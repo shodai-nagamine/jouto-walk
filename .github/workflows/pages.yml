@@ -32,3 +32,6 @@ jobs:
           path: public
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          # Pages側の配信キューが混むと既定の10分では足りずに打ち切られるので延ばす
+          timeout: 1800000

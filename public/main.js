@@ -961,17 +961,24 @@ function tick() {
       }
     }
 
-    // 進行方向(水平のみ)
-    fwd.set(-Math.sin(player.yaw), 0, -Math.cos(player.yaw));
+    // 進行方向。歩きは水平だけ、飛行は視線の上下にも進む
+    // (見上げながら前進で上昇、見下ろせば降下。pitch は上を向くと正)
+    if (flying) {
+      const cp = Math.cos(player.pitch);
+      fwd.set(-Math.sin(player.yaw) * cp, Math.sin(player.pitch), -Math.cos(player.yaw) * cp);
+    } else {
+      fwd.set(-Math.sin(player.yaw), 0, -Math.cos(player.yaw));
+    }
     right.set(Math.cos(player.yaw), 0, -Math.sin(player.yaw));
     let mx = fwd.x * fb + right.x * lr;
     let mz = fwd.z * fb + right.z * lr;
+    let my = flying ? fwd.y * fb : 0;   // 飛行時の垂直成分(この後 dt を掛ける)
     // 足元(地表 or 屋根)の高さ。飛行中の当たり判定にも使う
     const feet = player.y - EYE;
-    const len = Math.hypot(mx, mz);
+    const len = flying ? Math.hypot(mx, my, mz) : Math.hypot(mx, mz);
     if (len > 0) {
       const sp = (flying ? FLY : run ? RUN : WALK) * dt * throttle;
-      mx = mx / len * sp; mz = mz / len * sp;
+      mx = mx / len * sp; mz = mz / len * sp; my = my / len * sp;
       // 軸ごとに試して壁ずりを効かせる(天端より上なら素通りできる)
       if (!blocked(player.x + mx, player.z, RADIUS, feet)) player.x += mx;
       if (!blocked(player.x, player.z + mz, RADIUS, feet)) player.z += mz;
@@ -991,7 +998,8 @@ function tick() {
       const up = (jumpHeld ? 1 : 0) -
                  (descend || keys.has('ShiftLeft') || keys.has('ShiftRight') ? 1 : 0);
       player.vy = up * FLY_V;
-      player.y += player.vy * dt;
+      // 明示的な上下(ボタン)と、視線に沿った上下(my)の両方で高度が動く
+      player.y += player.vy * dt + my;
       const ceil = groundAt(player.x, player.z) + FLY_CEIL;
       if (player.y > ceil) { player.y = ceil; player.vy = 0; }
       if (player.y < gy) { player.y = gy; player.vy = 0; }   // 地面は突き抜けない
