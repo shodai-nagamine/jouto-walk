@@ -19,6 +19,7 @@ import json
 import math
 import os
 import sys
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -26,7 +27,9 @@ NAHA = os.path.expanduser("~/dev/tools/blender-mcp/data/naha")
 sys.path.insert(0, NAHA)
 
 from dem_grid import load_points  # noqa: E402
-from gml_to_schematic import fill_missing, parse_buildings  # noqa: E402
+from gml_to_schematic import (  # noqa: E402
+    fill_missing, local_name, parse_buildings, polygons_of,
+)
 
 M_PER_DEG_LAT = 111320.0
 
@@ -61,6 +64,27 @@ def simplify(pts, tol=0.35):
     return out if len(out) >= 3 else pts
 
 
+def parse_roads(gml_path):
+    """交通(tran)モデルから道路の面ポリゴンを取り出す。
+
+    PLATEAU の tran は LOD1 = lod1MultiSurface で、道路の「面」がそのまま入っている
+    (中心線ではない)。高さは一律 0 なので平面として扱い、描画時に地形へ伏せる。
+    """
+    out = []
+    for _ev, el in ET.iterparse(gml_path, events=("end",)):
+        if local_name(el.tag) != "Road":
+            continue
+        fn = ""
+        for ch in el.iter():
+            if local_name(ch.tag) == "function":
+                fn = (ch.text or "").strip()
+                break
+        for poly in polygons_of(el):
+            out.append((poly, fn))
+        el.clear()
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--center", nargs=2, type=float, required=True, metavar=("LAT", "LON"))
@@ -68,6 +92,7 @@ def main():
     ap.add_argument("--cell", type=int, default=5, help="地形グリッドの間隔(m)")
     ap.add_argument("--gml", nargs="+", required=True, help="建物CityGML(複数可)")
     ap.add_argument("--dem", nargs="*", default=[], help="地形CityGML(複数可)")
+    ap.add_argument("--tran", nargs="*", default=[], help="交通(道路)CityGML(複数可)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -148,6 +173,37 @@ def main():
             kept += 1
         print(f"  {os.path.basename(path)}: 建物 {len(recs):,} → 採用 {kept:,}", file=sys.stderr)
 
+    # ---- 道路 -------------------------------------------------------------
+    roads = []
+    for g in args.tran:
+        path = g if os.path.isabs(g) else os.path.join(NAHA, g)
+        recs = parse_roads(path)
+        kept = 0
+        for poly, fn in recs:
+            xz = [
+                ((lo - lon_c) * m_lon + half, -(la - lat_c) * m_lat + half)
+                for la, lo, *_ in poly
+            ]
+            xs = [p[0] for p in xz]
+            zs = [p[1] for p in xz]
+            # ワールドの矩形と交差しないものは捨てる(タイルは窓より広い)
+            if max(xs) < -20 or min(xs) > args.size + 20:
+                continue
+            if max(zs) < -20 or min(zs) > args.size + 20:
+                continue
+            ring = simplify(xz, tol=0.25)
+            if len(ring) < 3 or abs(ring_area(ring)) < 1.5:
+                continue
+            roads.append({
+                "fn": fn,
+                "f": [round(v, 2) for p in ring for v in p],
+            })
+            kept += 1
+        print(
+            f"  {os.path.basename(path)}: 道路面 {len(recs):,} → 採用 {kept:,}",
+            file=sys.stderr,
+        )
+
     # 中心の地表高さ(スポーン基準)
     ci = n // 2
     world = {
@@ -161,13 +217,14 @@ def main():
         # X が外側、Z が内側の row-major (terrain[x*n+z])
         "terrain": [round(float(v), 2) for v in terrain.reshape(-1)],
         "buildings": buildings,
+        "roads": roads,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(world, f, separators=(",", ":"))
     mb = os.path.getsize(args.out) / 1e6
     print(
-        f"建物 {len(buildings):,} 棟 / 地形 {n}x{n} ({args.cell}m格子) "
+        f"建物 {len(buildings):,} 棟 / 道路面 {len(roads):,} / 地形 {n}x{n} ({args.cell}m格子) "
         f"標高 {world['meta']['minZ']}〜{world['meta']['maxZ']}m\n"
         f"中心の地表 {world['meta']['groundAtCenter']}m\n"
         f"→ {args.out} ({mb:.1f}MB)",

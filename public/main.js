@@ -8,6 +8,7 @@ const GRAVITY = 22, JUMP = 7.2;
 const RADIUS = 0.55;       // プレイヤーの当たり半径(m)
 const N_SEESAA = 10;
 const PICKUP = 4.0;        // 保護できる距離(m)
+const HASH = 24;           // 当たり判定用の空間ハッシュの升目(m)。建物・道路で共用
 
 const $ = (id) => document.getElementById(id);
 
@@ -104,11 +105,69 @@ function facadeTexture() {
   return t;
 }
 
+// ---------------------------------------------------------------- 道路
+// PLATEAU の交通モデル(tran LOD1)の道路「面」。中心線ではなく実際の路面形状で、
+// 高さは持たない(一律0)ため平面として扱い、地面テクスチャに焼いて地形へ伏せる。
+const rstore = [];
+const rmap = new Map();
+{
+  for (const r of world.roads ?? []) {
+    const f = r.f, m = f.length / 2;
+    const ring = new Array(m);
+    let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
+    for (let i = 0; i < m; i++) {
+      const x = f[i * 2] - HALF, z = f[i * 2 + 1] - HALF;
+      ring[i] = new THREE.Vector2(x, z);
+      if (x < minx) minx = x; if (x > maxx) maxx = x;
+      if (z < minz) minz = z; if (z > maxz) maxz = z;
+    }
+    const idx = rstore.length;
+    rstore.push({ ring, minx, maxx, minz, maxz });
+    for (let gx = Math.floor(minx / HASH); gx <= Math.floor(maxx / HASH); gx++) {
+      for (let gz = Math.floor(minz / HASH); gz <= Math.floor(maxz / HASH); gz++) {
+        const k = `${gx},${gz}`;
+        (rmap.get(k) ?? rmap.set(k, []).get(k)).push(idx);
+      }
+    }
+  }
+  console.log(`道路面 ${rstore.length}`);
+}
+
+/** (x,z) が道路面の上か。シーサーの設置場所選びに使う。 */
+function onRoad(x, z) {
+  const ids = rmap.get(`${Math.floor(x / HASH)},${Math.floor(z / HASH)}`);
+  if (!ids) return false;
+  for (const id of ids) {
+    const r = rstore[id];
+    if (x < r.minx || x > r.maxx || z < r.minz || z > r.maxz) continue;
+    const g = r.ring, m = g.length;
+    let inside = false;
+    for (let k = 0, l = m - 1; k < m; l = k++) {
+      const a = g[k], c = g[l];
+      if ((a.y > z) !== (c.y > z) &&
+          x < (c.x - a.x) * (z - a.y) / (c.y - a.y) + a.x) inside = !inside;
+    }
+    if (inside) return true;
+  }
+  return false;
+}
+
+/** canvas に道路面のパスを引く(塗りは呼び出し側)。 */
+function roadPath(ctx, toX, toZ) {
+  ctx.beginPath();
+  for (const r of rstore) {
+    ctx.moveTo(toX(r.ring[0].x), toZ(r.ring[0].y));
+    for (let i = 1; i < r.ring.length; i++) ctx.lineTo(toX(r.ring[i].x), toZ(r.ring[i].y));
+    ctx.closePath();
+  }
+}
+
 /**
- * 地面を1枚のテクスチャで描く。道路データは持っていないので、
- * 建物の footprint を太らせて「敷地」を作り、ぼかして街区の密度場を得る。
- * 密度が高い=敷地、隙間の筋=道路、どこからも離れた広い場所=緑地、と読み替える。
- * bstore に依存するので建物を組み立てたあとに呼ぶこと。
+ * 地面を1枚のテクスチャで描く。道路は tran の実データを焼き、
+ * それ以外は建物 footprint を太らせた「敷地」とその密度場で塗り分ける。
+ * 密度が高い=敷地、どこからも離れた広い場所=緑地。tran に入らない
+ * 私道・路地は密度から弱く推定して補う。
+ * bstore / rstore に依存するので建物と道路を組み立てたあとに呼ぶこと。
  */
 function groundTexture() {
   const W = TOUCH ? 1024 : 2048;   // 生成は素のJSループなので端末に合わせる
@@ -133,8 +192,22 @@ function groundTexture() {
   dg.filter = `blur(${14 * s}px)`;          // 14m ぼかし = 街区スケール
   dg.drawImage(lot, 0, 0);
 
+  // 実データの道路面。輪郭のぼかし版を路肩(縁石まわり)の帯として使う
+  const rd = document.createElement('canvas'); rd.width = rd.height = W;
+  const rg = rd.getContext('2d', { willReadFrequently: true });
+  rg.fillStyle = '#000'; rg.fillRect(0, 0, W, W);
+  rg.fillStyle = '#fff';
+  roadPath(rg, (x) => (x + HALF) * s, (z) => (z + HALF) * s);
+  rg.fill();
+
+  const rds = document.createElement('canvas'); rds.width = rds.height = W;
+  const rsg = rds.getContext('2d', { willReadFrequently: true });
+  rsg.filter = `blur(${1.8 * s}px)`;        // 1.8m ぼかし = 路肩の帯
+  rsg.drawImage(rd, 0, 0);
+
   const A = lg.getImageData(0, 0, W, W), B = dg.getImageData(0, 0, W, W);
-  const a = A.data, b = B.data;
+  const R = rg.getImageData(0, 0, W, W), RS = rsg.getImageData(0, 0, W, W);
+  const a = A.data, b = B.data, rr = R.data, rs = RS.data;
   const PAVE = [154, 150, 142];             // 敷地(コンクリ)
   const ROAD = [110, 110, 114];             // 道路(アスファルト)
   const EDGE = [138, 134, 112];             // 路肩・未舗装
@@ -147,13 +220,18 @@ function groundTexture() {
     return t * t * (3 - 2 * t);
   };
   for (let i = 0; i < a.length; i += 4) {
-    const solid = a[i], dens = b[i];
+    const solid = a[i], dens = b[i], rc = rr[i] / 255, rsv = rs[i] / 255;
     let c;
-    if (solid > 128) c = PAVE;                            // 建物の敷地
+    // 実データの道路が最優先。敷地の外周(建物から2.25m)と重なる帯は実際には路面
+    if (rc > 0.5) c = ROAD;
+    else if (solid > 128) c = PAVE;                       // 建物の敷地
     else {
       // 市街地なので、建物からよほど離れた所だけを緑地にする
       c = mix(GREEN, EDGE, sstep(2, 13, dens));           // 緑地 → 路肩
-      c = mix(c, ROAD, sstep(15, 44, dens));              // 路肩 → 道路
+      // tran に入らない私道・路地は密度から弱く推定して補う
+      c = mix(c, ROAD, 0.5 * sstep(15, 44, dens));
+      c = mix(c, EDGE, sstep(0.04, 0.5, rsv));            // 実道路の際は路肩
+      c = mix(c, ROAD, sstep(0.5, 0.95, rc));             // 縁のアンチエイリアス
     }
     const n = 0.88 + Math.random() * 0.24;                // ざらつき
     a[i] = c[0] * n; a[i + 1] = c[1] * n; a[i + 2] = c[2] * n;
@@ -188,8 +266,6 @@ function detailTexture() {
 // 底面リングは build_world.py で CCW(符号付き面積>0)に揃えてある。
 const bmap = new Map();          // 空間ハッシュ: "gx,gz" -> [建物index]
 const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,maxx,minz,maxz}
-const HASH = 24;
-const hkey = (x, z) => `${Math.floor(x / HASH)},${Math.floor(z / HASH)}`;
 
 {
   // 壁と屋根は別マテリアルにしたいので、頂点を2群に分けてから連結する
@@ -432,15 +508,50 @@ function makeSeesaa() {
 let seed = 20260805;
 const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
 const seesaa = [];
+
+/** 道路面の上から、互いに離れた設置点を選ぶ(道沿いに立つので必ず辿り着ける)。 */
+function roadSpots(want) {
+  const cand = [];
+  for (const r of rstore) {
+    let cx = 0, cz = 0;
+    for (const p of r.ring) { cx += p.x; cz += p.y; }
+    cx /= r.ring.length; cz /= r.ring.length;
+    const d = Math.hypot(cx, cz);
+    if (d < 50 || d > 400) continue;                 // 近すぎ・遠すぎを除く
+    if (Math.abs(cx) > HALF - 30 || Math.abs(cz) > HALF - 30) continue;
+    if (!onRoad(cx, cz)) continue;                   // 凹多角形の重心は外に出うる
+    if (blocked(cx, cz, 2.4)) continue;              // 台座ぶんの余裕をとる
+    cand.push([cx, cz]);
+  }
+  for (let i = cand.length - 1; i > 0; i--) {        // 擬似乱数でシャッフル
+    const j = (rnd() * (i + 1)) | 0;
+    [cand[i], cand[j]] = [cand[j], cand[i]];
+  }
+  // まず十分離して選び、足りなければ間隔を詰めて補う
+  const out = [];
+  for (const sep of [110, 70, 40, 0]) {
+    for (const c of cand) {
+      if (out.length >= want) break;
+      if (out.every((p) => Math.hypot(p[0] - c[0], p[1] - c[1]) > sep) &&
+          !out.includes(c)) out.push(c);
+    }
+    if (out.length >= want) break;
+  }
+  return out;
+}
+
+const spots = roadSpots(N_SEESAA);
 for (let i = 0; i < N_SEESAA; i++) {
-  const ang = (i / N_SEESAA) * Math.PI * 2 + rnd() * 0.55;
-  let placed = null;
-  for (let tries = 0; tries < 260 && !placed; tries++) {
-    const rad = 55 + rnd() * 330;
-    const x = Math.cos(ang + (rnd() - 0.5) * 0.5) * rad;
-    const z = Math.sin(ang + (rnd() - 0.5) * 0.5) * rad;
-    if (Math.abs(x) > HALF - 30 || Math.abs(z) > HALF - 30) continue;
-    if (!blocked(x, z, 2.4)) placed = [x, z];   // 台座ぶんの余裕をとる
+  let placed = spots[i] ?? null;
+  if (!placed) {                                     // 道路が無い区画向けの保険
+    const ang = (i / N_SEESAA) * Math.PI * 2 + rnd() * 0.55;
+    for (let tries = 0; tries < 260 && !placed; tries++) {
+      const rad = 55 + rnd() * 330;
+      const x = Math.cos(ang + (rnd() - 0.5) * 0.5) * rad;
+      const z = Math.sin(ang + (rnd() - 0.5) * 0.5) * rad;
+      if (Math.abs(x) > HALF - 30 || Math.abs(z) > HALF - 30) continue;
+      if (!blocked(x, z, 2.4)) placed = [x, z];
+    }
   }
   if (!placed) continue;
   const [x, z] = placed;
@@ -651,6 +762,10 @@ base.width = base.height = MS;
 {
   const b = base.getContext('2d');
   b.fillStyle = '#16302f'; b.fillRect(0, 0, MS, MS);
+  // 道路を先に敷く(街路の骨格が見えると現在地を掴みやすい)
+  b.fillStyle = 'rgba(190,205,205,.30)';
+  roadPath(b, w2m, w2m);
+  b.fill();
   b.fillStyle = 'rgba(246,243,234,.42)';
   for (const bd of bstore) {
     b.beginPath();
@@ -840,8 +955,8 @@ function tick() {
 let elapsed = 0, frame = 0;
 
 // 動作確認用(コンソールから位置や視点を動かせる)
-window.dbg = { player, seesaa, groundAt, blocked, scene, camera, world, renderer, degrade,
-  quality: () => qLevel };
+window.dbg = { player, seesaa, groundAt, blocked, onRoad, rstore, scene, camera, world,
+  renderer, degrade, quality: () => qLevel };
 
 // ---------------------------------------------------------------- 起動
 $('go').disabled = false;
