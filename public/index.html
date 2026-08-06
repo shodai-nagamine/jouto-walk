@@ -37,10 +37,19 @@
   #compass .needle { position:absolute; left:50%; top:0; width:2px; height:34px;
     background:var(--accent); transform:translateX(-50%); }
 
-  #radar { bottom:14px; right:14px; padding:8px; }
-  #radar canvas { border-radius:5px; display:block; }
+  /* 地図はタップで拡大できるので、HUDの中で唯一クリックを受け取る */
+  #radar { bottom:calc(14px + env(safe-area-inset-bottom)); right:14px; padding:8px;
+    pointer-events:auto; cursor:pointer; transition:none; }
+  #radar canvas { border-radius:5px; display:block; width:188px; height:188px; }
   #radar .cap { font-size:10px; opacity:.6; text-align:center; padding-top:5px;
-    letter-spacing:.14em; }
+    letter-spacing:.14em; white-space:nowrap; }
+
+  /* 拡大表示: 画面中央に大きく置く */
+  #radar.big { right:auto; bottom:auto; left:50%; top:50%;
+    transform:translate(-50%,-50%); padding:12px;
+    background:rgba(13,27,30,.86); z-index:5; }
+  #radar.big canvas { width:min(80vw, 74vh); height:min(80vw, 74vh); }
+  #radar.big .cap { font-size:12px; padding-top:9px; }
 
   #hint { bottom:16px; left:14px; font-size:12px; line-height:1.85; opacity:.9; }
   #hint b { color:var(--accent); font-weight:600; }
@@ -101,6 +110,11 @@
   .tbtn:active { background:rgba(232,100,47,.75); }
   #jump { right:calc(20px + env(safe-area-inset-right)); bottom:186px;
     width:78px; height:78px; font-size:13px; }
+  /* 下降ボタンは飛行中だけ出す(ジャンプの左どなり) */
+  #down { display:none; right:calc(108px + env(safe-area-inset-right)); bottom:186px;
+    width:66px; height:66px; font-size:12px; }
+  body.touch.flying #down { display:grid; }
+  body.flying #jump { background:rgba(232,100,47,.62); }
   #pause { left:calc(16px + env(safe-area-inset-left)); top:calc(14px + env(safe-area-inset-top));
     width:44px; height:44px; font-size:16px; }
   /* 上段はポーズ＋コンパス。ステータスはぶつかるので一段下げて右に置く */
@@ -120,7 +134,11 @@
       right:calc(12px + env(safe-area-inset-right)); }
     #radar canvas { width:112px; height:112px; }
     #radar .cap { font-size:9px; padding-top:3px; }
+    #radar.big { padding:10px; }
+    #radar.big .cap { font-size:11px; padding-top:7px; }
     #jump { width:66px; height:66px; bottom:152px; font-size:12px; }
+    #down { width:58px; height:58px; bottom:156px;
+      right:calc(94px + env(safe-area-inset-right)); font-size:11px; }
     #card { padding:26px 22px; }
     #card h1 { font-size:25px; }
     #card p { font-size:13px; line-height:1.85; }
@@ -148,12 +166,13 @@
   <div id="compass" class="panel"><div class="tape" id="tape"></div><div class="needle"></div></div>
 
   <div id="radar" class="panel">
-    <canvas id="map" width="188" height="188"></canvas>
-    <div class="cap">城東小 周辺 1km</div>
+    <canvas id="map" width="640" height="640"></canvas>
+    <div class="cap" id="mapcap">城東小 周辺 1km ・ タップで拡大</div>
   </div>
 
   <div id="hint" class="panel">
     <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 移動 ／ <kbd>Shift</kbd> 走る ／ <kbd>Space</kbd> ジャンプ<br>
+    <kbd>Space</kbd> <b>長押しで飛行</b>（飛行中は <kbd>Space</kbd> 上昇 ／ <kbd>Shift</kbd> 下降）<br>
     マウス（効かなければドラッグ）で見回す ／ <kbd>Esc</kbd> でポーズ<br>
     <b>光の柱</b>に近づくとシーサーを保護できる
   </div>
@@ -164,6 +183,7 @@
   <div id="touchui">
     <div id="stick"><div id="knob"></div></div>
     <button class="tbtn" id="jump">ジャンプ</button>
+    <button class="tbtn" id="down">おりる</button>
     <button class="tbtn" id="pause">⏸</button>
   </div>
 </div>
@@ -179,7 +199,10 @@
       街に散った <b>10体のシーサー</b> を迎えに行きましょう。
     </p>
     <div class="ctl" id="ctl-key"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> で移動 ／ マウスで見回す</div>
-    <div class="ctl" id="ctl-touch">画面の<b>左半分</b>を押して動かすと歩き、<b>右半分</b>をなぞると見回せます</div>
+    <div class="ctl" id="ctl-touch">
+      画面の<b>左半分</b>を押して動かすと歩き、<b>右半分</b>をなぞると見回せます<br>
+      <b>ジャンプ長押し</b>で飛行モード（街を上から見られます）
+    </div>
     <button class="go" id="go" disabled>読み込み中…</button>
     <div class="meta" id="meta">建物データを準備しています</div>
     <div class="credit">

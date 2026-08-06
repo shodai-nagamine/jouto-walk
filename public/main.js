@@ -5,6 +5,9 @@ import * as THREE from './lib/three.module.js';
 const EYE = 1.62;          // 目線の高さ(m)
 const WALK = 4.6, RUN = 9.4;
 const GRAVITY = 22, JUMP = 7.2;
+const HOLD_MS = 320;       // ジャンプ長押しで飛行を切り替えるまでの時間
+const FLY = 14, FLY_V = 9; // 飛行の水平・垂直速度(m/s)
+const FLY_CEIL = 480;      // 地表からの上限高度(m)
 const RADIUS = 0.55;       // プレイヤーの当たり半径(m)
 const N_SEESAA = 10;
 const PICKUP = 4.0;        // 保護できる距離(m)
@@ -317,7 +320,7 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
 
     // 当たり判定用の登録
     const idx = bstore.length;
-    bstore.push({ ring, minx, maxx, minz, maxz });
+    bstore.push({ ring, minx, maxx, minz, maxz, top });
     for (let gx = Math.floor(minx / HASH); gx <= Math.floor(maxx / HASH); gx++) {
       for (let gz = Math.floor(minz / HASH); gz <= Math.floor(maxz / HASH); gz++) {
         const k = `${gx},${gz}`;
@@ -344,7 +347,32 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
 }
 
 /** (x,z) が建物の壁から r 以内(または内部)か。r を広げれば「開けた場所」判定になる。 */
-function blocked(x, z, r = RADIUS) {
+/** (x,z) で足が乗る高さ。地表か、footprint 内なら建物の天端(=屋根に立てる)。 */
+function supportY(x, z) {
+  let h = groundAt(x, z);
+  const ids = bmap.get(`${Math.floor(x / HASH)},${Math.floor(z / HASH)}`);
+  if (!ids) return h;
+  for (const id of ids) {
+    const b = bstore[id];
+    if (b.top <= h) continue;
+    if (x < b.minx || x > b.maxx || z < b.minz || z > b.maxz) continue;
+    const g = b.ring, m = g.length;
+    let inside = false;
+    for (let k = 0, l = m - 1; k < m; l = k++) {
+      const a = g[k], c = g[l];
+      if ((a.y > z) !== (c.y > z) &&
+          x < (c.x - a.x) * (z - a.y) / (c.y - a.y) + a.x) inside = !inside;
+    }
+    if (inside) h = b.top;
+  }
+  return h;
+}
+
+/**
+ * (x,z) が壁に触れているか。y を渡すと、その建物の天端より上に居る場合は
+ * 通り抜けられる(飛行で屋根を越える・屋根の上を歩くため)。
+ */
+function blocked(x, z, r = RADIUS, y = -Infinity) {
   const gx = Math.floor(x / HASH), gz = Math.floor(z / HASH);
   for (let i = -1; i <= 1; i++) {
     for (let j = -1; j <= 1; j++) {
@@ -352,6 +380,7 @@ function blocked(x, z, r = RADIUS) {
       if (!ids) continue;
       for (const id of ids) {
         const b = bstore[id];
+        if (y > b.top) continue;                 // 天端より上なら素通り
         if (x < b.minx - r || x > b.maxx + r ||
             z < b.minz - r || z > b.maxz + r) continue;
         const rg = b.ring, m = rg.length;
@@ -631,11 +660,14 @@ player.y = groundAt(player.x, player.z) + EYE;
 
 const keys = new Set();
 addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) jumpDown(); }
   keys.add(e.code);
-  if (e.code === 'Space') e.preventDefault();
 });
-addEventListener('keyup', (e) => keys.delete(e.code));
-addEventListener('blur', () => keys.clear());
+addEventListener('keyup', (e) => {
+  if (e.code === 'Space') jumpUp();
+  keys.delete(e.code);
+});
+addEventListener('blur', () => { keys.clear(); jumpUp(); });
 
 // ポインタロックが使えない環境でも遊べるよう、開始状態は自前のフラグで持つ。
 // ロックが取れていればマウス移動で、取れなければ左ドラッグで視点を回す。
@@ -696,6 +728,27 @@ let look = null;                 // {id, x, y}
 let jumpTap = false;
 const knob = $('knob'), stickUI = $('stick');
 
+// ---------------------------------------------------------------- 飛行
+// マイクラのクリエイティブと同じ操作感: ジャンプを長押しすると飛行に入り、
+// 以降は押しっぱなしで上昇。もう一度長押しすると解除して落ちる。
+let flying = false;
+let jumpHeld = false, jumpSince = 0, holdUsed = false;
+let descend = false;                       // 下降(PCはShift、スマホは専用ボタン)
+
+function setFly(on) {
+  flying = on;
+  document.body.classList.toggle('flying', on);
+  if (on) player.vy = 0;
+  say(on ? '飛行モード ON（長押しで解除）' : '飛行モード OFF');
+}
+
+function jumpDown() {
+  if (jumpHeld) return;
+  jumpHeld = true; jumpSince = performance.now(); holdUsed = false;
+  jumpTap = true;                          // 短押しはその場でジャンプ
+}
+function jumpUp() { jumpHeld = false; }
+
 function stickShow(on, cx, cy) {
   if (!stickUI) return;
   stickUI.style.display = on ? 'block' : 'none';
@@ -746,8 +799,18 @@ if (TOUCH) {
   el.addEventListener('touchend', endTouch);
   el.addEventListener('touchcancel', endTouch);
 
-  $('jump')?.addEventListener('touchstart', (e) => { e.preventDefault(); jumpTap = true; },
+  $('jump')?.addEventListener('touchstart', (e) => { e.preventDefault(); jumpDown(); },
     { passive: false });
+  for (const ev of ['touchend', 'touchcancel']) {
+    $('jump')?.addEventListener(ev, (e) => { e.preventDefault(); jumpUp(); }, { passive: false });
+  }
+  // 下降ボタンは飛行中だけ出る
+  $('down')?.addEventListener('touchstart', (e) => { e.preventDefault(); descend = true; },
+    { passive: false });
+  for (const ev of ['touchend', 'touchcancel']) {
+    $('down')?.addEventListener(ev, (e) => { e.preventDefault(); descend = false; },
+      { passive: false });
+  }
   $('pause')?.addEventListener('touchstart', (e) => { e.preventDefault(); pause(); },
     { passive: false });
   $('pause')?.addEventListener('click', () => { if (started) pause(); });
@@ -775,24 +838,41 @@ base.width = base.height = MS;
   }
 }
 
+// マーカーは 188px 表示を基準に描いていたので、実解像度に合わせて拡大する
+const MK = MS / 188;
+
 function drawMap() {
   mctx.drawImage(base, 0, 0);
   // 城東小
   mctx.fillStyle = '#e8642f';
-  mctx.beginPath(); mctx.arc(w2m(0), w2m(0), 3.4, 0, 7); mctx.fill();
+  mctx.beginPath(); mctx.arc(w2m(0), w2m(0), 3.4 * MK, 0, 7); mctx.fill();
   // シーサー
   for (const s of seesaa) {
     if (s.userData.taken) continue;
     mctx.fillStyle = '#ffc27a';
-    mctx.beginPath(); mctx.arc(w2m(s.position.x), w2m(s.position.z), 2.6, 0, 7); mctx.fill();
+    mctx.beginPath(); mctx.arc(w2m(s.position.x), w2m(s.position.z), 2.6 * MK, 0, 7); mctx.fill();
   }
   // 自分(視線方向つき)
   const px = w2m(player.x), pz = w2m(player.z);
   mctx.save(); mctx.translate(px, pz); mctx.rotate(-player.yaw);
   mctx.fillStyle = '#7fe0ff';
-  mctx.beginPath(); mctx.moveTo(0, -6); mctx.lineTo(4, 4); mctx.lineTo(-4, 4);
+  mctx.beginPath();
+  mctx.moveTo(0, -6 * MK); mctx.lineTo(4 * MK, 4 * MK); mctx.lineTo(-4 * MK, 4 * MK);
   mctx.closePath(); mctx.fill();
   mctx.restore();
+}
+
+// 地図をタップ/クリックすると拡大表示に切り替える
+{
+  const radar = $('radar'), cap = $('mapcap');
+  const toggle = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const big = radar.classList.toggle('big');
+    cap.textContent = big ? '城東小 周辺 1km ・ タップで戻す' : '城東小 周辺 1km ・ タップで拡大';
+    drawMap();
+  };
+  radar.addEventListener('click', toggle);
+  radar.addEventListener('touchstart', toggle, { passive: false });
 }
 
 // ---------------------------------------------------------------- コンパス
@@ -886,26 +966,45 @@ function tick() {
     right.set(Math.cos(player.yaw), 0, -Math.sin(player.yaw));
     let mx = fwd.x * fb + right.x * lr;
     let mz = fwd.z * fb + right.z * lr;
+    // 足元(地表 or 屋根)の高さ。飛行中の当たり判定にも使う
+    const feet = player.y - EYE;
     const len = Math.hypot(mx, mz);
     if (len > 0) {
-      const sp = (run ? RUN : WALK) * dt * throttle;
+      const sp = (flying ? FLY : run ? RUN : WALK) * dt * throttle;
       mx = mx / len * sp; mz = mz / len * sp;
-      // 軸ごとに試して壁ずりを効かせる
-      if (!blocked(player.x + mx, player.z)) player.x += mx;
-      if (!blocked(player.x, player.z + mz)) player.z += mz;
+      // 軸ごとに試して壁ずりを効かせる(天端より上なら素通りできる)
+      if (!blocked(player.x + mx, player.z, RADIUS, feet)) player.x += mx;
+      if (!blocked(player.x, player.z + mz, RADIUS, feet)) player.z += mz;
       player.x = Math.max(-HALF + 2, Math.min(HALF - 2, player.x));
       player.z = Math.max(-HALF + 2, Math.min(HALF - 2, player.z));
     }
 
-    // 上下(重力とジャンプ)
-    const gy = groundAt(player.x, player.z) + EYE;
-    if (player.onGround && (keys.has('Space') || jumpTap)) {
-      player.vy = JUMP; player.onGround = false;
+    // ジャンプの長押しで飛行を切り替える(押している間に1回だけ発火)
+    if (jumpHeld && !holdUsed && now - jumpSince > HOLD_MS) {
+      holdUsed = true;
+      setFly(!flying);
+    }
+
+    // 上下。屋根の上にも立てるので接地面は supportY で取る
+    const gy = supportY(player.x, player.z) + EYE;
+    if (flying) {
+      const up = (jumpHeld ? 1 : 0) -
+                 (descend || keys.has('ShiftLeft') || keys.has('ShiftRight') ? 1 : 0);
+      player.vy = up * FLY_V;
+      player.y += player.vy * dt;
+      const ceil = groundAt(player.x, player.z) + FLY_CEIL;
+      if (player.y > ceil) { player.y = ceil; player.vy = 0; }
+      if (player.y < gy) { player.y = gy; player.vy = 0; }   // 地面は突き抜けない
+      player.onGround = false;
+    } else {
+      if (player.onGround && (jumpHeld || jumpTap)) {
+        player.vy = JUMP; player.onGround = false;
+      }
+      player.vy -= GRAVITY * dt;
+      player.y += player.vy * dt;
+      if (player.y <= gy) { player.y = gy; player.vy = 0; player.onGround = true; }
     }
     jumpTap = false;
-    player.vy -= GRAVITY * dt;
-    player.y += player.vy * dt;
-    if (player.y <= gy) { player.y = gy; player.vy = 0; player.onGround = true; }
   }
 
   camera.position.set(player.x, player.y, player.z);
@@ -955,8 +1054,9 @@ function tick() {
 let elapsed = 0, frame = 0;
 
 // 動作確認用(コンソールから位置や視点を動かせる)
-window.dbg = { player, seesaa, groundAt, blocked, onRoad, rstore, scene, camera, world,
-  renderer, degrade, quality: () => qLevel };
+window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
+  world, renderer, degrade, quality: () => qLevel, setFly,
+  flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
 
 // ---------------------------------------------------------------- 起動
 $('go').disabled = false;
