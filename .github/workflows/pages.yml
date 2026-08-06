@@ -11,9 +11,12 @@ permissions:
   pages: write
   id-token: write
 
+# 進行中のデプロイは打ち切らない。打ち切ると Pages 側で
+# "Deployment cancelled" となり、成果物を上げ直しても反映されないため
+# (GitHub のPages公式サンプルも false を推奨)
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
