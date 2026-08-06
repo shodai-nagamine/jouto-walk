@@ -1,5 +1,10 @@
 # 城東小あるき — PLATEAU那覇を歩く
 
+**▶ 遊ぶ: <https://shodai-nagamine.github.io/jouto-walk/>**（スマホ可）
+
+<img src="jouto-walk-qr.png" width="180" alt="公開URLのQRコード">
+
+
 那覇市 **城東小学校** を中心とした 1km 四方を、国土交通省 PLATEAU の実測データ
 （建物 CityGML LOD1 ＋ 地形 DEM）から起こして歩き回れるようにした Three.js の一人称ゲーム。
 街に散らばった **10体のシーサー** を探して保護するのが目的。
@@ -10,11 +15,19 @@
 
 ## 起動
 
+ローカルで動かす場合:
+
 ```bash
 python3 -m http.server 8945 --directory ~/dev/apps/jouto-walk/public
 ```
 
 <http://localhost:8945> を開く。ビルド不要（Three.js は `public/lib/` に同梱）。
+
+## 公開
+
+`main` に push すると GitHub Actions（`.github/workflows/pages.yml`）が
+`public/` を GitHub Pages へ配信する。ビルド手順は無く、成果物をそのまま上げるだけ。
+配信サイズは約 1.3MB（`world.json` は gzip で 0.2MB）。
 
 ## 操作
 
