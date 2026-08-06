@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d1b1e">
+<title>城東小あるき — PLATEAU那覇</title>
+<style>
+  :root { --ink:#0d1b1e; --paper:#f6f3ea; --accent:#e8642f; --sea:#1b7fa8; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; overflow:hidden;
+    font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN",system-ui,sans-serif;
+    background:#8fc4de; color:var(--paper);
+    /* スワイプでページが動いたり、二本指で拡大されたりしないように */
+    touch-action:none; -webkit-user-select:none; user-select:none;
+    -webkit-tap-highlight-color:transparent; overscroll-behavior:none; }
+  canvas { display:block; touch-action:none; }
+
+  #hud { position:fixed; inset:0; pointer-events:none; }
+
+  .panel { position:absolute; background:rgba(13,27,30,.62); backdrop-filter:blur(6px);
+    border:1px solid rgba(246,243,234,.18); border-radius:10px; padding:10px 13px; }
+
+  #stats { top:14px; left:14px; min-width:186px; }
+  #stats .row { display:flex; justify-content:space-between; align-items:baseline;
+    gap:14px; font-size:13px; line-height:1.9; }
+  #stats .k { opacity:.65; letter-spacing:.04em; }
+  #stats .v { font-variant-numeric:tabular-nums; font-weight:600; }
+  #found { color:var(--accent); font-size:17px; }
+
+  #compass { top:14px; left:50%; transform:translateX(-50%);
+    width:230px; height:34px; overflow:hidden; padding:0; }
+  #compass .tape { position:absolute; top:0; height:34px; display:flex;
+    align-items:center; font-size:12px; letter-spacing:.3em; white-space:nowrap; }
+  #compass .needle { position:absolute; left:50%; top:0; width:2px; height:34px;
+    background:var(--accent); transform:translateX(-50%); }
+
+  #radar { bottom:14px; right:14px; padding:8px; }
+  #radar canvas { border-radius:5px; display:block; }
+  #radar .cap { font-size:10px; opacity:.6; text-align:center; padding-top:5px;
+    letter-spacing:.14em; }
+
+  #hint { bottom:16px; left:14px; font-size:12px; line-height:1.85; opacity:.9; }
+  #hint b { color:var(--accent); font-weight:600; }
+  kbd { background:rgba(246,243,234,.15); border:1px solid rgba(246,243,234,.25);
+    border-radius:4px; padding:1px 5px; font-size:11px; font-family:inherit; }
+
+  #reticle { position:absolute; left:50%; top:50%; width:5px; height:5px;
+    margin:-2.5px 0 0 -2.5px; border-radius:50%; background:rgba(246,243,234,.75);
+    box-shadow:0 0 0 1.5px rgba(13,27,30,.4); }
+
+  #toast { position:absolute; left:50%; top:56%; transform:translateX(-50%);
+    font-size:22px; font-weight:700; color:var(--accent); text-shadow:0 2px 12px rgba(0,0,0,.6);
+    opacity:0; transition:opacity .28s; white-space:nowrap; }
+  #toast.on { opacity:1; }
+
+  #overlay { position:fixed; inset:0; display:grid; place-items:center;
+    background:radial-gradient(120% 90% at 50% 30%, #1d5f7d 0%, #0d1b1e 78%);
+    pointer-events:auto; transition:opacity .35s; z-index:10; }
+  #overlay.hide { opacity:0; pointer-events:none; }
+  #card { max-width:520px; padding:38px 42px; text-align:center; }
+  #card h1 { margin:0 0 6px; font-size:31px; letter-spacing:.02em; }
+  #card .sub { opacity:.62; font-size:13px; letter-spacing:.16em; margin-bottom:22px; }
+  #card p { font-size:14px; line-height:2; opacity:.9; margin:0 0 26px; }
+  #card .go { display:inline-block; padding:13px 34px; border-radius:999px;
+    background:var(--accent); color:#160c06; font-weight:700; font-size:15px;
+    cursor:pointer; border:none; letter-spacing:.06em; }
+  #card .go:hover { filter:brightness(1.08); }
+  #card .go[disabled] { background:#4a5254; color:#9aa; cursor:default; }
+  #card .meta { margin-top:24px; font-size:11px; opacity:.45; line-height:1.9; }
+  /* PLATEAU(PDL1.0/CC BY 4.0)は出典と「加工した旨」の表示が必須 */
+  #card .credit { margin-top:12px; font-size:10.5px; opacity:.5; line-height:1.85; }
+  #card .credit a { color:var(--paper); }
+
+  #card .ctl { font-size:12.5px; opacity:.72; margin:0 0 22px; line-height:1.8; }
+  #card .ctl b { color:var(--accent); }
+  #ctl-touch { display:none; }
+  body.touch #ctl-key { display:none; }
+  body.touch #ctl-touch { display:block; }
+
+  /* ---- タッチ操作 UI（body.touch のときだけ出す） ---- */
+  #touchui { display:none; }
+  body.touch #touchui { display:block; }
+  body.touch #hint { display:none; }
+  body.touch #reticle { opacity:.5; }
+
+  #stick { position:absolute; width:118px; height:118px; margin:-59px 0 0 -59px;
+    border-radius:50%; border:2px solid rgba(246,243,234,.34);
+    background:rgba(13,27,30,.26); display:none; pointer-events:none; }
+  #knob { position:absolute; left:50%; top:50%; width:52px; height:52px;
+    transform:translate(-50%,-50%); border-radius:50%;
+    background:rgba(246,243,234,.62); box-shadow:0 2px 10px rgba(0,0,0,.35); }
+
+  .tbtn { position:absolute; pointer-events:auto; border-radius:50%; padding:0;
+    white-space:nowrap; font-family:inherit;
+    background:rgba(13,27,30,.55); border:1px solid rgba(246,243,234,.28);
+    color:var(--paper); display:grid; place-items:center; font-size:12px;
+    letter-spacing:.08em; backdrop-filter:blur(6px); }
+  .tbtn:active { background:rgba(232,100,47,.75); }
+  #jump { right:calc(20px + env(safe-area-inset-right)); bottom:186px;
+    width:78px; height:78px; font-size:13px; }
+  #pause { left:calc(16px + env(safe-area-inset-left)); top:calc(14px + env(safe-area-inset-top));
+    width:44px; height:44px; font-size:16px; }
+  /* 上段はポーズ＋コンパス。ステータスはぶつかるので一段下げて右に置く */
+  body.touch #stats { left:auto; right:calc(12px + env(safe-area-inset-right));
+    top:calc(62px + env(safe-area-inset-top)); }
+
+  /* ---- 画面が小さいとき ---- */
+  @media (max-width:820px), (max-height:560px) {
+    .panel { padding:7px 10px; border-radius:8px; }
+    #stats { min-width:0; top:calc(12px + env(safe-area-inset-top)); }
+    #stats .row { font-size:11px; line-height:1.62; gap:9px; }
+    #found { font-size:14px; }
+    #compass { width:150px; height:26px; top:calc(12px + env(safe-area-inset-top)); }
+    #compass .tape, #compass .needle { height:26px; }
+    #compass .tape { font-size:10px; letter-spacing:.16em; }
+    #radar { padding:5px; bottom:calc(12px + env(safe-area-inset-bottom));
+      right:calc(12px + env(safe-area-inset-right)); }
+    #radar canvas { width:112px; height:112px; }
+    #radar .cap { font-size:9px; padding-top:3px; }
+    #jump { width:66px; height:66px; bottom:152px; font-size:12px; }
+    #card { padding:26px 22px; }
+    #card h1 { font-size:25px; }
+    #card p { font-size:13px; line-height:1.85; }
+    #card .sub { margin-bottom:16px; font-size:11px; }
+    #toast { font-size:17px; }
+  }
+
+  /* 横持ちは縦の余白が無いので、ジャンプはミニマップの左隣に並べる */
+  @media (max-height:480px) {
+    #jump { width:62px; height:62px; bottom:calc(12px + env(safe-area-inset-bottom));
+      right:calc(148px + env(safe-area-inset-right)); }
+    #toast { top:62%; }
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="stats" class="panel">
+    <div class="row"><span class="k">シーサー</span><span class="v" id="found">0 / 10</span></div>
+    <div class="row"><span class="k">最寄りまで</span><span class="v" id="dist">—</span></div>
+    <div class="row"><span class="k">標高</span><span class="v" id="alt">—</span></div>
+    <div class="row"><span class="k">経過</span><span class="v" id="time">0:00</span></div>
+  </div>
+
+  <div id="compass" class="panel"><div class="tape" id="tape"></div><div class="needle"></div></div>
+
+  <div id="radar" class="panel">
+    <canvas id="map" width="188" height="188"></canvas>
+    <div class="cap">城東小 周辺 1km</div>
+  </div>
+
+  <div id="hint" class="panel">
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 移動 ／ <kbd>Shift</kbd> 走る ／ <kbd>Space</kbd> ジャンプ<br>
+    マウス（効かなければドラッグ）で見回す ／ <kbd>Esc</kbd> でポーズ<br>
+    <b>光の柱</b>に近づくとシーサーを保護できる
+  </div>
+
+  <div id="reticle"></div>
+  <div id="toast"></div>
+
+  <div id="touchui">
+    <div id="stick"><div id="knob"></div></div>
+    <button class="tbtn" id="jump">ジャンプ</button>
+    <button class="tbtn" id="pause">⏸</button>
+  </div>
+</div>
+
+<div id="overlay">
+  <div id="card">
+    <h1>城東小あるき</h1>
+    <div class="sub">NAHA · PLATEAU 3D CITY</div>
+    <p>
+      那覇市 城東小学校のまわり <b>1km四方</b>。<br>
+      国土交通省 PLATEAU の実測データから起こした<br>
+      本物の地形と建物のなかを歩けます。<br>
+      街に散った <b>10体のシーサー</b> を迎えに行きましょう。
+    </p>
+    <div class="ctl" id="ctl-key"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> で移動 ／ マウスで見回す</div>
+    <div class="ctl" id="ctl-touch">画面の<b>左半分</b>を押して動かすと歩き、<b>右半分</b>をなぞると見回せます</div>
+    <button class="go" id="go" disabled>読み込み中…</button>
+    <div class="meta" id="meta">建物データを準備しています</div>
+    <div class="credit">
+      建物・地形データ:
+      <a href="https://www.mlit.go.jp/plateau/" target="_blank" rel="noopener">国土交通省 PLATEAU</a>
+      を加工して作成（PDL1.0 ／ CC BY 4.0 互換）<br>
+      3D描画: <a href="https://threejs.org/" target="_blank" rel="noopener">three.js</a>（MIT）
+      ／ 本ページは国土交通省が作成したものではありません
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./main.js"></script>
+</body>
+</html>
