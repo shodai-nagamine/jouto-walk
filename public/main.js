@@ -1017,6 +1017,108 @@ const councilPosts = [];
     `${(council.places ?? []).reduce((n, p) => n + p.speeches.length, 0)}発言`);
 }
 
+// ---------------------------------------------------------------- 信号
+// OSM の信号ノード。交差点ごとに束ねてあり、直交する系統(axis 0/1)が交互に青になる。
+// 灯火は InstancedMesh の per-instance color を書き換えるだけなので描画は1回。
+const SIG_GREEN = 9, SIG_YELLOW = 2.5, SIG_RED_GAP = 1.5;   // 各相の秒数
+const SIG_CYCLE = (SIG_GREEN + SIG_YELLOW + SIG_RED_GAP) * 2;
+const signals = world.signals ?? [];
+const sigGroups = [...new Set(signals.map((s) => s.g))];
+let sigLamps = null, sigState = [];        // 交差点ごとの現在の相
+
+const OFF = { r: 0x3a1416, y: 0x3a3216, g: 0x14321f };
+const ON = { r: 0xff3b30, y: 0xffcc00, g: 0x2fd158 };
+
+{
+  if (signals.length) {
+    const poleMat = new THREE.MeshLambertMaterial({ color: 0x6f7679 });
+    const caseMat = new THREE.MeshLambertMaterial({ color: 0x3c4448 });
+    const poles = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(0.075, 0.1, 1, 6), poleMat, signals.length);
+    const cases = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(1, 1, 0.22), caseMat, signals.length);
+    // 灯火は1基3つ(歩行者用は上2つだけ使う)
+    sigLamps = new THREE.InstancedMesh(
+      new THREE.CircleGeometry(0.15, 12),
+      new THREE.MeshBasicMaterial({ toneMapped: false }), signals.length * 3);
+    sigLamps.instanceColor = new THREE.InstancedBufferAttribute(
+      new Float32Array(signals.length * 3 * 3), 3);
+
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion();
+    const pos = new THREE.Vector3(), scl = new THREE.Vector3();
+    const e = new THREE.Euler();
+
+    signals.forEach((s, i) => {
+      const x = s.x - HALF, z = s.z - HALF;
+      const g = groundAt(x, z);
+      const car = s.k === 'car';
+      const h = car ? 5.0 : 3.1;            // 車両用は高く、歩行者用は低く
+      // 支柱
+      e.set(0, 0, 0); q.setFromEuler(e);
+      pos.set(x, g + h / 2, z); scl.set(1, h, 1);
+      m.compose(pos, q, scl); poles.setMatrixAt(i, m);
+
+      // 灯器(交差点の中心を向く)
+      e.set(0, s.r, 0); q.setFromEuler(e);
+      const cw = car ? 1.15 : 0.5, ch = car ? 0.42 : 0.78;
+      pos.set(x, g + h - 0.35, z); scl.set(cw, ch, 1);
+      m.compose(pos, q, scl); cases.setMatrixAt(i, m);
+
+      // 灯火を灯器の前面に並べる(車両用は横3つ、歩行者用は縦2つ)
+      const fx = Math.sin(s.r) * 0.13, fz = Math.cos(s.r) * 0.13;
+      for (let k = 0; k < 3; k++) {
+        const li = i * 3 + k;
+        let ox = 0, oy = 0;
+        if (car) ox = (k - 1) * 0.34; else oy = k === 2 ? 0 : (k === 0 ? 0.19 : -0.19);
+        const lx = x + Math.cos(s.r) * ox + fx;
+        const lz = z - Math.sin(s.r) * ox + fz;
+        pos.set(lx, g + h - 0.35 + oy, lz);
+        scl.set(car ? 1 : (k === 2 ? 0.001 : 1), 1, 1);   // 歩行者用は3つ目を消す
+        m.compose(pos, q, scl);
+        sigLamps.setMatrixAt(li, m);
+      }
+    });
+    poles.instanceMatrix.needsUpdate = true;
+    cases.instanceMatrix.needsUpdate = true;
+    sigLamps.instanceMatrix.needsUpdate = true;
+    poles.castShadow = cases.castShadow = true;
+    scene.add(poles, cases, sigLamps);
+    console.log(`信号 ${signals.length}基 / 交差点 ${sigGroups.length}箇所`);
+  }
+}
+
+/** 交差点 g の、系統 axis から見た現在の灯色を返す。 */
+function sigPhase(g, axis, t) {
+  // 交差点ごとに位相をずらして、街全体が一斉に変わらないようにする
+  const p = (t + g * 6.3) % SIG_CYCLE;
+  const halfC = SIG_CYCLE / 2;
+  const mine = axis === 0 ? p : (p + halfC) % SIG_CYCLE;
+  if (mine < SIG_GREEN) return 'g';
+  if (mine < SIG_GREEN + SIG_YELLOW) return 'y';
+  return 'r';
+}
+
+function updateSignals(t) {
+  if (!sigLamps) return;
+  const c = new THREE.Color();
+  signals.forEach((s, i) => {
+    const ph = sigPhase(s.g, s.a, t);
+    // 歩行者用は青と赤の2灯(黄は赤扱い)
+    const lit = s.k === 'car' ? ph : (ph === 'g' ? 'g' : 'r');
+    // 車両用は運転者から見て左から青・黄・赤(日本の並び)。
+    // 灯器は交差点の中心を向いているので、この視点がそのまま運転者の視点になる。
+    // 歩行者用は上が赤、下が青。
+    const cols = s.k === 'car'
+      ? [lit === 'g' ? ON.g : OFF.g, lit === 'y' ? ON.y : OFF.y, lit === 'r' ? ON.r : OFF.r]
+      : [lit === 'r' ? ON.r : OFF.r, lit === 'g' ? ON.g : OFF.g, OFF.r];
+    for (let k = 0; k < 3; k++) {
+      c.setHex(cols[k]);
+      sigLamps.setColorAt(i * 3 + k, c);
+    }
+  });
+  if (sigLamps.instanceColor) sigLamps.instanceColor.needsUpdate = true;
+}
+
 // ---------------------------------------------------------------- 走るバス
 // 経路は OSM のバス路線リレーション(那覇バスの実系統)。時刻表は持たないので
 // 走行は任意のタイミングだが、経路と停留所は実在のもの。
@@ -1065,8 +1167,23 @@ const buses = [];
     g.add(lab);
     scene.add(g);
 
+    // 経路上で信号に差しかかる地点(停止線)。進行方向から見る系統も決めておく
+    const sigs = [];
+    for (let d = 0; d < path.len; d += 4) {
+      const q = pathAt(path, d);
+      for (const s of signals) {
+        if (s.k !== 'car') continue;
+        if (Math.hypot(s.x - HALF - q.x, s.z - HALF - q.z) > 11) continue;
+        if (sigs.length && Math.abs(d - sigs[sigs.length - 1].d) < 30) break;
+        // 東西に進むなら axis 0、南北なら axis 1 の系統を見る
+        const axis = Math.abs(Math.sin(q.yaw)) >= Math.abs(Math.cos(q.yaw)) ? 0 : 1;
+        sigs.push({ d, g: s.g, axis });
+        break;
+      }
+    }
+
     buses.push({
-      g, path, stops, label: lab,
+      g, path, stops, sigs, label: lab,
       ref: r.ref, name: r.name.split('(')[0].split('（')[0].trim(),
       d: path.len * (0.13 + 0.21 * i), dir: 1, wait: 0,
     });
@@ -1554,6 +1671,7 @@ function say(msg) {
 // ---------------------------------------------------------------- ループ
 const clock = new THREE.Clock();
 const fwd = new THREE.Vector3(), right = new THREE.Vector3();
+let sigLast = -1;              // 信号の灯火を書き換えた最後の時刻(秒)
 
 // ---------------------------------------------------------------- 画質の自動調整
 // 端末の性能は事前に分からないので、実測fpsが足りなければ段階的に軽くする。
@@ -1601,10 +1719,23 @@ function tick() {
 
   // バス(バス停で少し停まる。端まで行ったら折り返す=上り下り)。
   // 乗車中はプレイヤーを座席へ貼り付けるので、必ずプレイヤー更新より先に動かす。
+  const sigT = now / 1000;
+  if (sigT - sigLast > 0.15) { sigLast = sigT; updateSignals(sigT); }
+
   for (const b of buses) {
+    // 停止線の手前で赤(と黄)なら進まない
+    let hold = false;
+    if (b.wait <= 0) {
+      for (const s of b.sigs) {
+        const ahead = b.dir > 0 ? s.d - b.d : b.d - s.d;
+        if (ahead >= 0 && ahead < 3.5 && sigPhase(s.g, s.axis, sigT) !== 'g') {
+          hold = true; break;
+        }
+      }
+    }
     if (b.wait > 0) {
       b.wait -= dt;
-    } else {
+    } else if (!hold) {
       const prev = b.d;
       b.d += b.dir * 8.5 * dt;              // 約30km/h
       if (b.d > b.path.len) { b.d = b.path.len; b.dir = -1; b.wait = 2.5; }
@@ -1827,7 +1958,7 @@ let elapsed = 0, frame = 0;
 // 動作確認用(コンソールから位置や視点を動かせる)
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
-  council, councilPosts, showCouncil, buses, trainRide, bstore,
+  council, councilPosts, showCouncil, buses, trainRide, bstore, sigPhase, signals,
   // 検証用: 列車を駅に着けて長く停める
   trainToStation: (sec = 60) => {
     if (trainStopD === null) return false;

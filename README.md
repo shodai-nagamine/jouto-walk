@@ -84,7 +84,7 @@ PC:
   --tran 39272568_tran.gml 39272578_tran.gml \
   --rail naha_railway.geojson --stations naha_station.czml \
   --bus naha_bus_osm.json --osm-named naha_named_osm.json \
-  --bus-routes naha_busroutes_osm.json \
+  --bus-routes naha_busroutes_osm.json --signals naha_signals_osm.json \
   --out public/data/world.json
 ```
 
@@ -181,6 +181,16 @@ python3 tools/link_council.py --world public/data/world.json --out public/data/c
   ワールドで切って**いちばん長く連続する区間**だけを使う。
   経路上でバス停に近づく地点を先に拾っておき、そこで 2.2 秒停まる。
   **時刻表は持っていないので発車タイミングは任意**（GTFS が手に入れば差し替えられる）
+- **信号**: OSM の信号ノード **55 基**（車両用 26／歩行者用 29）を、**交差点 11 箇所**に
+  束ねてある。交差点の中心から見た向きで東西（axis 0）と南北（axis 1）に振り分け、
+  直交する系統が交互に青になる（同時に青にならないことと、全赤の間があることを検証済み）。
+  交差点ごとに位相をずらしてあるので街全体が一斉には変わらない。
+  灯火は 165 個を 1 つの InstancedMesh に入れて **per-instance color を書き換えるだけ**
+  （0.15 秒ごと）。並びは**運転者から見て左から青・黄・赤**（日本の並び。灯器は
+  交差点の中心を向いているので、その視点がそのまま運転者の視点になる）。
+  歩行者用は上が赤、下が青
+- **バスは赤で止まる**: 各路線の経路上で信号に差しかかる地点を先に拾い、進行方向から
+  見る系統（東西か南北か）も決めておく。停止線の 3.5m 手前で青以外なら進まない
 - **バス停**: 20 基（うち「城東小学校前」は校門のすぐ前）。支柱と台座は InstancedMesh、
   標識は canvas テクスチャのスプライトにして向きを持たせない。名札が 20 枚も常時
   見えると画面が埋まるので、**135m 以内だけ表示**する

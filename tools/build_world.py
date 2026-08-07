@@ -260,6 +260,64 @@ def parse_osm_named(path, lat_c, lon_c, m_lat, m_lon, half, size):
     return out
 
 
+def parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, size, radius=32.0):
+    """OSM の信号ノードを、交差点ごとにまとめて系統(青になる向き)を決める。
+
+    1つの交差点に複数のノードがあるので、近いものを1つの交差点として束ね、
+    交差点中心から見た向きで東西(axis=0)と南北(axis=1)に振り分ける。
+    こうすると直交する系統が交互に青になる。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    pts = []
+    for e in d.get("elements", []):
+        if "lat" not in e or "lon" not in e:
+            continue
+        t = e.get("tags") or {}
+        x = (e["lon"] - lon_c) * m_lon + half
+        z = -(e["lat"] - lat_c) * m_lat + half
+        if not (0 <= x <= size and 0 <= z <= size):
+            continue
+        # crossing=traffic_signals は歩行者用、highway=traffic_signals は車両用
+        kind = "ped" if t.get("crossing") == "traffic_signals" else "car"
+        pts.append({"x": x, "z": z, "kind": kind})
+
+    # 近いノードを同じ交差点に束ねる(単純な連結成分)
+    n = len(pts)
+    grp = list(range(n))
+
+    def find(a):
+        while grp[a] != a:
+            grp[a] = grp[grp[a]]
+            a = grp[a]
+        return a
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if math.dist((pts[i]["x"], pts[i]["z"]), (pts[j]["x"], pts[j]["z"])) <= radius:
+                a, b = find(i), find(j)
+                if a != b:
+                    grp[a] = b
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    out = []
+    for gi, (root, members) in enumerate(sorted(groups.items())):
+        cx = sum(pts[i]["x"] for i in members) / len(members)
+        cz = sum(pts[i]["z"] for i in members) / len(members)
+        for i in members:
+            dx, dz = pts[i]["x"] - cx, pts[i]["z"] - cz
+            axis = 0 if abs(dx) >= abs(dz) else 1
+            out.append({
+                "x": round(pts[i]["x"], 2), "z": round(pts[i]["z"], 2),
+                "k": pts[i]["kind"], "g": gi, "a": axis,
+                # 交差点中心を向く角度(灯器の正面を車の来る側へ向ける)
+                "r": round(math.atan2(-dx, -dz), 3),
+            })
+    return out
+
+
 def parse_bus_routes(path, lat_c, lon_c, m_lat, m_lon, half, size, max_routes):
     """OSM のバス路線リレーション(type=route, route=bus)を走行経路にする。
 
@@ -376,6 +434,7 @@ def main():
     ap.add_argument("--bus", default="", help="バス停 (OSM Overpass JSON)")
     ap.add_argument("--osm-named", default="", help="名前付き地物 (OSM Overpass JSON)")
     ap.add_argument("--bus-routes", default="", help="バス路線 (OSM route relation JSON)")
+    ap.add_argument("--signals", default="", help="信号 (OSM Overpass JSON)")
     ap.add_argument("--max-routes", type=int, default=4, help="走らせる路線数")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -556,6 +615,16 @@ def main():
             print(f"  路線 {r['ref']:>4} {r['name'][:34]} ({len(r['f']) // 2}点)",
                   file=sys.stderr)
 
+    signals = []
+    if args.signals:
+        path = (args.signals if os.path.isabs(args.signals)
+                else os.path.join(NAHA, args.signals))
+        signals = parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        ng = len({s["g"] for s in signals})
+        ncar = sum(1 for s in signals if s["k"] == "car")
+        print(f"  {os.path.basename(path)}: 信号 {len(signals)}基 "
+              f"(車両{ncar}/歩行者{len(signals)-ncar}) / 交差点 {ng}箇所", file=sys.stderr)
+
     # 中心の地表高さ(スポーン基準)
     ci = n // 2
     world = {
@@ -575,6 +644,7 @@ def main():
         "bus": bus,
         "busRoutes": bus_routes,
         "landmarks": landmarks,
+        "signals": signals,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
