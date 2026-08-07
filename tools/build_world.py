@@ -106,14 +106,46 @@ def clip_segment(ax, az, bx, bz, lo, hi):
     return (ax + t0 * dx, az + t0 * dz, ax + t1 * dx, az + t1 * dz)
 
 
+def stitch(lines, tol=3.0):
+    """端点が接する折れ線どうしを繋ぐ(必要なら反転する)。
+
+    鉄道 GeoJSON は路線が細切れの feature で入っているので、繋がないと
+    「813m / 82m / 130m」のような断片になり、列車が短い往復をしてしまう。
+    """
+    rest = [list(l) for l in lines if len(l) >= 2]
+    out = []
+    while rest:
+        cur = rest.pop(0)
+        joined = True
+        while joined:
+            joined = False
+            for i, l in enumerate(rest):
+                if math.dist(cur[-1], l[0]) <= tol:
+                    cur += l[1:]
+                elif math.dist(cur[-1], l[-1]) <= tol:
+                    cur += l[-2::-1]
+                elif math.dist(cur[0], l[-1]) <= tol:
+                    cur = l[:-1] + cur
+                elif math.dist(cur[0], l[0]) <= tol:
+                    cur = l[:0:-1] + cur
+                else:
+                    continue
+                rest.pop(i)
+                joined = True
+                break
+        out.append(cur)
+    return out
+
+
 def parse_rail(path, lat_c, lon_c, m_lat, m_lon, half, margin):
     """鉄道 GeoJSON(国土数値情報由来)の線形をローカル座標の折れ線にする。
 
     高さは持たない(2Dの中心線)ので、桁の高さは描画側で地形から合成する。
+    細切れの feature を先に繋いでから矩形で切る(先に切ると繋がらなくなる)。
     """
     d = json.load(open(path, encoding="utf-8"))
     lo, hi = -margin, 2 * half + margin
-    out = []
+    raw = []
     for f in d.get("features", []):
         g = f.get("geometry") or {}
         lines = g.get("coordinates") or []
@@ -124,24 +156,29 @@ def parse_rail(path, lat_c, lon_c, m_lat, m_lon, half, margin):
                 ((c[0] - lon_c) * m_lon + half, -(c[1] - lat_c) * m_lat + half)
                 for c in line
             ]
-            cur = []
-            for i in range(len(pts) - 1):
-                seg = clip_segment(*pts[i], *pts[i + 1], lo, hi)
-                if seg is None:
-                    if len(cur) >= 2:
-                        out.append(cur)
-                    cur = []
-                    continue
-                ax, az, bx, bz = seg
-                if not cur:
-                    cur = [(ax, az)]
-                elif abs(cur[-1][0] - ax) > 0.5 or abs(cur[-1][1] - az) > 0.5:
-                    if len(cur) >= 2:
-                        out.append(cur)
-                    cur = [(ax, az)]
-                cur.append((bx, bz))
-            if len(cur) >= 2:
-                out.append(cur)
+            if len(pts) >= 2:
+                raw.append(pts)
+
+    out = []
+    for pts in stitch(raw):
+        cur = []
+        for i in range(len(pts) - 1):
+            seg = clip_segment(*pts[i], *pts[i + 1], lo, hi)
+            if seg is None:
+                if len(cur) >= 2:
+                    out.append(cur)
+                cur = []
+                continue
+            ax, az, bx, bz = seg
+            if not cur:
+                cur = [(ax, az)]
+            elif abs(cur[-1][0] - ax) > 0.5 or abs(cur[-1][1] - az) > 0.5:
+                if len(cur) >= 2:
+                    out.append(cur)
+                cur = [(ax, az)]
+            cur.append((bx, bz))
+        if len(cur) >= 2:
+            out.append(cur)
     return out
 
 
