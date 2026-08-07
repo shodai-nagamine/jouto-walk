@@ -85,6 +85,85 @@ def parse_roads(gml_path):
     return out
 
 
+def clip_segment(ax, az, bx, bz, lo, hi):
+    """線分を [lo,hi]x[lo,hi] の矩形で切る(Liang-Barsky)。外なら None。"""
+    dx, dz = bx - ax, bz - az
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, ax - lo), (dx, hi - ax), (-dz, az - lo), (dz, hi - az)):
+        if p == 0:
+            if q < 0:
+                return None
+            continue
+        r = q / p
+        if p < 0:
+            if r > t1:
+                return None
+            t0 = max(t0, r)
+        else:
+            if r < t0:
+                return None
+            t1 = min(t1, r)
+    return (ax + t0 * dx, az + t0 * dz, ax + t1 * dx, az + t1 * dz)
+
+
+def parse_rail(path, lat_c, lon_c, m_lat, m_lon, half, margin):
+    """鉄道 GeoJSON(国土数値情報由来)の線形をローカル座標の折れ線にする。
+
+    高さは持たない(2Dの中心線)ので、桁の高さは描画側で地形から合成する。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = -margin, 2 * half + margin
+    out = []
+    for f in d.get("features", []):
+        g = f.get("geometry") or {}
+        lines = g.get("coordinates") or []
+        if g.get("type") == "LineString":
+            lines = [lines]
+        for line in lines:
+            pts = [
+                ((c[0] - lon_c) * m_lon + half, -(c[1] - lat_c) * m_lat + half)
+                for c in line
+            ]
+            cur = []
+            for i in range(len(pts) - 1):
+                seg = clip_segment(*pts[i], *pts[i + 1], lo, hi)
+                if seg is None:
+                    if len(cur) >= 2:
+                        out.append(cur)
+                    cur = []
+                    continue
+                ax, az, bx, bz = seg
+                if not cur:
+                    cur = [(ax, az)]
+                elif abs(cur[-1][0] - ax) > 0.5 or abs(cur[-1][1] - az) > 0.5:
+                    if len(cur) >= 2:
+                        out.append(cur)
+                    cur = [(ax, az)]
+                cur.append((bx, bz))
+            if len(cur) >= 2:
+                out.append(cur)
+    return out
+
+
+def parse_stations(path, lat_c, lon_c, m_lat, m_lon, half, margin):
+    """駅 CZML から駅名と位置を取り出す。position の高さは地盤高なので使わない。"""
+    out = []
+    for p in json.load(open(path, encoding="utf-8")):
+        pos = (p.get("position") or {}).get("cartographicDegrees")
+        if not pos:
+            continue
+        lon, lat = pos[0], pos[1]
+        x = (lon - lon_c) * m_lon + half
+        z = -(lat - lat_c) * m_lat + half
+        if not (-margin <= x <= 2 * half + margin and -margin <= z <= 2 * half + margin):
+            continue
+        out.append({
+            "name": p.get("name") or (p.get("properties") or {}).get("駅名") or "",
+            "x": round(x, 2), "z": round(z, 2),
+        })
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--center", nargs=2, type=float, required=True, metavar=("LAT", "LON"))
@@ -93,6 +172,8 @@ def main():
     ap.add_argument("--gml", nargs="+", required=True, help="建物CityGML(複数可)")
     ap.add_argument("--dem", nargs="*", default=[], help="地形CityGML(複数可)")
     ap.add_argument("--tran", nargs="*", default=[], help="交通(道路)CityGML(複数可)")
+    ap.add_argument("--rail", default="", help="鉄道 GeoJSON(モノレール線形)")
+    ap.add_argument("--stations", default="", help="鉄道駅 CZML")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -204,6 +285,28 @@ def main():
             file=sys.stderr,
         )
 
+    # ---- モノレール ---------------------------------------------------------
+    # 桁が地形の端でぶつ切りにならないよう、ワールドより少し外まで延ばす
+    RAIL_MARGIN = 80
+    rail = []
+    if args.rail:
+        path = args.rail if os.path.isabs(args.rail) else os.path.join(NAHA, args.rail)
+        for line in parse_rail(path, lat_c, lon_c, m_lat, m_lon, half, RAIL_MARGIN):
+            rail.append([round(v, 2) for p in line for v in p])
+        pts = sum(len(r) // 2 for r in rail)
+        print(f"  {os.path.basename(path)}: 線形 {len(rail)}本 / {pts}点", file=sys.stderr)
+
+    stations = []
+    if args.stations:
+        path = (args.stations if os.path.isabs(args.stations)
+                else os.path.join(NAHA, args.stations))
+        stations = parse_stations(path, lat_c, lon_c, m_lat, m_lon, half, RAIL_MARGIN)
+        print(
+            f"  {os.path.basename(path)}: 駅 {len(stations)} "
+            f"({', '.join(s['name'] for s in stations) or 'なし'})",
+            file=sys.stderr,
+        )
+
     # 中心の地表高さ(スポーン基準)
     ci = n // 2
     world = {
@@ -218,6 +321,8 @@ def main():
         "terrain": [round(float(v), 2) for v in terrain.reshape(-1)],
         "buildings": buildings,
         "roads": roads,
+        "rail": rail,
+        "stations": stations,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:

@@ -347,6 +347,120 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
 }
 
 /** (x,z) が建物の壁から r 以内(または内部)か。r を広げれば「開けた場所」判定になる。 */
+// ---------------------------------------------------------------- モノレール
+// 沖縄都市モノレール(ゆいレール)。線形は国土数値情報由来の2D中心線なので、
+// 跨座式の高架らしく地形から一定の高さに桁を浮かせ、橋脚で地面まで降ろす。
+const RAIL_H = 10.5;        // 地表から桁の中心までの高さ(m)
+const BEAM_W = 0.85;        // 桁の幅(m)
+const BEAM_T = 1.6;         // 桁の高さ(m)
+const PIER_EVERY = 26;      // 橋脚の間隔(m)
+const railPaths = [];       // 描画・車両走行に使う {pts:[{x,y,z}], len, cum[]}
+
+function buildMonorail() {
+  const group = new THREE.Group();
+  const beamMat = new THREE.MeshLambertMaterial({ color: 0xd8d5cc });
+  const pierMat = new THREE.MeshLambertMaterial({ color: 0xc3c0b6 });
+  const V = [], N = [], piers = [];
+
+  const push = (p, nx, ny, nz) => { V.push(p[0], p[1], p[2]); N.push(nx, ny, nz); };
+  const quad = (a, b, c, d, nx, ny, nz) => {
+    push(a, nx, ny, nz); push(b, nx, ny, nz); push(c, nx, ny, nz);
+    push(a, nx, ny, nz); push(c, nx, ny, nz); push(d, nx, ny, nz);
+  };
+
+  for (const flat of world.rail ?? []) {
+    // 8m 間隔に打ち直す(元データは頂点が疎で、地形に沿わせるため)
+    const raw = [];
+    for (let i = 0; i < flat.length; i += 2) raw.push([flat[i] - HALF, flat[i + 1] - HALF]);
+    const pts = [];
+    for (let i = 0; i < raw.length - 1; i++) {
+      const [ax, az] = raw[i], [bx, bz] = raw[i + 1];
+      const d = Math.hypot(bx - ax, bz - az);
+      const steps = Math.max(1, Math.round(d / 8));
+      for (let s = 0; s < steps; s++) {
+        const t = s / steps;
+        pts.push([ax + (bx - ax) * t, az + (bz - az) * t]);
+      }
+    }
+    pts.push(raw[raw.length - 1]);
+    if (pts.length < 2) continue;
+
+    // 桁の高さ: 地形+RAIL_H を移動平均でならす(実物ほど水平ではないが起伏は消える)
+    const gy = pts.map(([x, z]) => groundAt(x, z) + RAIL_H);
+    const y = gy.map((_, i) => {
+      let s = 0, c = 0;
+      for (let k = Math.max(0, i - 6); k <= Math.min(gy.length - 1, i + 6); k++) { s += gy[k]; c++; }
+      return s / c;
+    });
+
+    const path = { pts: pts.map(([x, z], i) => ({ x, y: y[i], z })), cum: [0], len: 0 };
+    for (let i = 1; i < pts.length; i++) {
+      path.len += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+      path.cum.push(path.len);
+    }
+    railPaths.push(path);
+
+    // 桁を角断面のリボンとして張る
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [ax, az] = pts[i], [bx, bz] = pts[i + 1];
+      let dx = bx - ax, dz = bz - az;
+      const L = Math.hypot(dx, dz) || 1;
+      dx /= L; dz /= L;
+      const px = dz * BEAM_W, pz = -dx * BEAM_W;      // 断面の横方向
+      const ay = y[i], by = y[i + 1];
+      const c = (x, yy, z) => [x, yy, z];
+      // 上面・下面・左右
+      quad(c(ax - px, ay + BEAM_T / 2, az - pz), c(bx - px, by + BEAM_T / 2, bz - pz),
+           c(bx + px, by + BEAM_T / 2, bz + pz), c(ax + px, ay + BEAM_T / 2, az + pz), 0, 1, 0);
+      quad(c(ax + px, ay - BEAM_T / 2, az + pz), c(bx + px, by - BEAM_T / 2, bz + pz),
+           c(bx - px, by - BEAM_T / 2, bz - pz), c(ax - px, ay - BEAM_T / 2, az - pz), 0, -1, 0);
+      quad(c(ax - px, ay - BEAM_T / 2, az - pz), c(bx - px, by - BEAM_T / 2, bz - pz),
+           c(bx - px, by + BEAM_T / 2, bz - pz), c(ax - px, ay + BEAM_T / 2, az - pz), -dz, 0, dx);
+      quad(c(ax + px, ay + BEAM_T / 2, az + pz), c(bx + px, by + BEAM_T / 2, bz + pz),
+           c(bx + px, by - BEAM_T / 2, bz + pz), c(ax + px, ay - BEAM_T / 2, az + pz), dz, 0, -dx);
+    }
+
+    // 橋脚(地形がある範囲だけ)。本数が多いので位置だけ溜めて後でまとめる
+    let next = 0;
+    for (let i = 0; i < pts.length; i++) {
+      if (path.cum[i] < next) continue;
+      next = path.cum[i] + PIER_EVERY;
+      const [x, z] = pts[i];
+      if (Math.abs(x) > HALF - 2 || Math.abs(z) > HALF - 2) continue;
+      const g = groundAt(x, z);
+      const h = y[i] - BEAM_T / 2 - g;
+      if (h < 1) continue;
+      piers.push([x, g + h / 2, z, h]);
+    }
+  }
+
+  // 橋脚は1本のInstancedMeshにまとめる(高さは行列のYスケールで出す)
+  if (piers.length) {
+    const im = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(0.75, 0.95, 1, 8), pierMat, piers.length);
+    const m = new THREE.Matrix4();
+    piers.forEach(([x, y0, z, h], i) => {
+      m.makeScale(1, h, 1); m.setPosition(x, y0, z);
+      im.setMatrixAt(i, m);
+    });
+    im.instanceMatrix.needsUpdate = true;
+    im.castShadow = im.receiveShadow = true;
+    group.add(im);
+  }
+
+  if (V.length) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+    const beam = new THREE.Mesh(geo, beamMat);
+    beam.castShadow = beam.receiveShadow = true;
+    group.add(beam);
+  }
+  scene.add(group);
+  console.log(`モノレール 線形${railPaths.length}本 / 桁${V.length / 3}頂点 / 橋脚${piers.length}本`);
+  return group;
+}
+
 /** (x,z) で足が乗る高さ。地表か、footprint 内なら建物の天端(=屋根に立てる)。 */
 function supportY(x, z) {
   let h = groundAt(x, z);
@@ -625,6 +739,89 @@ for (let i = 0; i < N_SEESAA; i++) {
   scene.add(g);
 }
 
+// ---------------------------------------------------------------- モノレール設置
+buildMonorail();
+
+/** 折れ線の距離 d の地点と進行方位を返す。 */
+function railAt(path, d) {
+  d = Math.max(0, Math.min(path.len, d));
+  let i = 1;
+  while (i < path.cum.length - 1 && path.cum[i] < d) i++;
+  const span = path.cum[i] - path.cum[i - 1] || 1;
+  const t = (d - path.cum[i - 1]) / span;
+  const a = path.pts[i - 1], b = path.pts[i];
+  return {
+    x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t,
+    yaw: Math.atan2(b.x - a.x, b.z - a.z),
+  };
+}
+
+/** 文字を描いた板(スプライト)。駅名の表示に使う。 */
+function makeLabel(text, w = 9, h = 2.4) {
+  const cv = document.createElement('canvas');
+  cv.width = 512; cv.height = 128;
+  const c = cv.getContext('2d');
+  c.fillStyle = '#0d1b1e'; c.fillRect(0, 0, 512, 128);
+  c.fillStyle = '#f6f3ea';
+  c.font = 'bold 62px "Hiragino Sans", sans-serif';
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.fillText(text, 256, 66);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: new THREE.CanvasTexture(cv), transparent: true, depthTest: false, fog: false,
+  }));
+  s.scale.set(w, h, 1);
+  return s;
+}
+
+// 駅(ホーム＋屋根＋駅名)。線形上のいちばん近い点に合わせて向きを決める
+for (const st of world.stations ?? []) {
+  const sx = st.x - HALF, sz = st.z - HALF;
+  let best = null;
+  for (const p of railPaths) {
+    for (let d = 0; d <= p.len; d += 4) {
+      const q = railAt(p, d);
+      const dist = Math.hypot(q.x - sx, q.z - sz);
+      if (!best || dist < best.dist) best = { dist, q };
+    }
+  }
+  if (!best || best.dist > 90) continue;
+  const { q } = best;
+  // 駅舎は PLATEAU の建物として既にある(石嶺駅=17x53m/高さ約16m)。
+  // 高架はその中をホーム高さで通り抜けるのが実際の姿なので、
+  // ホームを作らず駅名だけを建物の上に出す。
+  const lab = makeLabel(`${st.name}駅`);
+  lab.position.set(q.x, supportY(q.x, q.z) + 5.5, q.z);
+  scene.add(lab);
+  console.log(`駅名を設置: ${st.name} (${q.x.toFixed(0)}, ${q.z.toFixed(0)})`);
+}
+
+// 走る車両(2両)。線形を往復するので端で消えたり湧いたりしない
+let train = null, trainPath = null, trainD = 0, trainDir = 1;
+if (railPaths.length) {
+  trainPath = railPaths.reduce((a, b) => (b.len > a.len ? b : a));
+  train = new THREE.Group();
+  for (const cz of [-7.2, 7.2]) {
+    const car = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(2.6, 3.1, 13.2),
+      new THREE.MeshLambertMaterial({ color: 0xf4f2ec }));
+    body.castShadow = true;
+    car.add(body);
+    const band = new THREE.Mesh(new THREE.BoxGeometry(2.68, 1.05, 12.4),
+      new THREE.MeshLambertMaterial({ color: 0x2b3b46 }));
+    band.position.y = 0.55;
+    car.add(band);
+    const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.7, 0.28, 12.8),
+      new THREE.MeshLambertMaterial({ color: 0x2f8fc4 }));
+    stripe.position.y = -0.55;
+    car.add(stripe);
+    car.position.z = cz;
+    train.add(car);
+  }
+  train.position.y = -9999;                   // 初回 tick で正しい位置に移す
+  scene.add(train);
+  trainD = trainPath.len * 0.25;
+}
+
 // ---------------------------------------------------------------- 操作
 const player = {
   x: 0, z: 0, y: 0, vy: 0, yaw: Math.PI * 0.15, pitch: 0.10, onGround: true,
@@ -829,6 +1026,15 @@ base.width = base.height = MS;
   b.fillStyle = 'rgba(190,205,205,.30)';
   roadPath(b, w2m, w2m);
   b.fill();
+  // モノレール(街の骨格として道路より目立たせる)
+  b.strokeStyle = 'rgba(120,190,235,.85)';
+  b.lineWidth = Math.max(2, 3 * (MS / 188));
+  b.lineCap = 'round';
+  for (const p of railPaths) {
+    b.beginPath();
+    p.pts.forEach((q, i) => (i ? b.lineTo(w2m(q.x), w2m(q.z)) : b.moveTo(w2m(q.x), w2m(q.z))));
+    b.stroke();
+  }
   b.fillStyle = 'rgba(246,243,234,.42)';
   for (const bd of bstore) {
     b.beginPath();
@@ -1023,6 +1229,16 @@ function tick() {
   sun.position.set(player.x + 150, groundAt(player.x, player.z) + 260, player.z + 110);
   sun.target.updateMatrixWorld();
 
+  // モノレールの車両(端に着いたら折り返す)
+  if (train && trainPath) {
+    trainD += trainDir * 11 * dt;             // 約40km/h
+    if (trainD > trainPath.len) { trainD = trainPath.len; trainDir = -1; }
+    if (trainD < 0) { trainD = 0; trainDir = 1; }
+    const q = railAt(trainPath, trainD);
+    train.position.set(q.x, q.y + 0.9, q.z);  // 桁をまたぐので少し上に乗せる
+    train.rotation.y = q.yaw + (trainDir < 0 ? Math.PI : 0);
+  }
+
   // シーサーの回収
   let nearest = Infinity;
   for (const s of seesaa) {
@@ -1063,7 +1279,7 @@ let elapsed = 0, frame = 0;
 
 // 動作確認用(コンソールから位置や視点を動かせる)
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
-  world, renderer, degrade, quality: () => qLevel, setFly,
+  world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
 
 // ---------------------------------------------------------------- 起動
