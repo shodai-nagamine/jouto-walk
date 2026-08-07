@@ -223,6 +223,85 @@ def parse_osm_named(path, lat_c, lon_c, m_lat, m_lon, half, size):
     return out
 
 
+def parse_bus_routes(path, lat_c, lon_c, m_lat, m_lon, half, size, max_routes):
+    """OSM のバス路線リレーション(type=route, route=bus)を走行経路にする。
+
+    メンバーの way は順に並んでいるが向きは揃っていないので、端点の近さで
+    反転させながら繋ぐ。そのあとワールドの矩形で切り、いちばん長く連続する
+    区間だけを採る(出入りを繰り返す破片は使わない)。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = 0.0, float(size)
+    cands = []
+    for rel in d.get("elements", []):
+        t = rel.get("tags") or {}
+        chain = []
+        for m in rel.get("members", []):
+            if m.get("type") != "way" or m.get("role", "") not in ("", "forward", "backward"):
+                continue
+            g = [p for p in (m.get("geometry") or []) if p]
+            if len(g) < 2:
+                continue
+            pts = [(p["lon"], p["lat"]) for p in g]
+            if not chain:
+                chain = pts
+                continue
+            a = chain[-1]
+            d0 = (a[0] - pts[0][0]) ** 2 + (a[1] - pts[0][1]) ** 2
+            d1 = (a[0] - pts[-1][0]) ** 2 + (a[1] - pts[-1][1]) ** 2
+            if d1 < d0:
+                pts = pts[::-1]
+            chain.extend(pts[1:])
+        if len(chain) < 2:
+            continue
+
+        xz = [((lon - lon_c) * m_lon + half, -(lat - lat_c) * m_lat + half)
+              for lon, lat in chain]
+        # ワールド内で最も長く続く区間を採る
+        runs, cur = [], []
+        for i in range(len(xz) - 1):
+            seg = clip_segment(*xz[i], *xz[i + 1], lo, hi)
+            if seg is None:
+                if len(cur) >= 2:
+                    runs.append(cur)
+                cur = []
+                continue
+            ax, az, bx, bz = seg
+            if not cur:
+                cur = [(ax, az)]
+            elif abs(cur[-1][0] - ax) > 0.5 or abs(cur[-1][1] - az) > 0.5:
+                if len(cur) >= 2:
+                    runs.append(cur)
+                cur = [(ax, az)]
+            cur.append((bx, bz))
+        if len(cur) >= 2:
+            runs.append(cur)
+        if not runs:
+            continue
+
+        def length(r):
+            return sum(math.dist(r[i], r[i + 1]) for i in range(len(r) - 1))
+
+        best = max(runs, key=length)
+        L = length(best)
+        if L < 150:                       # かすめるだけの路線は使わない
+            continue
+        cands.append({
+            "ref": t.get("ref", ""), "name": t.get("name", ""),
+            "op": t.get("operator", ""), "len": L, "pts": best,
+        })
+
+    # 同じ系統番号は往復で2本あるので、長いほうを1本だけ残す
+    byref = {}
+    for c in sorted(cands, key=lambda c: -c["len"]):
+        byref.setdefault(c["ref"], c)
+    picked = sorted(byref.values(), key=lambda c: -c["len"])[:max_routes]
+    return [{
+        "ref": c["ref"], "name": c["name"], "op": c["op"],
+        "f": [round(v, 2) for p in c["pts"] for v in p],
+    } for c in picked]
+
+
 def parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, margin):
     """OpenStreetMap(Overpass API)のバス停ノードをローカル座標にする。
 
@@ -259,6 +338,8 @@ def main():
     ap.add_argument("--stations", default="", help="鉄道駅 CZML")
     ap.add_argument("--bus", default="", help="バス停 (OSM Overpass JSON)")
     ap.add_argument("--osm-named", default="", help="名前付き地物 (OSM Overpass JSON)")
+    ap.add_argument("--bus-routes", default="", help="バス路線 (OSM route relation JSON)")
+    ap.add_argument("--max-routes", type=int, default=4, help="走らせる路線数")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -428,6 +509,16 @@ def main():
             file=sys.stderr,
         )
 
+    bus_routes = []
+    if args.bus_routes:
+        path = (args.bus_routes if os.path.isabs(args.bus_routes)
+                else os.path.join(NAHA, args.bus_routes))
+        bus_routes = parse_bus_routes(path, lat_c, lon_c, m_lat, m_lon,
+                                      half, args.size, args.max_routes)
+        for r in bus_routes:
+            print(f"  路線 {r['ref']:>4} {r['name'][:34]} ({len(r['f']) // 2}点)",
+                  file=sys.stderr)
+
     # 中心の地表高さ(スポーン基準)
     ci = n // 2
     world = {
@@ -445,6 +536,7 @@ def main():
         "rail": rail,
         "stations": stations,
         "bus": bus,
+        "busRoutes": bus_routes,
         "landmarks": landmarks,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

@@ -898,6 +898,77 @@ const councilPosts = [];
     `${(council.places ?? []).reduce((n, p) => n + p.speeches.length, 0)}発言`);
 }
 
+// ---------------------------------------------------------------- 走るバス
+// 経路は OSM のバス路線リレーション(那覇バスの実系統)。時刻表は持たないので
+// 走行は任意のタイミングだが、経路と停留所は実在のもの。
+const buses = [];
+{
+  const LIVERY = [0xf2f0ea, 0xe8642f];   // 白地にオレンジ帯(那覇バスのイメージ)
+  for (const [i, r] of (world.busRoutes ?? []).entries()) {
+    const pts = [];
+    for (let k = 0; k < r.f.length; k += 2) pts.push([r.f[k] - HALF, r.f[k + 1] - HALF]);
+    if (pts.length < 2) continue;
+    const path = { pts: pts.map(([x, z]) => ({ x, z })), cum: [0], len: 0 };
+    for (let k = 1; k < pts.length; k++) {
+      path.len += Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]);
+      path.cum.push(path.len);
+    }
+
+    // 経路上でバス停に近づく地点(そこで少し停まる)
+    const stops = [];
+    for (let d = 0; d < path.len; d += 5) {
+      const q = pathAt(path, d);
+      for (const b of world.bus ?? []) {
+        if (Math.hypot(b.x - HALF - q.x, b.z - HALF - q.z) < 13) {
+          if (!stops.length || d - stops[stops.length - 1] > 45) stops.push(d);
+          break;
+        }
+      }
+    }
+
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(2.5, 2.9, 9.2),
+      new THREE.MeshLambertMaterial({ color: LIVERY[0] }));
+    body.position.y = 1.75; body.castShadow = true; g.add(body);
+    const band = new THREE.Mesh(new THREE.BoxGeometry(2.56, 0.5, 9.0),
+      new THREE.MeshLambertMaterial({ color: LIVERY[1] }));
+    band.position.y = 1.15; g.add(band);
+    const win = new THREE.Mesh(new THREE.BoxGeometry(2.58, 0.95, 8.4),
+      new THREE.MeshLambertMaterial({ color: 0x33424c }));
+    win.position.y = 2.35; g.add(win);
+    for (const [wx, wz] of [[-1.15, 3.0], [1.15, 3.0], [-1.15, -2.6], [1.15, -2.6]]) {
+      const t = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 0.34, 10),
+        new THREE.MeshLambertMaterial({ color: 0x24282a }));
+      t.rotation.z = Math.PI / 2; t.position.set(wx, 0.45, wz); g.add(t);
+    }
+    const lab = makeLabel(`${r.ref}  ${r.name.split('(')[0].trim()}`, 7.6, 1.9);
+    lab.position.y = 4.4;
+    g.add(lab);
+    scene.add(g);
+
+    buses.push({
+      g, path, stops, label: lab,
+      d: path.len * (0.13 + 0.21 * i), dir: 1, wait: 0,
+    });
+  }
+  console.log(`バス ${buses.length}台 / 経路 ` +
+    (world.busRoutes ?? []).map((r) => r.ref).join('、'));
+}
+
+/** 折れ線の距離 d の地点と方位(バス用。高さは地形から取る)。 */
+function pathAt(path, d) {
+  d = Math.max(0, Math.min(path.len, d));
+  let i = 1;
+  while (i < path.cum.length - 1 && path.cum[i] < d) i++;
+  const span = path.cum[i] - path.cum[i - 1] || 1;
+  const t = (d - path.cum[i - 1]) / span;
+  const a = path.pts[i - 1], b = path.pts[i];
+  return {
+    x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t,
+    yaw: Math.atan2(b.x - a.x, b.z - a.z),
+  };
+}
+
 // 走る車両(2両)。線形を往復するので端で消えたり湧いたりしない
 let train = null, trainPath = null, trainD = 0, trainDir = 1;
 if (railPaths.length) {
@@ -1216,10 +1287,11 @@ const tape = $('tape');
 // ---------------------------------------------------------------- 議会パネル
 const COUNCIL_R = 16;          // この距離まで近づくと出る(m)
 let councilNear = null, councilIdx = 0, councilRead = 0;
+let councilClosed = false;     // ✕で閉じた。離れるまで出し直さない
 const cvEl = $('council');
 
 function showCouncil(g) {
-  if (!g) { cvEl.classList.remove('on'); return; }
+  if (!g || councilClosed) { cvEl.classList.remove('on'); return; }
   const p = g.userData.place;
   const s = p.speeches[councilIdx % p.speeches.length];
   $('cv-place').textContent = p.label;
@@ -1229,19 +1301,36 @@ function showCouncil(g) {
   const a = $('cv-link');
   a.href = s.url || '#';
   a.style.visibility = s.url ? 'visible' : 'hidden';
-  $('cv-nav').textContent = p.speeches.length > 1
-    ? `${councilIdx % p.speeches.length + 1} / ${p.speeches.length}　[Q]で次へ`
+  const multi = p.speeches.length > 1;
+  $('cv-next').hidden = !multi;
+  $('cv-nav').textContent = multi
+    ? `${councilIdx % p.speeches.length + 1} / ${p.speeches.length}`
     : `この場所の言及 ${p.hits}件中1件`;
   cvEl.classList.add('on');
 }
 
-// 同じ地点に複数の発言があるときは Q で送る(スマホはパネルのタップ)
+function closeCouncil() {
+  councilClosed = true;
+  cvEl.classList.remove('on');
+}
+function nextCouncil() {
+  if (!councilNear) return;
+  councilIdx++;
+  showCouncil(councilNear);
+}
+
+$('cv-close').addEventListener('click', closeCouncil);
+$('cv-next').addEventListener('click', nextCouncil);
+// タッチはクリック合成を待たずに反応させる(押しても反応しないと感じさせない)
+$('cv-close').addEventListener('touchstart', (e) => { e.preventDefault(); closeCouncil(); },
+  { passive: false });
+$('cv-next').addEventListener('touchstart', (e) => { e.preventDefault(); nextCouncil(); },
+  { passive: false });
+
 addEventListener('keydown', (e) => {
-  if (e.code === 'KeyQ' && councilNear) { councilIdx++; showCouncil(councilNear); }
-});
-cvEl.addEventListener('click', (e) => {
-  if (e.target.id === 'cv-link') return;   // リンクはそのまま開かせる
-  if (councilNear) { councilIdx++; showCouncil(councilNear); }
+  if (!councilNear) return;
+  if (e.code === 'KeyQ') nextCouncil();
+  if (e.code === 'KeyX') closeCouncil();
 });
 
 // ---------------------------------------------------------------- HUD状態
@@ -1381,6 +1470,27 @@ function tick() {
   sun.position.set(player.x + 150, groundAt(player.x, player.z) + 260, player.z + 110);
   sun.target.updateMatrixWorld();
 
+  // バス(バス停で少し停まる。端まで行ったら折り返す=上り下り)
+  for (const b of buses) {
+    if (b.wait > 0) {
+      b.wait -= dt;
+    } else {
+      const prev = b.d;
+      b.d += b.dir * 8.5 * dt;              // 約30km/h
+      if (b.d > b.path.len) { b.d = b.path.len; b.dir = -1; b.wait = 2.5; }
+      if (b.d < 0) { b.d = 0; b.dir = 1; b.wait = 2.5; }
+      // 通過したバス停で停車
+      for (const s of b.stops) {
+        if ((prev < s && b.d >= s) || (prev > s && b.d <= s)) { b.wait = 2.2; break; }
+      }
+    }
+    const q = pathAt(b.path, b.d);
+    b.g.position.set(q.x, groundAt(q.x, q.z), q.z);
+    b.g.rotation.y = q.yaw + (b.dir < 0 ? Math.PI : 0);
+    // 系統名は近くだけ
+    b.label.visible = Math.hypot(q.x - player.x, q.z - player.z) < 110;
+  }
+
   // モノレールの車両(端に着いたら折り返す)
   if (train && trainPath) {
     trainD += trainDir * 11 * dt;             // 約40km/h
@@ -1404,6 +1514,7 @@ function tick() {
     if (hit !== councilNear) {
       councilNear = hit;
       councilIdx = 0;
+      councilClosed = false;      // 別の地点(や圏外)に移ったら閉じた状態は解除
       showCouncil(hit);
       if (hit && !hit.userData.read) {
         hit.userData.read = true;
@@ -1459,7 +1570,7 @@ let elapsed = 0, frame = 0;
 // 動作確認用(コンソールから位置や視点を動かせる)
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
-  council, councilPosts, showCouncil,
+  council, councilPosts, showCouncil, buses,
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
 
 // ---------------------------------------------------------------- 起動

@@ -84,11 +84,26 @@
   #card .credit a { color:var(--paper); }
 
   /* ---- 市議会の言及パネル ---- */
+  /* パネル自体はクリックを受け取らない。受け取るとパネルが画面を覆っている間
+     移動や視点のタッチが奪われて、その場から動けなくなる */
   #council { display:none; left:50%; transform:translateX(-50%); bottom:96px;
     width:min(620px, calc(100vw - 28px)); padding:13px 16px 11px;
-    pointer-events:auto; border-color:rgba(232,100,47,.42); }
+    pointer-events:none; border-color:rgba(232,100,47,.42); }
   #council.on { display:block; }
   #council .ch { display:flex; align-items:baseline; gap:9px; margin-bottom:7px; }
+  /* 押せるのはこの3つだけ */
+  #council .x, #council .nx, #council .foot a { pointer-events:auto; }
+  #council .x { margin-left:auto; background:rgba(246,243,234,.14);
+    border:1px solid rgba(246,243,234,.28); color:var(--paper);
+    border-radius:6px; width:30px; height:30px; font-size:14px; line-height:1;
+    cursor:pointer; font-family:inherit; flex:none; }
+  #council .x:hover, #council .x:active { background:var(--accent); color:#160c06; }
+  #council .nx { background:rgba(232,100,47,.18); color:var(--accent);
+    border:1px solid rgba(232,100,47,.45); border-radius:999px;
+    padding:4px 12px; font-size:11px; font-weight:700; cursor:pointer;
+    font-family:inherit; }
+  #council .nx:hover, #council .nx:active { background:var(--accent); color:#160c06; }
+  #council .nx[hidden] { display:none; }
   #council .tag { font-size:10px; letter-spacing:.14em; color:#160c06;
     background:var(--accent); border-radius:3px; padding:2px 7px; font-weight:700;
     white-space:nowrap; }
@@ -99,7 +114,7 @@
   #council .quote { font-size:12.5px; line-height:1.85; max-height:8.4em;
     overflow:hidden; border-left:2px solid rgba(232,100,47,.5); padding-left:10px; }
   #council .foot { display:flex; justify-content:space-between; align-items:center;
-    margin-top:9px; font-size:11px; }
+    gap:10px; margin-top:9px; font-size:11px; }
   #council .foot a { color:var(--accent); text-decoration:none; font-weight:700;
     pointer-events:auto; }
   #council .foot a:hover { text-decoration:underline; }
@@ -213,11 +228,13 @@
     <div class="ch">
       <span class="tag">市議会で言及</span>
       <span class="place" id="cv-place"></span>
+      <button class="x" id="cv-close" aria-label="閉じる">✕</button>
     </div>
     <div class="who"><b id="cv-speaker"></b><span id="cv-date"></span></div>
     <div class="quote" id="cv-quote"></div>
     <div class="foot">
       <a id="cv-link" href="#" target="_blank" rel="noopener">原文を読む ↗</a>
+      <button class="nx" id="cv-next">次の発言 ›</button>
       <span class="nav" id="cv-nav"></span>
     </div>
   </div>

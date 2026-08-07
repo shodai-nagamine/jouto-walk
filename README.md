@@ -83,7 +83,8 @@ PC:
   --dem 392725_dem_55.gml \
   --tran 39272568_tran.gml 39272578_tran.gml \
   --rail naha_railway.geojson --stations naha_station.czml \
-  --bus naha_bus_osm.json \
+  --bus naha_bus_osm.json --osm-named naha_named_osm.json \
+  --bus-routes naha_busroutes_osm.json \
   --out public/data/world.json
 ```
 
@@ -148,6 +149,13 @@ python3 tools/link_council.py --world public/data/world.json --out public/data/c
   会議録 9,749 発言）を、ワールド内の施設名で全文検索して地点に結びつける。
   16m 以内に近づくとパネルが出て、**発言者・日付・抜粋・原文リンク**が読める
   （同じ地点に複数あるときは `Q` かパネルのタップで送る）
+- **走るバス**: 経路は OSM のバス路線リレーション（**那覇バスの実系統**）。
+  この 1km 四方には 23 系統が通っていて、そのうち世界内を長く走る 4 本
+  （94 首里駅琉大快速線 / 346 那覇西原線 / 19 首里駅循環線 / 8 首里城下町線）を採用。
+  リレーションのメンバー way は向きが揃っていないので端点の近さで反転させながら繋ぎ、
+  ワールドで切って**いちばん長く連続する区間**だけを使う。
+  経路上でバス停に近づく地点を先に拾っておき、そこで 2.2 秒停まる。
+  **時刻表は持っていないので発車タイミングは任意**（GTFS が手に入れば差し替えられる）
 - **バス停**: 20 基（うち「城東小学校前」は校門のすぐ前）。支柱と台座は InstancedMesh、
   標識は canvas テクスチャのスプライトにして向きを持たせない。名札が 20 枚も常時
   見えると画面が埋まるので、**135m 以内だけ表示**する
