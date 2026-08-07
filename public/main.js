@@ -109,6 +109,33 @@ function facadeTexture() {
   return t;
 }
 
+// ------------------------------------------------ 当たり判定の空間ハッシュ
+// 升目 "gx,gz" -> [レコードの参照]。index ではなく参照を入れるのが要点。
+// index を入れると、タイルを破棄して store の途中が消えた瞬間に以降の
+// index が全部ずれ、当たり判定が音もなく壊れる(誤った建物を指すだけで
+// 例外は出ないので気づけない)。対象は外接矩形 minx/maxx/minz/maxz を
+// 持つレコード = 道路面・建物・ホーム。
+
+/** レコードを、その外接矩形が跨ぐ升目すべてに登録する。 */
+function hashInsert(map, rec) {
+  for (let gx = Math.floor(rec.minx / HASH); gx <= Math.floor(rec.maxx / HASH); gx++) {
+    for (let gz = Math.floor(rec.minz / HASH); gz <= Math.floor(rec.maxz / HASH); gz++) {
+      const k = `${gx},${gz}`;
+      (map.get(k) ?? map.set(k, []).get(k)).push(rec);
+    }
+  }
+}
+
+/** pred が真になるレコードを全升目から取り除く。空になった升目は消す。 */
+function hashRemove(map, pred) {
+  for (const [k, a] of map) {
+    const b = a.filter((r) => !pred(r));
+    if (b.length === a.length) continue;
+    if (b.length) map.set(k, b);
+    else map.delete(k);
+  }
+}
+
 // ---------------------------------------------------------------- 道路
 // PLATEAU の交通モデル(tran LOD1)の道路「面」。中心線ではなく実際の路面形状で、
 // 高さは持たない(一律0)ため平面として扱い、地面テクスチャに焼いて地形へ伏せる。
@@ -125,24 +152,18 @@ const rmap = new Map();
       if (x < minx) minx = x; if (x > maxx) maxx = x;
       if (z < minz) minz = z; if (z > maxz) maxz = z;
     }
-    const idx = rstore.length;
-    rstore.push({ ring, minx, maxx, minz, maxz });
-    for (let gx = Math.floor(minx / HASH); gx <= Math.floor(maxx / HASH); gx++) {
-      for (let gz = Math.floor(minz / HASH); gz <= Math.floor(maxz / HASH); gz++) {
-        const k = `${gx},${gz}`;
-        (rmap.get(k) ?? rmap.set(k, []).get(k)).push(idx);
-      }
-    }
+    const rec = { ring, minx, maxx, minz, maxz };
+    rstore.push(rec);
+    hashInsert(rmap, rec);
   }
   console.log(`道路面 ${rstore.length}`);
 }
 
 /** (x,z) が道路面の上か。シーサーの設置場所選びに使う。 */
 function onRoad(x, z) {
-  const ids = rmap.get(`${Math.floor(x / HASH)},${Math.floor(z / HASH)}`);
-  if (!ids) return false;
-  for (const id of ids) {
-    const r = rstore[id];
+  const hits = rmap.get(`${Math.floor(x / HASH)},${Math.floor(z / HASH)}`);
+  if (!hits) return false;
+  for (const r of hits) {
     if (x < r.minx || x > r.maxx || z < r.minz || z > r.maxz) continue;
     const g = r.ring, m = g.length;
     let inside = false;
@@ -321,7 +342,7 @@ function detailTexture() {
 // ---------------------------------------------------------------- 建物
 // 全棟を1つのBufferGeometryに詰める(ドローコール1回)。
 // 底面リングは build_world.py で CCW(符号付き面積>0)に揃えてある。
-const bmap = new Map();          // 空間ハッシュ: "gx,gz" -> [建物index]
+const bmap = new Map();          // 空間ハッシュ: "gx,gz" -> [建物レコードの参照]
 const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,maxx,minz,maxz}
 
 {
@@ -395,14 +416,9 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
     }
 
     // 当たり判定用の登録
-    const idx = bstore.length;
-    bstore.push({ ring, minx, maxx, minz, maxz, top });
-    for (let gx = Math.floor(minx / HASH); gx <= Math.floor(maxx / HASH); gx++) {
-      for (let gz = Math.floor(minz / HASH); gz <= Math.floor(maxz / HASH); gz++) {
-        const k = `${gx},${gz}`;
-        (bmap.get(k) ?? bmap.set(k, []).get(k)).push(idx);
-      }
-    }
+    const rec = { ring, minx, maxx, minz, maxz, top };
+    bstore.push(rec);
+    hashInsert(bmap, rec);
   }
 
   const geo = new THREE.BufferGeometry();
@@ -541,10 +557,9 @@ function buildMonorail() {
 /** (x,z) で足が乗る高さ。地表か、footprint 内なら建物の天端(=屋根に立てる)。 */
 function supportY(x, z) {
   let h = groundAt(x, z);
-  const ids = bmap.get(`${Math.floor(x / HASH)},${Math.floor(z / HASH)}`);
-  if (!ids) return h;
-  for (const id of ids) {
-    const b = bstore[id];
+  const hits = bmap.get(`${Math.floor(x / HASH)},${Math.floor(z / HASH)}`);
+  if (!hits) return h;
+  for (const b of hits) {
     if (b.top <= h) continue;
     if (x < b.minx || x > b.maxx || z < b.minz || z > b.maxz) continue;
     const g = b.ring, m = g.length;
@@ -567,10 +582,9 @@ function blocked(x, z, r = RADIUS, y = -Infinity) {
   const gx = Math.floor(x / HASH), gz = Math.floor(z / HASH);
   for (let i = -1; i <= 1; i++) {
     for (let j = -1; j <= 1; j++) {
-      const ids = bmap.get(`${gx + i},${gz + j}`);
-      if (!ids) continue;
-      for (const id of ids) {
-        const b = bstore[id];
+      const hits = bmap.get(`${gx + i},${gz + j}`);
+      if (!hits) continue;
+      for (const b of hits) {
         // 天端より上、または段差ぶん(STEP)以内なら通れる。
         // 階段やホームを bstore に足すだけで昇り降りできるようにするための許容。
         if (y + STEP > b.top) continue;
@@ -603,10 +617,9 @@ function distToBuilding(x, z, max = 20) {
   const gx = Math.floor(x / HASH), gz = Math.floor(z / HASH);
   for (let i = -1; i <= 1; i++) {
     for (let j = -1; j <= 1; j++) {
-      const ids = bmap.get(`${gx + i},${gz + j}`);
-      if (!ids) continue;
-      for (const id of ids) {
-        const b = bstore[id];
+      const hits = bmap.get(`${gx + i},${gz + j}`);
+      if (!hits) continue;
+      for (const b of hits) {
         const dx = Math.max(b.minx - x, 0, x - b.maxx);
         const dz = Math.max(b.minz - z, 0, z - b.maxz);
         const d = Math.hypot(dx, dz);
@@ -869,14 +882,9 @@ function addSolid(cx, cz, w, d, yaw, top) {
     if (p.x < minx) minx = p.x; if (p.x > maxx) maxx = p.x;
     if (p.y < minz) minz = p.y; if (p.y > maxz) maxz = p.y;
   }
-  const idx = bstore.length;
-  bstore.push({ ring, minx, maxx, minz, maxz, top });
-  for (let gx = Math.floor(minx / HASH); gx <= Math.floor(maxx / HASH); gx++) {
-    for (let gz = Math.floor(minz / HASH); gz <= Math.floor(maxz / HASH); gz++) {
-      const k = `${gx},${gz}`;
-      (bmap.get(k) ?? bmap.set(k, []).get(k)).push(idx);
-    }
-  }
+  const rec = { ring, minx, maxx, minz, maxz, top };
+  bstore.push(rec);
+  hashInsert(bmap, rec);
 }
 
 /** 石嶺駅のホームと階段。桁の高さから床を決めるので数字は自動で合う。 */
@@ -2206,6 +2214,7 @@ let elapsed = 0, frame = 0;
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
   council, councilPosts, showCouncil, buses, trainRide, bstore, sigPhase, signals,
+  rmap, bmap, hashInsert, hashRemove, distToBuilding,
   // 検証用: 列車を駅に着けて長く停める
   trainToStation: (sec = 60) => {
     if (trainStopD === null) return false;
