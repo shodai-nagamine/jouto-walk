@@ -853,6 +853,51 @@ const busSigns = [];
   }
 }
 
+// ---------------------------------------------------------------- 市議会の言及
+// council.json は tools/link_council.py が作る。ワールド内の施設名で
+// 那覇市議会の会議録(okinawa-civic-api)を検索し、地点に発言を結びつけたもの。
+const council = await fetch('./data/council.json')
+  .then((r) => (r.ok ? r.json() : { places: [] }))
+  .catch(() => ({ places: [] }));
+const councilPosts = [];
+{
+  const postMat = new THREE.MeshLambertMaterial({ color: 0xe8642f });
+  const poleMat = new THREE.MeshLambertMaterial({ color: 0x6b625c });
+  for (const p of council.places ?? []) {
+    const g = new THREE.Group();
+    const y = groundAt(p.x, p.z);
+    g.position.set(p.x, y, p.z);
+
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.09, 2.2, 6), poleMat);
+    pole.position.y = 1.1; pole.castShadow = true; g.add(pole);
+    // 掲示板(両面)。回転させて目立たせる
+    const board = new THREE.Mesh(new THREE.BoxGeometry(1.5, 1.0, 0.08), postMat);
+    board.position.y = 2.5; board.castShadow = true; g.add(board);
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(1.25, 0.05, 8, 26),
+      new THREE.MeshBasicMaterial({ color: 0xe8642f, transparent: true, opacity: 0.8 }));
+    ring.rotation.x = Math.PI / 2; ring.position.y = 0.12; g.add(ring);
+    // 遠くからでも分かる細い光柱
+    const beam = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.28, 0.5, 60, 8, 1, true),
+      new THREE.MeshBasicMaterial({
+        color: 0xe8642f, transparent: true, opacity: 0.13,
+        side: THREE.DoubleSide, depthWrite: false, fog: false,
+      }));
+    beam.position.y = 30; g.add(beam);
+
+    const lab = makeLabel(`🏛 ${p.label}`, 8.4, 2.1);
+    lab.position.y = 4.3;
+    g.add(lab);
+
+    g.userData = { place: p, board, ring, read: false };
+    scene.add(g);
+    councilPosts.push(g);
+  }
+  console.log(`市議会の言及 ${councilPosts.length}地点 / ` +
+    `${(council.places ?? []).reduce((n, p) => n + p.speeches.length, 0)}発言`);
+}
+
 // 走る車両(2両)。線形を往復するので端で消えたり湧いたりしない
 let train = null, trainPath = null, trainD = 0, trainDir = 1;
 if (railPaths.length) {
@@ -1122,6 +1167,18 @@ function drawMap() {
     mctx.fillStyle = '#ffc27a';
     mctx.beginPath(); mctx.arc(w2m(s.position.x), w2m(s.position.z), 2.6 * MK, 0, 7); mctx.fill();
   }
+  // 市議会の言及(未読は塗り、既読は輪郭だけ)
+  for (const g of councilPosts) {
+    const x = w2m(g.position.x), z = w2m(g.position.z), r = 3.2 * MK;
+    mctx.beginPath(); mctx.arc(x, z, r, 0, 7);
+    if (g.userData.read) {
+      mctx.strokeStyle = '#e8642f'; mctx.lineWidth = 1.6 * MK; mctx.stroke();
+    } else {
+      mctx.fillStyle = '#e8642f'; mctx.fill();
+      mctx.strokeStyle = '#f6f3ea'; mctx.lineWidth = 1.2 * MK; mctx.stroke();
+    }
+  }
+
   // 自分(視線方向つき)
   const px = w2m(player.x), pz = w2m(player.z);
   mctx.save(); mctx.translate(px, pz); mctx.rotate(-player.yaw);
@@ -1155,6 +1212,37 @@ const tape = $('tape');
   }
   tape.innerHTML = html;
 }
+
+// ---------------------------------------------------------------- 議会パネル
+const COUNCIL_R = 16;          // この距離まで近づくと出る(m)
+let councilNear = null, councilIdx = 0, councilRead = 0;
+const cvEl = $('council');
+
+function showCouncil(g) {
+  if (!g) { cvEl.classList.remove('on'); return; }
+  const p = g.userData.place;
+  const s = p.speeches[councilIdx % p.speeches.length];
+  $('cv-place').textContent = p.label;
+  $('cv-speaker').textContent = s.speaker || '(発言者不明)';
+  $('cv-date').textContent = `${s.date}　${s.meeting}`;
+  $('cv-quote').textContent = s.excerpt;
+  const a = $('cv-link');
+  a.href = s.url || '#';
+  a.style.visibility = s.url ? 'visible' : 'hidden';
+  $('cv-nav').textContent = p.speeches.length > 1
+    ? `${councilIdx % p.speeches.length + 1} / ${p.speeches.length}　[Q]で次へ`
+    : `この場所の言及 ${p.hits}件中1件`;
+  cvEl.classList.add('on');
+}
+
+// 同じ地点に複数の発言があるときは Q で送る(スマホはパネルのタップ)
+addEventListener('keydown', (e) => {
+  if (e.code === 'KeyQ' && councilNear) { councilIdx++; showCouncil(councilNear); }
+});
+cvEl.addEventListener('click', (e) => {
+  if (e.target.id === 'cv-link') return;   // リンクはそのまま開かせる
+  if (councilNear) { councilIdx++; showCouncil(councilNear); }
+});
 
 // ---------------------------------------------------------------- HUD状態
 let taken = 0, t0 = performance.now(), running = false;
@@ -1303,6 +1391,28 @@ function tick() {
     train.rotation.y = q.yaw + (trainDir < 0 ? Math.PI : 0);
   }
 
+  // 市議会の言及。近づいた地点のパネルを出す
+  {
+    let near = null, nd = Infinity;
+    for (const g of councilPosts) {
+      const d = Math.hypot(g.position.x - player.x, g.position.z - player.z);
+      if (d < nd) { nd = d; near = g; }
+      g.userData.ring.rotation.z += dt * 0.8;
+      g.userData.board.rotation.y += dt * 0.35;
+    }
+    const hit = nd < COUNCIL_R ? near : null;
+    if (hit !== councilNear) {
+      councilNear = hit;
+      councilIdx = 0;
+      showCouncil(hit);
+      if (hit && !hit.userData.read) {
+        hit.userData.read = true;
+        councilRead++;
+        say(`議会の記録を見つけた（${councilRead}/${councilPosts.length}）`);
+      }
+    }
+  }
+
   // バス停の名札は近くだけ(20枚が常時見えると画面が埋まる)
   for (const s of busSigns) {
     s.visible = Math.hypot(s.position.x - player.x, s.position.z - player.z) < 135;
@@ -1349,6 +1459,7 @@ let elapsed = 0, frame = 0;
 // 動作確認用(コンソールから位置や視点を動かせる)
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
+  council, councilPosts, showCouncil,
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
 
 // ---------------------------------------------------------------- 起動

@@ -164,6 +164,65 @@ def parse_stations(path, lat_c, lon_c, m_lat, m_lon, half, margin):
     return out
 
 
+GMLNS = "{http://www.opengis.net/gml}"
+
+
+def parse_landmarks(gml_path, lat_c, lon_c, m_lat, m_lon, half, size):
+    """建物CityGMLの gml:name(施設名)を代表点つきで拾う。
+
+    名前が付く建物は疎(1タイルに5〜16件)だが、学校・駅・郵便局など
+    議事録に出てくる固有名詞がここに入っている。
+    """
+    out = []
+    for _ev, el in ET.iterparse(gml_path, events=("end",)):
+        if local_name(el.tag) != "Building":
+            continue
+        nm = el.find(f"{GMLNS}name")
+        if nm is not None and nm.text and nm.text.strip():
+            pos = None
+            for p in el.iter(f"{GMLNS}posList"):
+                if p.text:
+                    pos = [float(v) for v in p.text.split()[:3]]
+                    break
+            if pos:
+                x = (pos[1] - lon_c) * m_lon + half
+                z = -(pos[0] - lat_c) * m_lat + half
+                if 0 <= x <= size and 0 <= z <= size:
+                    out.append({"name": nm.text.strip(),
+                                "x": round(x, 2), "z": round(z, 2)})
+        el.clear()
+    return out
+
+
+def parse_osm_named(path, lat_c, lon_c, m_lat, m_lon, half, size):
+    """OSM の名前付き地物(node/way)を地名辞書として取り込む。
+
+    CityGML の gml:name はタイルあたり数件しかないので、議事録に出てくる
+    「石嶺市営住宅」「石嶺図書館」「市道城東城北線」などを拾うにはこちらが要る。
+    way は Overpass の `out center` が返す代表点を使う。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        nm = (t.get("name") or "").strip()
+        if not nm:
+            continue
+        lat = e.get("lat", (e.get("center") or {}).get("lat"))
+        lon = e.get("lon", (e.get("center") or {}).get("lon"))
+        if lat is None or lon is None:
+            continue
+        x = (lon - lon_c) * m_lon + half
+        z = -(lat - lat_c) * m_lat + half
+        if not (0 <= x <= size and 0 <= z <= size):
+            continue
+        kind = next((f"{k}={t[k]}" for k in
+                     ("amenity", "leisure", "highway", "landuse", "building",
+                      "office", "tourism", "shop", "man_made") if k in t), "")
+        out.append({"name": nm, "x": round(x, 2), "z": round(z, 2), "kind": kind})
+    return out
+
+
 def parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, margin):
     """OpenStreetMap(Overpass API)のバス停ノードをローカル座標にする。
 
@@ -199,6 +258,7 @@ def main():
     ap.add_argument("--rail", default="", help="鉄道 GeoJSON(モノレール線形)")
     ap.add_argument("--stations", default="", help="鉄道駅 CZML")
     ap.add_argument("--bus", default="", help="バス停 (OSM Overpass JSON)")
+    ap.add_argument("--osm-named", default="", help="名前付き地物 (OSM Overpass JSON)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -310,6 +370,32 @@ def main():
             file=sys.stderr,
         )
 
+    # ---- 施設名(建物の gml:name) --------------------------------------------
+    landmarks = []
+    for g in args.gml:
+        path = g if os.path.isabs(g) else os.path.join(NAHA, g)
+        got = parse_landmarks(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        landmarks.extend(got)
+        if got:
+            print(
+                f"  {os.path.basename(path)}: 施設名 {len(got)}"
+                f" ({'、'.join(l['name'] for l in got[:4])}…)",
+                file=sys.stderr,
+            )
+
+    if args.osm_named:
+        path = (args.osm_named if os.path.isabs(args.osm_named)
+                else os.path.join(NAHA, args.osm_named))
+        got = parse_osm_named(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        # CityGML 側と同名のものは重複させない
+        have = {l["name"] for l in landmarks}
+        add = [g for g in got if g["name"] not in have]
+        landmarks.extend(add)
+        print(
+            f"  {os.path.basename(path)}: 名前付き地物 {len(got)} → 追加 {len(add)}",
+            file=sys.stderr,
+        )
+
     # ---- モノレール ---------------------------------------------------------
     # 桁が地形の端でぶつ切りにならないよう、ワールドより少し外まで延ばす
     RAIL_MARGIN = 80
@@ -359,6 +445,7 @@ def main():
         "rail": rail,
         "stations": stations,
         "bus": bus,
+        "landmarks": landmarks,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:

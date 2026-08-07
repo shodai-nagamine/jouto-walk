@@ -87,12 +87,33 @@ PC:
   --out public/data/world.json
 ```
 
-バス停は OpenStreetMap から Overpass API で取る（クエリは
-`naha_bus_osm.query.txt` に保存してある）:
+バス停と地名辞書は OpenStreetMap から Overpass API で取る（クエリは
+`naha_bus_osm.query.txt` / `naha_named_osm.query.txt` に保存してある）:
 
 ```bash
 curl -s -X POST -d @naha_bus_osm.query.txt https://overpass-api.de/api/interpreter -o naha_bus_osm.json
 ```
+
+市議会の言及は world.json を作ったあとに別途生成する（Postgres が要る）:
+
+```bash
+python3 tools/link_council.py --world public/data/world.json --out public/data/council.json
+```
+
+### 市議会リンクの作り方
+
+1. **地名辞書**: CityGML の `gml:name` はタイルあたり 4〜7 件しかないので、
+   OSM の名前付き地物（`--osm-named`、196 件）で厚くする。これで
+   「石嶺市営住宅」「石嶺公民館」「市道城東城北線」など議事録に出る名前が入る
+2. **絞り込み**: 議会が議題にするのは公共施設と道路なので、OSM のタグか
+   名前のキーワードで**公共施設だけに限る**。これをやらないと
+   「ほっともっと」が金芽米の話に、「コープ」が労働者協同組合ワーカーズコープに
+   当たるといった誤検出が出る（実際に出た）
+3. **並び順**: 発言者不明（32 件ある）と議長の議事進行を後ろへ回し、
+   議員の質疑と執行部の答弁を先に出す
+
+現在は **4 地点 / 8 発言**（城東小学校・石嶺中学校・石嶺公民館・石嶺市営住宅）。
+収録が那覇市議会の令和 8 年 2 月定例会 13 日分なので、会議録を増やせばそのまま増える。
 
 - `--center` は緯度経度。別の場所にすれば那覇市内のどこでも作れる（該当メッシュの GML が要る）
 - 城東小 26.2233,127.7322 は 3次メッシュ `39272568`。1km 四方だと北隣の `39272578` も必要
@@ -122,6 +143,11 @@ curl -s -X POST -d @naha_bus_osm.query.txt https://overpass-api.de/api/interpret
   既に存在する**（17×53m・高さ約 16m）ので、ホームは作らず駅名だけを出す。
   高架がこの建物を貫くのは不具合ではなく、ホーム高さで駅舎を通る実際の姿
   （干渉サンプルは全 258 点中 15 点で、すべてこの駅舎の範囲内）
+- **市議会の言及**: `tools/link_council.py` が
+  [okinawa-civic-api](https://github.com/shodai-nagamine) の Postgres（那覇市議会
+  会議録 9,749 発言）を、ワールド内の施設名で全文検索して地点に結びつける。
+  16m 以内に近づくとパネルが出て、**発言者・日付・抜粋・原文リンク**が読める
+  （同じ地点に複数あるときは `Q` かパネルのタップで送る）
 - **バス停**: 20 基（うち「城東小学校前」は校門のすぐ前）。支柱と台座は InstancedMesh、
   標識は canvas テクスチャのスプライトにして向きを持たせない。名札が 20 枚も常時
   見えると画面が埋まるので、**135m 以内だけ表示**する
