@@ -255,8 +255,12 @@ def parse_osm_named(path, lat_c, lon_c, m_lat, m_lon, half, size):
             continue
         kind = next((f"{k}={t[k]}" for k in
                      ("amenity", "leisure", "highway", "landuse", "building",
-                      "office", "tourism", "shop", "man_made") if k in t), "")
-        out.append({"name": nm, "x": round(x, 2), "z": round(z, 2), "kind": kind})
+                      "office", "tourism", "shop", "man_made", "craft",
+                      "healthcare") if k in t), "")
+        rec = {"name": nm, "x": round(x, 2), "z": round(z, 2), "kind": kind}
+        if t.get("opening_hours"):
+            rec["oh"] = t["opening_hours"][:60]
+        out.append(rec)
     return out
 
 

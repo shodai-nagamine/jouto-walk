@@ -1070,6 +1070,157 @@ const councilPosts = [];
     `${(council.places ?? []).reduce((n, p) => n + p.speeches.length, 0)}発言`);
 }
 
+// ---------------------------------------------------------------- 店舗の看板
+// OSM の名前付き地物から店舗系だけを拾って、建物の前に小さな看板を出す。
+// 数が増えても重くならないよう、表示は SHOP_R 以内に限る(距離バジェット)。
+const SHOP_R = 62;
+const SHOP_CATS = [
+  ['食', 0xe8642f, ['restaurant', 'fast_food', 'cafe', 'pub', 'bar', 'confectionery',
+                    'pastry', 'bakery', 'ice_cream', 'greengrocer', 'butcher']],
+  ['買', 0x2f8fc4, ['supermarket', 'convenience', 'alcohol', 'clothes', 'shoes',
+                    'books', 'florist', 'hardware', 'furniture', 'variety_store',
+                    'department_store', 'mobile_phone', 'electronics', 'optician']],
+  ['医', 0x4fb477, ['pharmacy', 'doctors', 'dentist', 'clinic', 'hospital',
+                    'veterinary', 'chemist', 'rehabilitation', 'physiotherapist']],
+  ['金', 0xb98cd4, ['bank', 'post_office', 'atm', 'insurance']],
+  ['学', 0xd8b13a, ['prep_school', 'school', 'music_school', 'driving_school',
+                    'language_school']],
+  ['他', 0x9aa3a6, []],
+];
+const shopSigns = [];
+{
+  const skip = new Set(['school', 'library', 'community_centre', 'townhall',
+    'fire_station', 'parking', 'bicycle_rental', 'shelter', 'bench', 'toilets',
+    'waste_basket', 'vending_machine', 'post_box', 'drinking_water',
+    'kindergarten', 'social_facility', 'place_of_worship', 'train_station']);
+  const catOf = (v) => SHOP_CATS.find((c) => c[2].includes(v)) ?? SHOP_CATS[5];
+
+  for (const l of world.landmarks ?? []) {
+    const [key, val] = (l.kind || '').split('=');
+    if (!['shop', 'amenity', 'office', 'craft', 'healthcare'].includes(key)) continue;
+    if (skip.has(val)) continue;
+    const [mark, color] = catOf(val);
+    const x = l.x - HALF, z = l.z - HALF;
+
+    const cv = document.createElement('canvas');
+    cv.width = 384; cv.height = 96;
+    const c = cv.getContext('2d');
+    c.fillStyle = 'rgba(13,27,30,0.9)';
+    c.beginPath(); c.roundRect(2, 8, 380, 80, 10); c.fill();
+    // 分類の色帯
+    c.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
+    c.beginPath(); c.roundRect(2, 8, 62, 80, 10); c.fill();
+    c.fillStyle = '#160c06';
+    c.font = 'bold 40px "Hiragino Sans", sans-serif';
+    c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(mark, 33, 49);
+    c.fillStyle = '#f6f3ea';
+    const nm = l.name.length > 11 ? l.name.slice(0, 10) + '…' : l.name;
+    c.font = `bold ${nm.length > 8 ? 26 : 31}px "Hiragino Sans", sans-serif`;
+    c.textAlign = 'left';
+    c.fillText(nm, 78, l.oh ? 40 : 49);
+    if (l.oh) {
+      c.fillStyle = 'rgba(246,243,234,0.62)';
+      c.font = '19px "Hiragino Sans", sans-serif';
+      c.fillText(l.oh.length > 22 ? l.oh.slice(0, 21) + '…' : l.oh, 78, 68);
+    }
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: new THREE.CanvasTexture(cv), transparent: true, depthWrite: false,
+    }));
+    sp.scale.set(5.2, 1.3, 1);
+    sp.position.set(x, supportY(x, z) + 2.4, z);
+    sp.visible = false;
+    scene.add(sp);
+    shopSigns.push(sp);
+  }
+  console.log(`店舗 ${shopSigns.length}件`);
+}
+
+// ---------------------------------------------------------------- 歩行者
+// 取り込んだ歩道網(OSM)の上を歩かせる。世界をモノレール沿いに広げても
+// 重くならないよう、数は固定で、遠ざかったら手前の歩道へ湧かし直す。
+const PED_N = 36;              // 同時に居る人数(固定)
+const PED_FAR = 165;           // これより遠い人は使い回す(m)
+const PED_NEAR = [30, 130];    // 湧かし直す距離の範囲(m)
+const peds = [];
+let pedBody = null, pedHead = null;
+const walkLines = [];
+
+{
+  for (const f of world.footways ?? []) {
+    if (f.k !== 'sidewalk' && f.k !== 'path') continue;
+    const pts = [];
+    for (let i = 0; i < f.f.length; i += 2) pts.push({ x: f.f[i] - HALF, z: f.f[i + 1] - HALF });
+    if (pts.length < 2) continue;
+    const cum = [0];
+    let len = 0;
+    for (let i = 1; i < pts.length; i++) {
+      len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
+      cum.push(len);
+    }
+    if (len < 6) continue;                 // 短すぎる断片は使わない
+    walkLines.push({ pts, cum, len });
+  }
+
+  if (walkLines.length) {
+    const bodyGeo = new THREE.CapsuleGeometry(0.21, 0.62, 4, 8);
+    const headGeo = new THREE.SphereGeometry(0.155, 8, 6);
+    const mat = () => new THREE.MeshLambertMaterial({ vertexColors: false });
+    pedBody = new THREE.InstancedMesh(bodyGeo, mat(), PED_N);
+    pedHead = new THREE.InstancedMesh(headGeo, mat(), PED_N);
+    pedBody.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(PED_N * 3), 3);
+    pedHead.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(PED_N * 3), 3);
+    pedBody.castShadow = pedHead.castShadow = true;
+    pedBody.frustumCulled = pedHead.frustumCulled = false;
+    scene.add(pedBody, pedHead);
+
+    const shirt = [0x4a6fa5, 0xb5563f, 0x4f7d5a, 0xd0c08a, 0x7a5f8c, 0x3f5560,
+                   0xc98b5e, 0x8a9aa3];
+    const skin = [0xe8c9a8, 0xdbb489, 0xf0d6bb];
+    for (let i = 0; i < PED_N; i++) {
+      peds.push({
+        line: 0, d: 0, dir: 1,
+        speed: 1.0 + rnd() * 0.5,          // 1.0〜1.5 m/s
+        phase: rnd() * Math.PI * 2,
+        shirt: new THREE.Color(shirt[(rnd() * shirt.length) | 0]),
+        skin: new THREE.Color(skin[(rnd() * skin.length) | 0]),
+        alive: false,
+      });
+    }
+    console.log(`歩行者 ${PED_N}人 / 歩道 ${walkLines.length}本`);
+  }
+}
+
+/** 歩道上の距離 d の地点。 */
+function walkAt(L, d) {
+  d = Math.max(0, Math.min(L.len, d));
+  let i = 1;
+  while (i < L.cum.length - 1 && L.cum[i] < d) i++;
+  const span = L.cum[i] - L.cum[i - 1] || 1;
+  const t = (d - L.cum[i - 1]) / span;
+  const a = L.pts[i - 1], b = L.pts[i];
+  return {
+    x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t,
+    yaw: Math.atan2(b.x - a.x, b.z - a.z),
+  };
+}
+
+/** プレイヤーの手前の歩道へ湧かし直す。見つからなければ諦めて休ませる。 */
+function respawnPed(p) {
+  for (let tries = 0; tries < 24; tries++) {
+    const L = walkLines[(Math.random() * walkLines.length) | 0];
+    const d = Math.random() * L.len;
+    const q = walkAt(L, d);
+    const dist = Math.hypot(q.x - player.x, q.z - player.z);
+    if (dist < PED_NEAR[0] || dist > PED_NEAR[1]) continue;
+    p.line = walkLines.indexOf(L); p.d = d;
+    p.dir = Math.random() < 0.5 ? 1 : -1;
+    p.alive = true;
+    return;
+  }
+  p.alive = false;
+}
+
 // ---------------------------------------------------------------- 信号
 // OSM の信号ノード。交差点ごとに束ねてあり、直交する系統(axis 0/1)が交互に青になる。
 // 灯火は InstancedMesh の per-instance color を書き換えるだけなので描画は1回。
@@ -1963,6 +2114,49 @@ function tick() {
         say(`議会の記録を見つけた（${councilRead}/${councilPosts.length}）`);
       }
     }
+  }
+
+  // 歩行者(数は固定。遠ざかったら手前へ湧かし直すので広げても重くならない)
+  if (pedBody && walkLines.length) {
+    const m = new THREE.Matrix4(), q4 = new THREE.Quaternion();
+    const pos = new THREE.Vector3(), one = new THREE.Vector3(1, 1, 1);
+    const eu = new THREE.Euler();
+    peds.forEach((p, i) => {
+      if (!p.alive) { if ((frame + i) % 30 === 0) respawnPed(p); }
+      if (!p.alive) {                       // 湧けなかった人は画面外へ置く
+        m.makeTranslation(0, -9999, 0);
+        pedBody.setMatrixAt(i, m); pedHead.setMatrixAt(i, m);
+        return;
+      }
+      const L = walkLines[p.line];
+      p.d += p.dir * p.speed * dt;
+      if (p.d > L.len) { p.d = L.len; p.dir = -1; }
+      if (p.d < 0) { p.d = 0; p.dir = 1; }
+      const w = walkAt(L, p.d);
+      if (Math.hypot(w.x - player.x, w.z - player.z) > PED_FAR) {
+        respawnPed(p);
+        return;
+      }
+      const g = groundAt(w.x, w.z);
+      const bob = Math.sin(now * 0.008 * p.speed + p.phase) * 0.045;
+      eu.set(0, w.yaw + (p.dir < 0 ? Math.PI : 0), 0);
+      q4.setFromEuler(eu);
+      pos.set(w.x, g + 0.92 + bob, w.z);
+      m.compose(pos, q4, one); pedBody.setMatrixAt(i, m);
+      pos.set(w.x, g + 1.53 + bob, w.z);
+      m.compose(pos, q4, one); pedHead.setMatrixAt(i, m);
+      pedBody.setColorAt(i, p.shirt);
+      pedHead.setColorAt(i, p.skin);
+    });
+    pedBody.instanceMatrix.needsUpdate = true;
+    pedHead.instanceMatrix.needsUpdate = true;
+    if (pedBody.instanceColor) pedBody.instanceColor.needsUpdate = true;
+    if (pedHead.instanceColor) pedHead.instanceColor.needsUpdate = true;
+  }
+
+  // 店舗の看板も近くだけ(距離バジェット)
+  for (const s of shopSigns) {
+    s.visible = Math.hypot(s.position.x - player.x, s.position.z - player.z) < SHOP_R;
   }
 
   // バス停の名札は近くだけ(20枚が常時見えると画面が埋まる)
