@@ -1325,7 +1325,10 @@ const PED_N = 36;              // 同時に居る人数(固定)
 const PED_FAR = 165;           // これより遠い人は使い回す(m)
 const PED_NEAR = [30, 130];    // 湧かし直す距離の範囲(m)
 const peds = [];
-let pedBody = null, pedHead = null;
+let pedBody = null, pedHead = null, pedHair = null, pedLimb = null;
+// 人体の寸法(m)。地面を 0 とした高さで、身長は約1.75m になる。
+const PED_HIP = 0.86, PED_SHOULDER = 1.34, PED_HEAD = 1.60;
+const PED_ARM = 0.60, PED_LEG = PED_HIP;
 const walkLines = [];
 
 {
@@ -1345,20 +1348,34 @@ const walkLines = [];
   }
 
   if (walkLines.length) {
-    const bodyGeo = new THREE.CapsuleGeometry(0.21, 0.62, 4, 8);
-    const headGeo = new THREE.SphereGeometry(0.155, 8, 6);
+    // 胴・頭・髪・四肢の4つの InstancedMesh に畳む(描画4回)。
+    // 四肢は1つの InstancedMesh に 1人4本(腕2・脚2)ぶんを詰めるので、
+    // 本数が増えてもドローコールは増えない。
+    // カプセル1本だった頃は手足が無く、それが「人に見えない」最大の原因だった。
+    const torsoGeo = new THREE.BoxGeometry(0.38, 0.54, 0.22);
+    const headGeo = new THREE.SphereGeometry(0.145, 8, 6);
+    // 頭の上半分だけの殻。これだけで髪型に見え、頭を1つ増やすより軽い
+    const hairGeo = new THREE.SphereGeometry(0.152, 8, 5, 0, Math.PI * 2, 0, Math.PI * 0.62);
+    const limbGeo = new THREE.BoxGeometry(1, 1, 1);
+    limbGeo.translate(0, -0.5, 0);       // 原点を上端(関節)に置く。Yスケール=長さ
     const mat = () => new THREE.MeshLambertMaterial({ vertexColors: false });
-    pedBody = new THREE.InstancedMesh(bodyGeo, mat(), PED_N);
+    pedBody = new THREE.InstancedMesh(torsoGeo, mat(), PED_N);
     pedHead = new THREE.InstancedMesh(headGeo, mat(), PED_N);
-    pedBody.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(PED_N * 3), 3);
-    pedHead.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(PED_N * 3), 3);
-    pedBody.castShadow = pedHead.castShadow = true;
-    pedBody.frustumCulled = pedHead.frustumCulled = false;
-    scene.add(pedBody, pedHead);
+    pedHair = new THREE.InstancedMesh(hairGeo, mat(), PED_N);
+    pedLimb = new THREE.InstancedMesh(limbGeo, mat(), PED_N * 4);
+    for (const [im, n] of [[pedBody, PED_N], [pedHead, PED_N], [pedHair, PED_N],
+                           [pedLimb, PED_N * 4]]) {
+      im.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(n * 3), 3);
+      im.castShadow = true;
+      im.frustumCulled = false;          // 毎フレーム行列を書き換えるので境界球が当てにならない
+      scene.add(im);
+    }
 
     const shirt = [0x4a6fa5, 0xb5563f, 0x4f7d5a, 0xd0c08a, 0x7a5f8c, 0x3f5560,
                    0xc98b5e, 0x8a9aa3];
     const skin = [0xe8c9a8, 0xdbb489, 0xf0d6bb];
+    const hair = [0x2b2320, 0x3a2e26, 0x1d1a18, 0x4a3a2c];
+    const pants = [0x38414d, 0x2f3338, 0x5a5346, 0x46403a, 0x6b6257];
     for (let i = 0; i < PED_N; i++) {
       peds.push({
         line: 0, d: 0, dir: 1,
@@ -1366,9 +1383,23 @@ const walkLines = [];
         phase: rnd() * Math.PI * 2,
         shirt: new THREE.Color(shirt[(rnd() * shirt.length) | 0]),
         skin: new THREE.Color(skin[(rnd() * skin.length) | 0]),
+        hair: new THREE.Color(hair[(rnd() * hair.length) | 0]),
+        pants: new THREE.Color(pants[(rnd() * pants.length) | 0]),
         alive: false,
       });
     }
+    // 色は人ごとに固定なので最初に1回だけ入れる(毎フレーム書き直す必要がない)。
+    // 腕は肌色=半袖。沖縄なので長袖にはしない。
+    peds.forEach((p, i) => {
+      pedBody.setColorAt(i, p.shirt);
+      pedHead.setColorAt(i, p.skin);
+      pedHair.setColorAt(i, p.hair);
+      pedLimb.setColorAt(i * 4, p.skin);
+      pedLimb.setColorAt(i * 4 + 1, p.skin);
+      pedLimb.setColorAt(i * 4 + 2, p.pants);
+      pedLimb.setColorAt(i * 4 + 3, p.pants);
+    });
+    for (const im of [pedBody, pedHead, pedHair, pedLimb]) im.instanceColor.needsUpdate = true;
     console.log(`歩行者 ${PED_N}人 / 歩道 ${walkLines.length}本`);
   }
 }
@@ -2302,12 +2333,22 @@ function tick() {
   if (pedBody && walkLines.length) {
     const m = new THREE.Matrix4(), q4 = new THREE.Quaternion();
     const pos = new THREE.Vector3(), one = new THREE.Vector3(1, 1, 1);
-    const eu = new THREE.Euler();
+    const scl = new THREE.Vector3(), eu = new THREE.Euler();
+    const away = new THREE.Matrix4().makeTranslation(0, -9999, 0);
+    // 四肢: [左右のずれ, 関節の高さ, 太さ, 長さ, 振りの大きさ, 位相のずれ]
+    // 腕と脚は逆位相で振る(右足が前なら左手が前)。
+    const LIMB = [
+      [-0.19, PED_SHOULDER, 0.085, PED_ARM, 0.42, Math.PI],
+      [0.19, PED_SHOULDER, 0.085, PED_ARM, 0.42, 0],
+      [-0.10, PED_HIP, 0.115, PED_LEG, 0.55, 0],
+      [0.10, PED_HIP, 0.115, PED_LEG, 0.55, Math.PI],
+    ];
     peds.forEach((p, i) => {
       if (!p.alive) { if ((frame + i) % 30 === 0) respawnPed(p); }
       if (!p.alive) {                       // 湧けなかった人は画面外へ置く
-        m.makeTranslation(0, -9999, 0);
-        pedBody.setMatrixAt(i, m); pedHead.setMatrixAt(i, m);
+        pedBody.setMatrixAt(i, away); pedHead.setMatrixAt(i, away);
+        pedHair.setMatrixAt(i, away);
+        for (let k = 0; k < 4; k++) pedLimb.setMatrixAt(i * 4 + k, away);
         return;
       }
       const L = walkLines[p.line];
@@ -2320,20 +2361,32 @@ function tick() {
         return;
       }
       const g = groundAt(w.x, w.z);
-      const bob = Math.sin(now * 0.008 * p.speed + p.phase) * 0.045;
-      eu.set(0, w.yaw + (p.dir < 0 ? Math.PI : 0), 0);
+      // 歩調は速さに比例させる。1.2m/s でおよそ 0.9Hz(=毎秒1.8歩)
+      const ph = now * 0.0047 * p.speed + p.phase;
+      const bob = Math.sin(ph * 2) * 0.03;  // 上下動は歩調の2倍(1歩ごとに沈む)
+      const yaw = w.yaw + (p.dir < 0 ? Math.PI : 0);
+      const cy = Math.cos(yaw), sy = Math.sin(yaw);
+
+      eu.set(0, yaw, 0);
       q4.setFromEuler(eu);
-      pos.set(w.x, g + 0.92 + bob, w.z);
+      pos.set(w.x, g + 1.13 + bob, w.z);
       m.compose(pos, q4, one); pedBody.setMatrixAt(i, m);
-      pos.set(w.x, g + 1.53 + bob, w.z);
+      pos.set(w.x, g + PED_HEAD + bob, w.z);
       m.compose(pos, q4, one); pedHead.setMatrixAt(i, m);
-      pedBody.setColorAt(i, p.shirt);
-      pedHead.setColorAt(i, p.skin);
+      pedHair.setMatrixAt(i, m);            // 髪は頭と同じ位置・向き
+
+      for (let k = 0; k < 4; k++) {
+        const [ox, jy, th, len, amp, off] = LIMB[k];
+        // 関節は体の横にあるので、左右のずれを向きで回してから足す。
+        // 三次元のオイラー角は YXZ 順にすると「向いてから前後に振る」になる。
+        eu.set(Math.sin(ph + off) * amp, yaw, 0, 'YXZ');
+        q4.setFromEuler(eu);
+        pos.set(w.x + ox * cy, g + jy + bob, w.z - ox * sy);
+        scl.set(th, len, th);
+        m.compose(pos, q4, scl); pedLimb.setMatrixAt(i * 4 + k, m);
+      }
     });
-    pedBody.instanceMatrix.needsUpdate = true;
-    pedHead.instanceMatrix.needsUpdate = true;
-    if (pedBody.instanceColor) pedBody.instanceColor.needsUpdate = true;
-    if (pedHead.instanceColor) pedHead.instanceColor.needsUpdate = true;
+    for (const im of [pedBody, pedHead, pedHair, pedLimb]) im.instanceMatrix.needsUpdate = true;
   }
 
   // 店舗の看板も近くだけ(距離バジェット)
