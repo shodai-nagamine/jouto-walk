@@ -247,6 +247,12 @@ def parse_osm_named(path, lat_c, lon_c, m_lat, m_lon, half, size):
             continue
         lat = e.get("lat", (e.get("center") or {}).get("lat"))
         lon = e.get("lon", (e.get("center") or {}).get("lon"))
+        if lat is None and e.get("geometry"):
+            # out geom を使うと center が付かないので、頂点の平均で代表点を作る
+            g = [p for p in e["geometry"] if p]
+            if g:
+                lat = sum(p["lat"] for p in g) / len(g)
+                lon = sum(p["lon"] for p in g) / len(g)
         if lat is None or lon is None:
             continue
         x = (lon - lon_c) * m_lon + half
@@ -278,6 +284,10 @@ def parse_footways(path, lat_c, lon_c, m_lat, m_lon, half, size):
         t = e.get("tags") or {}
         hw = t.get("highway", "")
         fw = t.get("footway", "")
+        # 1つの OSM ファイルに名前付きの車道も入っているので、歩行者系だけに絞る。
+        # これをやらないと「市道○○線」が歩道として描かれる。
+        if hw not in ("footway", "path", "pedestrian", "steps", "living_street"):
+            continue
         if hw == "steps":
             kind = "steps"
         elif fw == "crossing" or t.get("crossing"):
@@ -326,13 +336,16 @@ def parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, size, radius=32.0):
         if "lat" not in e or "lon" not in e:
             continue
         t = e.get("tags") or {}
+        # 1つの OSM ファイルに他の地物も入っているので、ここでタグを見て絞る
+        is_car = t.get("highway") == "traffic_signals"
+        is_ped = t.get("crossing") == "traffic_signals"
+        if not (is_car or is_ped):
+            continue
         x = (e["lon"] - lon_c) * m_lon + half
         z = -(e["lat"] - lat_c) * m_lat + half
         if not (0 <= x <= size and 0 <= z <= size):
             continue
-        # crossing=traffic_signals は歩行者用、highway=traffic_signals は車両用
-        kind = "ped" if t.get("crossing") == "traffic_signals" else "car"
-        pts.append({"x": x, "z": z, "kind": kind})
+        pts.append({"x": x, "z": z, "kind": "ped" if is_ped else "car"})
 
     # 近いノードを同じ交差点に束ねる(単純な連結成分)
     n = len(pts)
@@ -462,6 +475,10 @@ def parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, margin):
         if "lat" not in e or "lon" not in e:
             continue
         t = e.get("tags") or {}
+        # 1つの OSM ファイルに他の地物も入っているので、ここでタグを見て絞る
+        if t.get("highway") != "bus_stop" and not (
+                t.get("public_transport") == "platform" and t.get("bus") == "yes"):
+            continue
         x = (e["lon"] - lon_c) * m_lon + half
         z = -(e["lat"] - lat_c) * m_lat + half
         if not (-margin <= x <= 2 * half + margin and -margin <= z <= 2 * half + margin):
@@ -477,6 +494,8 @@ def parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, margin):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--center", nargs=2, type=float, required=True, metavar=("LAT", "LON"))
+    ap.add_argument("--origin", nargs=2, type=float, default=None,
+                    metavar=("LAT", "LON"), help="全タイル共通の原点(省略時は--centerと同じ)")
     ap.add_argument("--size", type=int, default=1000, help="一辺のメートル数")
     ap.add_argument("--cell", type=int, default=5, help="地形グリッドの間隔(m)")
     ap.add_argument("--gml", nargs="+", required=True, help="建物CityGML(複数可)")
@@ -495,8 +514,14 @@ def main():
 
     lat_c, lon_c = args.center
     half = args.size / 2.0
+    # タイルを並べるときに継ぎ目が出ないよう、緯度経度→メートルの換算は
+    # 全タイルで共通の原点の緯度で行う(タイルごとの緯度で換算すると縮尺がずれる)。
+    lat_o, lon_o = (args.origin if args.origin else [lat_c, lon_c])
     m_lat = M_PER_DEG_LAT
-    m_lon = M_PER_DEG_LAT * math.cos(math.radians(lat_c))
+    m_lon = M_PER_DEG_LAT * math.cos(math.radians(lat_o))
+    # このタイルの中心が、全体原点から見てどこにあるか(m)
+    off_x = (lon_c - lon_o) * m_lon
+    off_z = -(lat_c - lat_o) * m_lat
     bbox = (
         lat_c - half / m_lat, lat_c + half / m_lat,
         lon_c - half / m_lon, lon_c + half / m_lon,
@@ -695,6 +720,8 @@ def main():
     world = {
         "meta": {
             "lat": lat_c, "lon": lon_c, "size": args.size,
+            "originLat": lat_o, "originLon": lon_o,
+            "offset": [round(off_x, 2), round(off_z, 2)],
             "cell": args.cell, "n": n,
             "groundAtCenter": round(float(terrain[ci, ci]), 2),
             "minZ": round(float(terrain.min()), 2),
