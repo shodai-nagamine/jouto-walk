@@ -12,6 +12,7 @@ const RADIUS = 0.55;       // プレイヤーの当たり半径(m)
 const N_SEESAA = 10;
 const PICKUP = 4.0;        // 保護できる距離(m)
 const HASH = 24;           // 当たり判定用の空間ハッシュの升目(m)。建物・道路で共用
+const STEP = 0.55;         // 乗り越えられる段差(m)。階段・ホームの昇降に使う
 
 const $ = (id) => document.getElementById(id);
 
@@ -277,6 +278,20 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
   const pushW = (x, y, z, u, v) => { WV.push(x, y, z); WC.push(wall.r, wall.g, wall.b); WU.push(u, v); };
   const pushR = (x, y, z) => { RV.push(x, y, z); RC.push(roof.r, roof.g, roof.b); RU.push(x / 8, z / 8); };
 
+  // 駅の位置を含む建物は、この後ホーム・階段を自前で建てるので除く。
+  // PLATEAU の駅舎は中身のない箱なので、残すとホームが壁の中に閉じ込められる。
+  const stationPts = (world.stations ?? []).map((s) => [s.x - HALF, s.z - HALF]);
+  const inRing = (ring, x, z) => {
+    let inside = false;
+    for (let k = 0, l = ring.length - 1; k < ring.length; l = k++) {
+      const a = ring[k], c = ring[l];
+      if ((a.y > z) !== (c.y > z) &&
+          x < (c.x - a.x) * (z - a.y) / (c.y - a.y) + a.x) inside = !inside;
+    }
+    return inside;
+  };
+  let skipped = 0;
+
   for (const b of world.buildings) {
     const f = b.f, m = f.length / 2;
     const ring = new Array(m);
@@ -287,6 +302,14 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
       if (x < minx) minx = x; if (x > maxx) maxx = x;
       if (z < minz) minz = z; if (z > maxz) maxz = z;
     }
+    // 駅を含む建物は自前のホームに置き換えるので飛ばす
+    if (stationPts.some(([sx, sz]) =>
+        sx >= minx - 6 && sx <= maxx + 6 && sz >= minz - 6 && sz <= maxz + 6 &&
+        inRing(ring, sx, sz))) {
+      skipped++;
+      continue;
+    }
+
     // 斜面で建物が浮かないよう、底は地表より少し下まで伸ばす
     const gc = groundAt((minx + maxx) / 2, (minz + maxz) / 2);
     const base = Math.min(b.b, gc) - 2.5;
@@ -343,7 +366,8 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
   ]);
   mesh.castShadow = mesh.receiveShadow = true;
   scene.add(mesh);
-  console.log(`建物 ${world.buildings.length} 棟 / 壁 ${nWall} + 屋根 ${RV.length / 3} 頂点`);
+  console.log(`建物 ${world.buildings.length} 棟(駅舎 ${skipped} 棟は除外) / ` +
+    `壁 ${nWall} + 屋根 ${RV.length / 3} 頂点`);
 }
 
 /** (x,z) が建物の壁から r 以内(または内部)か。r を広げれば「開けた場所」判定になる。 */
@@ -494,7 +518,9 @@ function blocked(x, z, r = RADIUS, y = -Infinity) {
       if (!ids) continue;
       for (const id of ids) {
         const b = bstore[id];
-        if (y > b.top) continue;                 // 天端より上なら素通り
+        // 天端より上、または段差ぶん(STEP)以内なら通れる。
+        // 階段やホームを bstore に足すだけで昇り降りできるようにするための許容。
+        if (y + STEP > b.top) continue;
         if (x < b.minx - r || x > b.maxx + r ||
             z < b.minz - r || z > b.maxz + r) continue;
         const rg = b.ring, m = rg.length;
@@ -773,6 +799,97 @@ function makeLabel(text, w = 9, h = 2.4) {
   return s;
 }
 
+// ---------------------------------------------------------------- 駅のホーム
+// 当たり判定は建物と同じ仕組み(footprint+天端)に足すだけでよい。
+// STEP(0.55m)以内の段差は登れるので、階段は箱を積むだけで昇れる。
+let stationStop = null;
+
+/** 中心(cx,cz)・向きyawの長方形を、天端topの固体として登録する。 */
+function addSolid(cx, cz, w, d, yaw, top) {
+  const cos = Math.cos(yaw), sin = Math.sin(yaw);
+  const ring = [];
+  for (const [ox, oz] of [[-w / 2, -d / 2], [w / 2, -d / 2], [w / 2, d / 2], [-w / 2, d / 2]]) {
+    ring.push(new THREE.Vector2(cx + ox * cos + oz * sin, cz - ox * sin + oz * cos));
+  }
+  let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
+  for (const p of ring) {
+    if (p.x < minx) minx = p.x; if (p.x > maxx) maxx = p.x;
+    if (p.y < minz) minz = p.y; if (p.y > maxz) maxz = p.y;
+  }
+  const idx = bstore.length;
+  bstore.push({ ring, minx, maxx, minz, maxz, top });
+  for (let gx = Math.floor(minx / HASH); gx <= Math.floor(maxx / HASH); gx++) {
+    for (let gz = Math.floor(minz / HASH); gz <= Math.floor(maxz / HASH); gz++) {
+      const k = `${gx},${gz}`;
+      (bmap.get(k) ?? bmap.set(k, []).get(k)).push(idx);
+    }
+  }
+}
+
+/** 石嶺駅のホームと階段。桁の高さから床を決めるので数字は自動で合う。 */
+function buildPlatform(q) {
+  const g = new THREE.Group();
+  const yaw = q.yaw;
+  const cos = Math.cos(yaw), sin = Math.sin(yaw);
+  // 桁からの相対位置(ox=横, oz=線路方向)をワールド座標へ
+  const at = (ox, oz) => [q.x + ox * cos + oz * sin, q.z - ox * sin + oz * cos];
+
+  const floorY = q.y - 0.7;            // 車両の床に合わせる
+  const PW = 4.2, PL = 42;             // ホームの幅と長さ
+  const SIDE = 3.4;                    // 桁中心からホーム中心までの距離
+
+  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
+  const box = (w, h, d, ox, oy, oz, color) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(color));
+    const [x, z] = at(ox, oz);
+    m.position.set(x, oy, z);
+    m.rotation.y = yaw;
+    m.castShadow = m.receiveShadow = true;
+    g.add(m);
+    return m;
+  };
+
+  // ホーム(床板)。厚み1mの板の上面が floorY になるように置く
+  box(PW, 1.0, PL, SIDE, floorY - 0.5, 0, 0xcfcabc);
+  addSolid(...at(SIDE, 0), PW, PL, yaw, floorY);
+  // ホーム端の白線
+  box(0.25, 0.06, PL, SIDE - PW / 2 + 0.35, floorY + 0.03, 0, 0xf1ede2);
+
+  // 上屋と柱
+  box(PW + 1.2, 0.3, PL - 4, SIDE, floorY + 3.9, 0, 0xe4e0d6);
+  for (const oz of [-16, -5.5, 5.5, 16]) {
+    for (const ox of [SIDE - PW / 2 + 0.4, SIDE + PW / 2 - 0.4]) {
+      box(0.22, 3.9, 0.22, ox, floorY + 1.95, oz, 0xbdb9ae);
+    }
+  }
+  // 転落防止の柵(線路と反対側)
+  box(0.12, 1.1, PL, SIDE + PW / 2 - 0.06, floorY + 0.55, 0, 0x9fa6a8);
+
+  // 階段(ホーム南端から地上へ)。1段0.45m×踏面0.62m
+  const gnd = groundAt(...at(SIDE, PL / 2 + 8));
+  const rise = 0.45, tread = 0.62;
+  const steps = Math.max(2, Math.round((floorY - gnd) / rise));
+  for (let i = 0; i < steps; i++) {
+    const top = gnd + rise * (i + 1);
+    const oz = PL / 2 + 0.4 + tread * (steps - 1 - i);
+    box(2.6, top - gnd + 0.1, tread, SIDE, (gnd + top) / 2 - 0.05, oz, 0xc6c2b6);
+    addSolid(...at(SIDE, oz), 2.6, tread, yaw, top);
+  }
+  // 階段の手すり
+  for (const ox of [SIDE - 1.45, SIDE + 1.45]) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.09, tread * steps + 1),
+      mat(0x9fa6a8));
+    const [x, z] = at(ox, PL / 2 + 0.4 + tread * steps / 2);
+    m.position.set(x, (gnd + floorY) / 2 + 1.0, z);
+    m.rotation.y = yaw;
+    m.rotation.x = -Math.atan2(floorY - gnd, tread * steps);
+    g.add(m);
+  }
+
+  scene.add(g);
+  console.log(`ホーム: 床 ${floorY.toFixed(1)}m / 地上 ${gnd.toFixed(1)}m / 階段${steps}段`);
+}
+
 // 駅(ホーム＋屋根＋駅名)。線形上のいちばん近い点に合わせて向きを決める
 for (const st of world.stations ?? []) {
   const sx = st.x - HALF, sz = st.z - HALF;
@@ -781,11 +898,13 @@ for (const st of world.stations ?? []) {
     for (let d = 0; d <= p.len; d += 4) {
       const q = railAt(p, d);
       const dist = Math.hypot(q.x - sx, q.z - sz);
-      if (!best || dist < best.dist) best = { dist, q };
+      if (!best || dist < best.dist) best = { dist, q, d, p };
     }
   }
   if (!best || best.dist > 90) continue;
   const { q } = best;
+  stationStop = { q, d: best.d, p: best.p };
+  buildPlatform(q);
   // 駅舎は PLATEAU の建物として既にある(石嶺駅=17x53m/高さ約16m)。
   // 高架はその中をホーム高さで通り抜けるのが実際の姿なので、
   // ホームを作らず駅名だけを建物の上に出す。
@@ -972,8 +1091,11 @@ function pathAt(path, d) {
 
 // 走る車両(2両)。線形を往復するので端で消えたり湧いたりしない
 let train = null, trainPath = null, trainD = 0, trainDir = 1;
+let trainStopD = null, trainWait = 0;
 if (railPaths.length) {
-  trainPath = railPaths.reduce((a, b) => (b.len > a.len ? b : a));
+  // 駅のある線形を走らせる(無ければいちばん長い線形)。
+  // 長さで選ぶと駅が別の線形に乗っていて永久に停まらないことがある。
+  trainPath = stationStop?.p ?? railPaths.reduce((a, b) => (b.len > a.len ? b : a));
   train = new THREE.Group();
   for (const cz of [-7.2, 7.2]) {
     const car = new THREE.Group();
@@ -995,7 +1117,19 @@ if (railPaths.length) {
   train.position.y = -9999;                   // 初回 tick で正しい位置に移す
   scene.add(train);
   trainD = trainPath.len * 0.25;
+
+  // 駅での停車位置(線形上の距離)
+  if (stationStop && stationStop.p === trainPath) trainStopD = stationStop.d;
+  console.log(`列車の線形 ${Math.round(trainPath.len)}m / 停車位置 ` +
+    (trainStopD === null ? 'なし' : `${Math.round(trainStopD)}m`));
 }
+
+// 乗り物としてのモノレール(バスと同じ扱いにして乗降処理を共通化する)
+const trainRide = train ? {
+  g: train, ref: 'ゆいレール', name: '沖縄都市モノレール線',
+  seat: { x: 0, y: 0.15, z: 7.2 },          // 前寄りの車両の中ほど
+  isTrain: true, wait: 0,
+} : null;
 
 // ---------------------------------------------------------------- 操作
 const player = {
@@ -1290,6 +1424,7 @@ const tape = $('tape');
 // 座席の位置にプレイヤーを貼り付ける(見回しは自由)。
 const BOARD_R = 6.5;           // この距離まで近づくと乗れる(m)
 const SEAT = { x: -0.75, y: 2.15, z: 1.6 };   // バス内の座席(左の窓側)
+const seatOf = (v) => v.seat ?? SEAT;
 let riding = null, boardable = null;
 const rideEl = $('ride');
 
@@ -1301,7 +1436,7 @@ function updateRideUI() {
     rideEl.classList.add('on');
   } else if (boardable) {
     $('rd-route').textContent = `${boardable.ref}　${boardable.name}`;
-    $('rd-msg').textContent = 'が停まっています';
+    $('rd-msg').textContent = boardable.isTrain ? 'が到着しています' : 'が停まっています';
     $('rd-btn').textContent = TOUCH ? '乗る' : '乗る [E]';
     rideEl.classList.add('on');
   } else {
@@ -1324,15 +1459,19 @@ function board() {
 function alight() {
   if (!riding) return;
   const b = riding;
-  // 進行方向の右側(歩道側)に降ろす。塞がっていたら少しずつ試す
+  // バスは歩道側、モノレールはホーム側へ降ろす。塞がっていたら順に試す
   const yaw = b.g.rotation.y;
+  const cos = Math.cos(yaw), sin = Math.sin(yaw);
+  const cands = b.isTrain
+    ? [[3.4, 0], [3.4, 6], [3.4, -6], [-3.4, 0], [3.4, 12]]
+    : [[2.6, 0], [3.4, 0], [2.6, 3], [2.6, -3], [-2.6, 0], [0, 5]];
   let done = false;
-  for (const [ox, oz] of [[2.6, 0], [3.4, 0], [2.6, 3], [2.6, -3], [-2.6, 0], [0, 5]]) {
-    const x = b.g.position.x + Math.cos(-yaw) * ox - Math.sin(-yaw) * oz;
-    const z = b.g.position.z + Math.sin(-yaw) * ox + Math.cos(-yaw) * oz;
-    if (!blocked(x, z, RADIUS, groundAt(x, z))) {
-      player.x = x; player.z = z; done = true; break;
-    }
+  for (const [ox, oz] of cands) {
+    const x = b.g.position.x + ox * cos + oz * sin;
+    const z = b.g.position.z - ox * sin + oz * cos;
+    // 降りた先の足場(ホームの天端も含む)で判定する
+    const s = supportY(x, z);
+    if (!blocked(x, z, RADIUS, s)) { player.x = x; player.z = z; done = true; break; }
   }
   if (!done) { player.x = b.g.position.x + 3; player.z = b.g.position.z; }
   player.y = supportY(player.x, player.z) + EYE;
@@ -1489,24 +1628,30 @@ function tick() {
 
   // 乗車中は座席に貼り付ける(見回しは自由)
   if (riding) {
+    const s = seatOf(riding);
     const yaw = riding.g.rotation.y;
     const cos = Math.cos(yaw), sin = Math.sin(yaw);
-    player.x = riding.g.position.x + SEAT.x * cos + SEAT.z * sin;
-    player.z = riding.g.position.z - SEAT.x * sin + SEAT.z * cos;
-    player.y = riding.g.position.y + SEAT.y;
+    player.x = riding.g.position.x + s.x * cos + s.z * sin;
+    player.z = riding.g.position.z - s.x * sin + s.z * cos;
+    player.y = riding.g.position.y + s.y;
     player.vy = 0; player.onGround = true;
   }
 
-  // 乗れるバスを探す(停車中で、十分近いもの)
+  // 乗れる車両を探す(停車中で、十分近いもの)
   {
     const prev = boardable;
     boardable = null;
     if (active && !riding) {
       let best = Infinity;
-      for (const b of buses) {
-        if (b.wait <= 0) continue;
-        const d = Math.hypot(b.g.position.x - player.x, b.g.position.z - player.z);
-        if (d < BOARD_R && d < best) { best = d; boardable = b; }
+      const cands = trainRide ? [...buses, trainRide] : buses;
+      for (const v of cands) {
+        if (v.wait <= 0) continue;
+        const d = Math.hypot(v.g.position.x - player.x, v.g.position.z - player.z);
+        // 高さも見る。モノレールは高架なので地上から乗り込めてはいけない
+        const dy = Math.abs(player.y - (v.g.position.y + seatOf(v).y));
+        if (d < (v.isTrain ? 11 : BOARD_R) && dy < 3.5 && d < best) {
+          best = d; boardable = v;
+        }
       }
     }
     if (prev !== boardable) updateRideUI();
@@ -1591,14 +1736,26 @@ function tick() {
   sun.position.set(player.x + 150, groundAt(player.x, player.z) + 260, player.z + 110);
   sun.target.updateMatrixWorld();
 
-  // モノレールの車両(端に着いたら折り返す)
+  // モノレールの車両(駅で停車し、端に着いたら折り返す)
   if (train && trainPath) {
-    trainD += trainDir * 11 * dt;             // 約40km/h
-    if (trainD > trainPath.len) { trainD = trainPath.len; trainDir = -1; }
-    if (trainD < 0) { trainD = 0; trainDir = 1; }
+    if (trainWait > 0) {
+      trainWait -= dt;
+    } else {
+      const prev = trainD;
+      trainD += trainDir * 11 * dt;             // 約40km/h
+      if (trainD > trainPath.len) { trainD = trainPath.len; trainDir = -1; trainWait = 3; }
+      if (trainD < 0) { trainD = 0; trainDir = 1; trainWait = 3; }
+      if (trainStopD !== null &&
+          ((prev < trainStopD && trainD >= trainStopD) ||
+           (prev > trainStopD && trainD <= trainStopD))) {
+        trainD = trainStopD;
+        trainWait = 9;                          // 乗り降りできる長さ
+      }
+    }
     const q = railAt(trainPath, trainD);
     train.position.set(q.x, q.y + 0.9, q.z);  // 桁をまたぐので少し上に乗せる
     train.rotation.y = q.yaw + (trainDir < 0 ? Math.PI : 0);
+    if (trainRide) trainRide.wait = trainWait;
   }
 
   // 市議会の言及。近づいた地点のパネルを出す
@@ -1670,7 +1827,13 @@ let elapsed = 0, frame = 0;
 // 動作確認用(コンソールから位置や視点を動かせる)
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
-  council, councilPosts, showCouncil, buses,
+  council, councilPosts, showCouncil, buses, trainRide, bstore,
+  // 検証用: 列車を駅に着けて長く停める
+  trainToStation: (sec = 60) => {
+    if (trainStopD === null) return false;
+    trainD = trainStopD; trainWait = sec;
+    return true;
+  },
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
 
 // ---------------------------------------------------------------- 開発ログ
