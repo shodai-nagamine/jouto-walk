@@ -463,6 +463,47 @@ def parse_bus_routes(path, lat_c, lon_c, m_lat, m_lon, half, size, max_routes):
     } for c in picked]
 
 
+def parse_parks(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=60.0):
+    """OSM の公園・庭園・遊び場・グラウンドを「面」として取り出す。
+
+    地面テクスチャに緑地として焼き、木を生やす場所にも使う。
+
+    name では絞らない。那覇の児童公園と校庭は半数以上が無名で、名前で
+    絞ると見た目に一番効く大きなグラウンドが軒並み落ちるため。
+    面は矩形で切らずに、外接矩形が世界に掛かるものをそのまま採る
+    (テクスチャは canvas 側で、木は設置時に範囲判定で落ちる)。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = -margin, size + margin
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        kind = t.get("leisure")
+        if kind not in ("park", "garden", "playground", "pitch"):
+            continue
+        g = [p for p in (e.get("geometry") or []) if p]
+        if len(g) < 3:
+            continue
+        pts = [((p["lon"] - lon_c) * m_lon + half,
+                -(p["lat"] - lat_c) * m_lat + half) for p in g]
+        if pts[0] == pts[-1]:
+            pts.pop()
+        if len(pts) < 3:
+            continue
+        xs = [p[0] for p in pts]
+        zs = [p[1] for p in pts]
+        if max(xs) < lo or min(xs) > hi or max(zs) < lo or min(zs) > hi:
+            continue
+        pts = simplify(pts, tol=0.6)
+        if len(pts) < 3:
+            continue
+        out.append({
+            "name": t.get("name", ""), "k": kind,
+            "f": [round(v, 2) for p in pts for v in p],
+        })
+    return out
+
+
 def parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, margin):
     """OpenStreetMap(Overpass API)のバス停ノードをローカル座標にする。
 
@@ -508,6 +549,7 @@ def main():
     ap.add_argument("--bus-routes", default="", help="バス路線 (OSM route relation JSON)")
     ap.add_argument("--signals", default="", help="信号 (OSM Overpass JSON)")
     ap.add_argument("--footways", default="", help="歩道・横断歩道・階段 (OSM Overpass JSON)")
+    ap.add_argument("--parks", default="", help="公園・広場・グラウンド (OSM Overpass JSON)")
     ap.add_argument("--max-routes", type=int, default=4, help="走らせる路線数")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -715,6 +757,18 @@ def main():
         print(f"  {os.path.basename(path)}: 歩行者系 {len(footways)}本 {cnt}",
               file=sys.stderr)
 
+    parks = []
+    if args.parks:
+        path = (args.parks if os.path.isabs(args.parks)
+                else os.path.join(NAHA, args.parks))
+        parks = parse_parks(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        cnt = {}
+        for p in parks:
+            cnt[p["k"]] = cnt.get(p["k"], 0) + 1
+        nn = sum(1 for p in parks if p["name"])
+        print(f"  {os.path.basename(path)}: 公園系 {len(parks)}面 {cnt} "
+              f"(名前あり{nn}/無名{len(parks) - nn})", file=sys.stderr)
+
     # 中心の地表高さ(スポーン基準)
     ci = n // 2
     world = {
@@ -738,6 +792,7 @@ def main():
         "landmarks": landmarks,
         "signals": signals,
         "footways": footways,
+        "parks": parks,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:

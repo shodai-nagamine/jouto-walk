@@ -86,6 +86,7 @@ PC:
   --bus naha_bus_osm.json --osm-named naha_named_osm.json \
   --bus-routes naha_busroutes_osm.json --signals naha_signals_osm.json \
   --footways naha_footways_osm.json \
+  --parks naha_parks_osm.json \
   --out public/data/world.json
 ```
 
@@ -95,6 +96,11 @@ PC:
 ```bash
 curl -s -X POST -d @naha_bus_osm.query.txt https://overpass-api.de/api/interpreter -o naha_bus_osm.json
 ```
+
+公園（`naha_parks_osm.query.txt`）だけは `["name"]` で絞らない。那覇の街区公園と
+校庭は半数以上が無名で、名前で絞ると見た目に一番効く大きなグラウンドが軒並み
+落ちるため（この 1km 四方でも 4 面 → 12 面に増える）。範囲はモノレール沿いの
+タイル展開を見込んで corridor 全体を覆ってある。
 
 タイトル画面の「開発ログ」は git 履歴から作る。手書きの記録ではないので
 書き忘れも盛りもない。GitHub Actions が push のたびに作り直すため、

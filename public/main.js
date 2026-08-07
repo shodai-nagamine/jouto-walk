@@ -253,14 +253,34 @@ function groundTexture() {
   strokeWays(['sidewalk', 'path'], 2.6, '#fff');   // 歩道
   strokeWays(['steps'], 2.0, '#888');              // 階段(あとで縞にする)
 
+  // 公園・広場・グラウンド(OSM)。地面の緑は「建物からどれだけ離れているか」で
+  // 推定しているだけなので実際の公園と一致しない。ここだけは実データで塗る。
+  // canvas を2枚持つと重いので、1枚の R=芝(公園・庭園・遊び場) /
+  // G=土(グラウンド) に分けて入れる。縁のアンチエイリアスも混ざらない。
+  const pk = document.createElement('canvas'); pk.width = pk.height = W;
+  const pg = pk.getContext('2d', { willReadFrequently: true });
+  pg.fillStyle = '#000'; pg.fillRect(0, 0, W, W);
+  for (const p of world.parks ?? []) {
+    pg.fillStyle = p.k === 'pitch' ? '#0f0' : '#f00';
+    pg.beginPath();
+    for (let i = 0; i < p.f.length; i += 2) {
+      const x = toPx(p.f[i] - HALF), z = toPx(p.f[i + 1] - HALF);
+      i ? pg.lineTo(x, z) : pg.moveTo(x, z);
+    }
+    pg.closePath(); pg.fill();
+  }
+
   const A = lg.getImageData(0, 0, W, W), B = dg.getImageData(0, 0, W, W);
   const R = rg.getImageData(0, 0, W, W), RS = rsg.getImageData(0, 0, W, W);
-  const WK = wg.getImageData(0, 0, W, W);
+  const WK = wg.getImageData(0, 0, W, W), PK = pg.getImageData(0, 0, W, W);
   const a = A.data, b = B.data, rr = R.data, rs = RS.data, wv = WK.data;
+  const pv = PK.data;
   const PAVE = [154, 150, 142];             // 敷地(コンクリ)
   const ROAD = [110, 110, 114];             // 道路(アスファルト)
   const EDGE = [138, 134, 112];             // 路肩・未舗装
-  const GREEN = [111, 147, 73];             // 緑地
+  const GREEN = [111, 147, 73];             // 緑地(建物からの距離で推定したもの)
+  const PARK = [92, 137, 60];               // 公園の芝(実データ)
+  const DIRT = [156, 130, 96];              // グラウンドの土(那覇の校庭は土が多い)
   // 閾値で切ると色の帯ができるので、密度に沿って連続的に混ぜる
   const mix = (p, q, t) => [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t,
                             p[2] + (q[2] - p[2]) * t];
@@ -287,6 +307,10 @@ function groundTexture() {
       c = mix(c, ROAD, 0.5 * sstep(15, 44, dens));
       c = mix(c, EDGE, sstep(0.04, 0.5, rsv));            // 実道路の際は路肩
       c = mix(c, ROAD, sstep(0.5, 0.95, rc));             // 縁のアンチエイリアス
+      // 実データの公園が最後に来る(推定の緑より優先)。道路・歩道の下には敷かない
+      const pgv = pv[i] / 255, pdv = pv[i + 1] / 255;
+      if (pgv > 0.01) c = mix(c, PARK, pgv);
+      if (pdv > 0.01) c = mix(c, DIRT, pdv);
     }
     const n = 0.88 + Math.random() * 0.24;                // ざらつき
     a[i] = c[0] * n; a[i + 1] = c[1] * n; a[i + 2] = c[2] * n;
@@ -1078,6 +1102,152 @@ const councilPosts = [];
     `${(council.places ?? []).reduce((n, p) => n + p.speeches.length, 0)}発言`);
 }
 
+// ---------------------------------------------------------------- 遊具の位置
+// 先に決めておく。木より後に決めると、木の生えた真上に滑り台が出てしまう。
+// OSM の leisure=playground だけを見ると那覇ではほぼ空になる(街区公園は
+// leisure=park で登録され playground が付かない)ので、児童公園サイズの
+// park も対象にする。広すぎる公園の真ん中に遊具1組だけ置いても嘘になるので
+// 上限を切る。
+const playSites = [];
+for (const p of world.parks ?? []) {
+  if (p.k !== 'playground' && p.k !== 'park') continue;
+  let cx = 0, cz = 0, a2 = 0;
+  const m = p.f.length / 2;
+  const pts = [];
+  for (let i = 0; i < p.f.length; i += 2) {
+    const x = p.f[i] - HALF, z = p.f[i + 1] - HALF;
+    pts.push([x, z]); cx += x; cz += z;
+  }
+  for (let i = 0; i < pts.length; i++) {
+    const [x, z] = pts[i], [nx, nz] = pts[(i + 1) % pts.length];
+    a2 += x * nz - nx * z;
+  }
+  const area = Math.abs(a2) / 2;
+  cx /= m; cz /= m;
+  if (p.k === 'park' && (area < 260 || area > 2600)) continue;
+  if (Math.abs(cx) > HALF - 6 || Math.abs(cz) > HALF - 6) continue;
+  if (blocked(cx, cz, 3.0)) continue;            // 建物に埋まる場所は避ける
+  playSites.push([cx, cz]);
+}
+
+// ---------------------------------------------------------------- 公園の木
+// 公園・庭園の面の中に木を散らす。1本ずつ Mesh にすると数百ドローコールに
+// なるので、幹と樹冠をそれぞれ InstancedMesh 1つに畳む(計2回)。
+// グラウンド(pitch)には生やさない。競技面に木が立つと嘘になる。
+// 幹だけ addSolid で固体にする(樹冠まで固くすると枝の下を歩けない)。
+// 地面テクスチャは既に焼き終わっているので、ここで足しても敷地色にはならない。
+{
+  const spots = [];
+  for (const p of world.parks ?? []) {
+    if (p.k === 'pitch') continue;
+    const pts = [];
+    for (let i = 0; i < p.f.length; i += 2) pts.push([p.f[i] - HALF, p.f[i + 1] - HALF]);
+    if (pts.length < 3) continue;
+    let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity, a2 = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const [x, z] = pts[i], [nx, nz] = pts[(i + 1) % pts.length];
+      a2 += x * nz - nx * z;
+      if (x < minx) minx = x; if (x > maxx) maxx = x;
+      if (z < minz) minz = z; if (z > maxz) maxz = z;
+    }
+    const inside = (x, z) => {
+      let s = false;
+      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        const [ax, az] = pts[i], [bx, bz] = pts[j];
+        if ((az > z) !== (bz > z) && x < (bx - ax) * (z - az) / (bz - az) + ax) s = !s;
+      }
+      return s;
+    };
+    // 90m2 に1本。小さな児童公園でも木が無いと寂しいので最低1本は試す
+    const want = Math.max(1, Math.min(40, Math.round(Math.abs(a2) / 2 / 90)));
+    for (let k = 0, guard = 0; k < want && guard < want * 40; guard++) {
+      const x = minx + Math.random() * (maxx - minx);
+      const z = minz + Math.random() * (maxz - minz);
+      if (Math.abs(x) > HALF - 5 || Math.abs(z) > HALF - 5) continue;
+      if (!inside(x, z)) continue;
+      if (blocked(x, z, 2.2)) continue;          // 建物際は避ける
+      if (onRoad(x, z)) continue;                // 園内の車路も避ける
+      if (playSites.some(([px, pz]) => Math.hypot(px - x, pz - z) < 5.5)) continue;
+      spots.push([x, z]);
+      k++;
+    }
+  }
+
+  if (spots.length) {
+    const trunkG = new THREE.CylinderGeometry(0.15, 0.23, 1, 5);
+    trunkG.translate(0, 0.5, 0);                 // 原点を根元に(Yスケール=幹の高さ)
+    const trunks = new THREE.InstancedMesh(
+      trunkG, new THREE.MeshLambertMaterial({ color: 0x6d573d }), spots.length);
+    const leaves = new THREE.InstancedMesh(
+      new THREE.IcosahedronGeometry(1, 0),
+      new THREE.MeshLambertMaterial({ color: 0xffffff }), spots.length);
+    const m4 = new THREE.Matrix4(), qt = new THREE.Quaternion();
+    const up = new THREE.Vector3(0, 1, 0);
+    const pv3 = new THREE.Vector3(), sv3 = new THREE.Vector3();
+    const col = new THREE.Color();
+    spots.forEach(([x, z], i) => {
+      const y = groundAt(x, z);
+      const h = 3.2 + Math.random() * 3.0;
+      const r = 1.4 + Math.random() * 1.2;
+      qt.setFromAxisAngle(up, Math.random() * Math.PI * 2);
+      m4.compose(pv3.set(x, y, z), qt, sv3.set(1, h, 1));
+      trunks.setMatrixAt(i, m4);
+      m4.compose(pv3.set(x, y + h + r * 0.4, z), qt, sv3.set(r, r * 0.85, r));
+      leaves.setMatrixAt(i, m4);
+      // 亜熱帯の照葉樹。濃い緑から明るい黄緑まで振って単調さを消す
+      col.setHSL(0.25 + Math.random() * 0.06, 0.30 + Math.random() * 0.20,
+                 0.24 + Math.random() * 0.13);
+      leaves.setColorAt(i, col);
+      addSolid(x, z, 0.55, 0.55, 0, y + h);      // 幹だけ固体にする
+    });
+    trunks.castShadow = leaves.castShadow = leaves.receiveShadow = true;
+    scene.add(trunks); scene.add(leaves);
+    console.log(`公園の木 ${spots.length} 本`);
+  }
+}
+
+// ---------------------------------------------------------------- 遊具
+// 滑り台とブランコを1組ずつ置く。数が少ないので InstancedMesh にはしない。
+// 当たり判定には入れない(すり抜けても実害が無く、細い支柱を固体にすると
+// 園内で引っかかって歩きにくくなるため)。
+{
+  const mk = (w, h, d, color) => new THREE.Mesh(
+    new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color }));
+  let n = 0;
+  for (const [cx, cz] of playSites) {
+    const g = new THREE.Group();
+    g.position.set(cx, groundAt(cx, cz), cz);
+    g.rotation.y = Math.random() * Math.PI * 2;
+
+    // 滑り台: 踊り場・斜面・脚
+    const deck = mk(1.1, 0.14, 1.1, 0xd8b13a); deck.position.set(-1.5, 1.45, 0);
+    const ramp = mk(0.12, 3.0, 0.95, 0xe8642f);
+    ramp.position.set(-0.1, 0.78, 0); ramp.rotation.z = Math.PI / 2 - 0.58;
+    g.add(deck, ramp);
+    for (const ox of [-0.45, 0.45]) for (const oz of [-0.45, 0.45]) {
+      const leg = mk(0.09, 1.45, 0.09, 0x9aa3a6);
+      leg.position.set(-1.5 + ox, 0.72, oz); g.add(leg);
+    }
+    // ブランコ: 門型の枠と座面2つ
+    const bar = mk(2.4, 0.1, 0.1, 0x4fb477); bar.position.set(2.4, 2.2, 0); g.add(bar);
+    for (const ox of [-1.1, 1.1]) for (const oz of [-0.7, 0.7]) {
+      const leg = mk(0.09, 2.2, 0.09, 0x4fb477);
+      leg.position.set(2.4 + ox, 1.1, oz); g.add(leg);
+    }
+    for (const ox of [-0.55, 0.55]) {
+      const seat = mk(0.5, 0.07, 0.22, 0x2f8fc4);
+      seat.position.set(2.4 + ox, 0.95, 0); g.add(seat);
+      for (const oz of [-0.09, 0.09]) {
+        const rope = mk(0.04, 1.25, 0.04, 0xbdb8ac);
+        rope.position.set(2.4 + ox, 1.58, oz); g.add(rope);
+      }
+    }
+    for (const o of g.children) o.castShadow = true;
+    scene.add(g); n++;
+  }
+  if (n) console.log(`遊具 ${n}組`);
+}
+
 // ---------------------------------------------------------------- 店舗の看板
 // OSM の名前付き地物から店舗系だけを拾って、建物の前に小さな看板を出す。
 // 数が増えても重くならないよう、表示は SHOP_R 以内に限る(距離バジェット)。
@@ -1093,6 +1263,9 @@ const SHOP_CATS = [
   ['金', 0xb98cd4, ['bank', 'post_office', 'atm', 'insurance']],
   ['学', 0xd8b13a, ['prep_school', 'school', 'music_school', 'driving_school',
                     'language_school']],
+  ['公', 0x5f9e57, ['park', 'garden', 'playground', 'pitch', 'sports_centre',
+                    'fitness_centre', 'stadium', 'swimming_pool', 'dance',
+                    'nature_reserve']],
   ['他', 0x9aa3a6, []],
 ];
 const shopSigns = [];
@@ -1101,11 +1274,12 @@ const shopSigns = [];
     'fire_station', 'parking', 'bicycle_rental', 'shelter', 'bench', 'toilets',
     'waste_basket', 'vending_machine', 'post_box', 'drinking_water',
     'kindergarten', 'social_facility', 'place_of_worship', 'train_station']);
-  const catOf = (v) => SHOP_CATS.find((c) => c[2].includes(v)) ?? SHOP_CATS[5];
+  const catOf = (v) => SHOP_CATS.find((c) => c[2].includes(v)) ?? SHOP_CATS.at(-1);
 
   for (const l of world.landmarks ?? []) {
     const [key, val] = (l.kind || '').split('=');
-    if (!['shop', 'amenity', 'office', 'craft', 'healthcare'].includes(key)) continue;
+    if (!['shop', 'amenity', 'office', 'craft', 'healthcare',
+          'leisure'].includes(key)) continue;
     if (skip.has(val)) continue;
     const [mark, color] = catOf(val);
     const x = l.x - HALF, z = l.z - HALF;
