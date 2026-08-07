@@ -164,6 +164,30 @@ def parse_stations(path, lat_c, lon_c, m_lat, m_lon, half, margin):
     return out
 
 
+def parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, margin):
+    """OpenStreetMap(Overpass API)のバス停ノードをローカル座標にする。
+
+    国土数値情報のバス停(P11)は「非商用」区分で複製物の再配布が禁止なので、
+    公開物には ODbL の OSM を使う。出典表示と継承が条件。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    out = []
+    for e in d.get("elements", []):
+        if "lat" not in e or "lon" not in e:
+            continue
+        t = e.get("tags") or {}
+        x = (e["lon"] - lon_c) * m_lon + half
+        z = -(e["lat"] - lat_c) * m_lat + half
+        if not (-margin <= x <= 2 * half + margin and -margin <= z <= 2 * half + margin):
+            continue
+        out.append({
+            "name": t.get("name", ""),
+            "op": t.get("operator", ""),
+            "x": round(x, 2), "z": round(z, 2),
+        })
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--center", nargs=2, type=float, required=True, metavar=("LAT", "LON"))
@@ -174,6 +198,7 @@ def main():
     ap.add_argument("--tran", nargs="*", default=[], help="交通(道路)CityGML(複数可)")
     ap.add_argument("--rail", default="", help="鉄道 GeoJSON(モノレール線形)")
     ap.add_argument("--stations", default="", help="鉄道駅 CZML")
+    ap.add_argument("--bus", default="", help="バス停 (OSM Overpass JSON)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -307,6 +332,16 @@ def main():
             file=sys.stderr,
         )
 
+    bus = []
+    if args.bus:
+        path = args.bus if os.path.isabs(args.bus) else os.path.join(NAHA, args.bus)
+        bus = parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, 0)
+        names = sorted({b["name"] for b in bus if b["name"]})
+        print(
+            f"  {os.path.basename(path)}: バス停 {len(bus)} / 名称 {len(names)}種",
+            file=sys.stderr,
+        )
+
     # 中心の地表高さ(スポーン基準)
     ci = n // 2
     world = {
@@ -323,6 +358,7 @@ def main():
         "roads": roads,
         "rail": rail,
         "stations": stations,
+        "bus": bus,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:

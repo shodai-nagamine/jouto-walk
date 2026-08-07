@@ -83,7 +83,15 @@ PC:
   --dem 392725_dem_55.gml \
   --tran 39272568_tran.gml 39272578_tran.gml \
   --rail naha_railway.geojson --stations naha_station.czml \
+  --bus naha_bus_osm.json \
   --out public/data/world.json
+```
+
+バス停は OpenStreetMap から Overpass API で取る（クエリは
+`naha_bus_osm.query.txt` に保存してある）:
+
+```bash
+curl -s -X POST -d @naha_bus_osm.query.txt https://overpass-api.de/api/interpreter -o naha_bus_osm.json
 ```
 
 - `--center` は緯度経度。別の場所にすれば那覇市内のどこでも作れる（該当メッシュの GML が要る）
@@ -114,6 +122,9 @@ PC:
   既に存在する**（17×53m・高さ約 16m）ので、ホームは作らず駅名だけを出す。
   高架がこの建物を貫くのは不具合ではなく、ホーム高さで駅舎を通る実際の姿
   （干渉サンプルは全 258 点中 15 点で、すべてこの駅舎の範囲内）
+- **バス停**: 20 基（うち「城東小学校前」は校門のすぐ前）。支柱と台座は InstancedMesh、
+  標識は canvas テクスチャのスプライトにして向きを持たせない。名札が 20 枚も常時
+  見えると画面が埋まるので、**135m 以内だけ表示**する
 - **シーサーの配置**: 道路面の重心を候補にし、互いに 110m 以上離して 10 体選ぶ
   （足りなければ 70m → 40m と間隔を緩める）。道沿いに立つので必ず辿り着ける
 - **屋根**: 低層の一部を赤瓦色にすると俯瞰したとき一気に沖縄になる
@@ -156,6 +167,17 @@ CC BY 4.0 と互換。再配布・商用利用とも可能だが、次の3点が
 このリポジトリでは `public/data/world.json` が加工済みの再配布データにあたるため、
 タイトル画面に上記3点を常時表示している（`index.html` の `#card .credit`）。
 公開先を変えたり UI を作り替えるときも、この表示は落とさないこと。
+
+**バス停**: [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors
+（**ODbL 1.0**）を加工して作成。Overpass API で取得。
+
+> ⚠️ バス停に国土数値情報（P11 バス停留所）を使ってはいけない。
+> P11 は「**非商用**」区分で、[利用規約](https://nlftp.mlit.go.jp/ksj/other/agreement_02.html)に
+> 「非商用目的のみでの利用（**ただし複製物の再配布を除く**）」と明記されている。
+> `world.json` に座標を載せて公開するのは複製物の再配布にあたるため、
+> 公開物には使えない。ODbL の OSM ならクレジットと継承を守れば再配布できる。
+> なお ODbL は派生データベースに継承を要求するので、`world.json` のバス停部分は
+> ODbL 扱いになる。
 
 **3D描画**: [three.js](https://threejs.org/) r180（MIT）。`public/lib/` に同梱、
 ライセンスヘッダはファイル先頭に保持している。

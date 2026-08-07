@@ -795,6 +795,64 @@ for (const st of world.stations ?? []) {
   console.log(`駅名を設置: ${st.name} (${q.x.toFixed(0)}, ${q.z.toFixed(0)})`);
 }
 
+// ---------------------------------------------------------------- バス停
+// 出典は OpenStreetMap(ODbL)。国土数値情報のバス停(P11)は「非商用」区分で
+// 複製物の再配布が禁止なので、公開物には使えない。
+const busSigns = [];
+{
+  const stops = world.bus ?? [];
+  if (stops.length) {
+    // 支柱はまとめて1ドローコール
+    const poleGeo = new THREE.CylinderGeometry(0.055, 0.07, 2.75, 6);
+    const poleMat = new THREE.MeshLambertMaterial({ color: 0x8d9295 });
+    const poles = new THREE.InstancedMesh(poleGeo, poleMat, stops.length);
+    const base = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.26, 0.3, 0.16, 8),
+      new THREE.MeshLambertMaterial({ color: 0x76797b }));
+    const bases = new THREE.InstancedMesh(base.geometry, base.material, stops.length);
+    const m = new THREE.Matrix4();
+
+    stops.forEach((s, i) => {
+      const x = s.x - HALF, z = s.z - HALF;
+      const g = groundAt(x, z);
+      m.makeTranslation(x, g + 1.38, z);
+      poles.setMatrixAt(i, m);
+      m.makeTranslation(x, g + 0.08, z);
+      bases.setMatrixAt(i, m);
+
+      // 標識は板(スプライト)。名前が常に読めるのと、向きを持たなくて済む
+      const cv = document.createElement('canvas');
+      cv.width = 384; cv.height = 128;
+      const c = cv.getContext('2d');
+      c.fillStyle = '#f6f3ea';
+      c.beginPath(); c.roundRect(4, 20, 376, 88, 14); c.fill();
+      c.strokeStyle = '#2f8fc4'; c.lineWidth = 6;
+      c.beginPath(); c.roundRect(4, 20, 376, 88, 14); c.stroke();
+      c.fillStyle = '#1d5f7d';
+      c.font = 'bold 20px "Hiragino Sans", sans-serif';
+      c.textAlign = 'center'; c.textBaseline = 'middle';
+      // 絵文字はフォント環境で崩れるので文字だけにする
+      c.fillText('バスのりば', 192, 42);
+      c.fillStyle = '#0d1b1e';
+      const name = s.name || 'バス停';
+      c.font = `bold ${name.length > 8 ? 30 : 38}px "Hiragino Sans", sans-serif`;
+      c.fillText(name, 192, 80);
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: new THREE.CanvasTexture(cv), transparent: true,
+      }));
+      sp.scale.set(3.9, 1.3, 1);
+      sp.position.set(x, g + 3.1, z);
+      scene.add(sp);
+      busSigns.push(sp);
+    });
+    poles.instanceMatrix.needsUpdate = true;
+    bases.instanceMatrix.needsUpdate = true;
+    poles.castShadow = bases.castShadow = true;
+    scene.add(poles, bases);
+    console.log(`バス停 ${stops.length}基`);
+  }
+}
+
 // 走る車両(2両)。線形を往復するので端で消えたり湧いたりしない
 let train = null, trainPath = null, trainD = 0, trainDir = 1;
 if (railPaths.length) {
@@ -1035,6 +1093,12 @@ base.width = base.height = MS;
     p.pts.forEach((q, i) => (i ? b.lineTo(w2m(q.x), w2m(q.z)) : b.moveTo(w2m(q.x), w2m(q.z))));
     b.stroke();
   }
+  // バス停
+  b.fillStyle = 'rgba(120,200,235,.9)';
+  const bs = Math.max(2, 2.2 * (MS / 188));
+  for (const s of world.bus ?? []) {
+    b.fillRect(w2m(s.x - HALF) - bs / 2, w2m(s.z - HALF) - bs / 2, bs, bs);
+  }
   b.fillStyle = 'rgba(246,243,234,.42)';
   for (const bd of bstore) {
     b.beginPath();
@@ -1237,6 +1301,11 @@ function tick() {
     const q = railAt(trainPath, trainD);
     train.position.set(q.x, q.y + 0.9, q.z);  // 桁をまたぐので少し上に乗せる
     train.rotation.y = q.yaw + (trainDir < 0 ? Math.PI : 0);
+  }
+
+  // バス停の名札は近くだけ(20枚が常時見えると画面が埋まる)
+  for (const s of busSigns) {
+    s.visible = Math.hypot(s.position.x - player.x, s.position.z - player.z) < 135;
   }
 
   // シーサーの回収
