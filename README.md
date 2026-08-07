@@ -29,6 +29,22 @@ python3 -m http.server 8945 --directory ~/dev/apps/jouto-walk/public
 `public/` を GitHub Pages へ配信する。ビルド手順は無く、成果物をそのまま上げるだけ。
 配信サイズは約 1.3MB（`world.json` は gzip で 0.2MB）。
 
+### デプロイでハマった点（2026-08-06）
+
+- `concurrency` は **`cancel-in-progress: false`**。`true` だと進行中のデプロイを
+  打ち切って Pages 側が `Deployment cancelled` になり、上げ直しても反映されない
+- **失敗したジョブを `gh run rerun --failed` で再実行しない**。同じ run に
+  `github-pages` という名前のアーティファクトが2つでき、
+  `Multiple artifacts named "github-pages"` で必ず落ちる。新しい run を投げること
+  （`gh workflow run pages.yml` か、新規 push）
+- `deploy-pages` の `timeout` は **10分が上限**（それ以上を書いても丸められる）。
+  Pages 側の配信がこれを超えると **ジョブは failure になるが、配信は後から完了して
+  公開される**。赤いバツを見たら、まず本番の中身を確認する:
+
+  ```bash
+  curl -s https://shodai-nagamine.github.io/jouto-walk/main.js | grep -c setFly
+  ```
+
 ## 操作
 
 PC:

@@ -30,8 +30,8 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: public
+      # timeout は 600000ms(10分)が上限で、それ以上を書いても丸められる。
+      # Pages側の配信がこれを超えると job は failure になるが、配信自体は
+      # 後から完了して公開される(= 赤いバツでもサイトは更新されていることがある)。
       - id: deployment
         uses: actions/deploy-pages@v4
-        with:
-          # Pages側の配信キューが混むと既定の10分では足りずに打ち切られるので延ばす
-          timeout: 1800000
