@@ -260,6 +260,55 @@ def parse_osm_named(path, lat_c, lon_c, m_lat, m_lon, half, size):
     return out
 
 
+def parse_footways(path, lat_c, lon_c, m_lat, m_lon, half, size):
+    """OSM の歩行者系 way を種別つきの折れ線にする。
+
+    PLATEAU の交通モデル(tran)は那覇では LOD1 のみで、TrafficArea /
+    AuxiliaryTrafficArea を持たない = 歩道と車道の区別が無い。
+    そこで歩道・横断歩道・階段は OSM から取る。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = 0.0, float(size)
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        hw = t.get("highway", "")
+        fw = t.get("footway", "")
+        if hw == "steps":
+            kind = "steps"
+        elif fw == "crossing" or t.get("crossing"):
+            kind = "crossing"
+        elif fw == "sidewalk" or hw in ("footway", "pedestrian"):
+            kind = "sidewalk"
+        else:
+            kind = "path"
+        pts = [
+            ((p["lon"] - lon_c) * m_lon + half, -(p["lat"] - lat_c) * m_lat + half)
+            for p in (e.get("geometry") or []) if p
+        ]
+        if len(pts) < 2:
+            continue
+        cur = []
+        for i in range(len(pts) - 1):
+            seg = clip_segment(*pts[i], *pts[i + 1], lo, hi)
+            if seg is None:
+                if len(cur) >= 2:
+                    out.append({"k": kind, "f": [round(v, 2) for p in cur for v in p]})
+                cur = []
+                continue
+            ax, az, bx, bz = seg
+            if not cur:
+                cur = [(ax, az)]
+            elif abs(cur[-1][0] - ax) > 0.5 or abs(cur[-1][1] - az) > 0.5:
+                if len(cur) >= 2:
+                    out.append({"k": kind, "f": [round(v, 2) for p in cur for v in p]})
+                cur = [(ax, az)]
+            cur.append((bx, bz))
+        if len(cur) >= 2:
+            out.append({"k": kind, "f": [round(v, 2) for p in cur for v in p]})
+    return out
+
+
 def parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, size, radius=32.0):
     """OSM の信号ノードを、交差点ごとにまとめて系統(青になる向き)を決める。
 
@@ -435,6 +484,7 @@ def main():
     ap.add_argument("--osm-named", default="", help="名前付き地物 (OSM Overpass JSON)")
     ap.add_argument("--bus-routes", default="", help="バス路線 (OSM route relation JSON)")
     ap.add_argument("--signals", default="", help="信号 (OSM Overpass JSON)")
+    ap.add_argument("--footways", default="", help="歩道・横断歩道・階段 (OSM Overpass JSON)")
     ap.add_argument("--max-routes", type=int, default=4, help="走らせる路線数")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -625,6 +675,17 @@ def main():
         print(f"  {os.path.basename(path)}: 信号 {len(signals)}基 "
               f"(車両{ncar}/歩行者{len(signals)-ncar}) / 交差点 {ng}箇所", file=sys.stderr)
 
+    footways = []
+    if args.footways:
+        path = (args.footways if os.path.isabs(args.footways)
+                else os.path.join(NAHA, args.footways))
+        footways = parse_footways(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        cnt = {}
+        for f in footways:
+            cnt[f["k"]] = cnt.get(f["k"], 0) + 1
+        print(f"  {os.path.basename(path)}: 歩行者系 {len(footways)}本 {cnt}",
+              file=sys.stderr)
+
     # 中心の地表高さ(スポーン基準)
     ci = n // 2
     world = {
@@ -645,6 +706,7 @@ def main():
         "busRoutes": bus_routes,
         "landmarks": landmarks,
         "signals": signals,
+        "footways": footways,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:

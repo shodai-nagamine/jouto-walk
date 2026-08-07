@@ -85,6 +85,7 @@ PC:
   --rail naha_railway.geojson --stations naha_station.czml \
   --bus naha_bus_osm.json --osm-named naha_named_osm.json \
   --bus-routes naha_busroutes_osm.json --signals naha_signals_osm.json \
+  --footways naha_footways_osm.json \
   --out public/data/world.json
 ```
 
@@ -191,6 +192,13 @@ python3 tools/link_council.py --world public/data/world.json --out public/data/c
   歩行者用は上が赤、下が青
 - **バスは赤で止まる**: 各路線の経路上で信号に差しかかる地点を先に拾い、進行方向から
   見る系統（東西か南北か）も決めておく。停止線の 3.5m 手前で青以外なら進まない
+- **歩道と車道の区別**: PLATEAU の交通モデルは那覇では **LOD1 のみ**で
+  `TrafficArea` / `AuxiliaryTrafficArea` を持たない = **歩道と車道の区別が無い**
+  （手元の tran GML を grep して 0 件を確認）。そこで歩行者系は OSM から取る。
+  歩道 166・横断歩道 50・階段 27・小径 18。歩道は 2.6m 幅の明るい舗装として
+  車道の上に描き、**横断歩道は白い縞**として最後に重ねる（縞は歩行者の進む向きと
+  平行な帯なので、way に沿う線を左右にずらして引く）。
+  路面を横断方向にサンプルすると明暗が 6 回切り替わることを確認済み
 - **バス停**: 20 基（うち「城東小学校前」は校門のすぐ前）。支柱と台座は InstancedMesh、
   標識は canvas テクスチャのスプライトにして向きを持たせない。名札が 20 枚も常時
   見えると画面が埋まるので、**135m 以内だけ表示**する

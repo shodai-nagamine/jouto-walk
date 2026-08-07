@@ -209,9 +209,33 @@ function groundTexture() {
   rsg.filter = `blur(${1.8 * s}px)`;        // 1.8m ぼかし = 路肩の帯
   rsg.drawImage(rd, 0, 0);
 
+  // 歩道・階段(OSM)。PLATEAU の tran は那覇では LOD1 のみで
+  // TrafficArea を持たない = 歩道と車道の区別が無いので、ここは OSM から取る。
+  const wk = document.createElement('canvas'); wk.width = wk.height = W;
+  const wg = wk.getContext('2d', { willReadFrequently: true });
+  wg.fillStyle = '#000'; wg.fillRect(0, 0, W, W);
+  wg.lineCap = 'round'; wg.lineJoin = 'round';
+  const toPx = (v) => (v + HALF) * s;
+  const strokeWays = (kinds, widthM, style) => {
+    wg.strokeStyle = style;
+    wg.lineWidth = widthM * s;
+    for (const f of world.footways ?? []) {
+      if (!kinds.includes(f.k)) continue;
+      wg.beginPath();
+      for (let i = 0; i < f.f.length; i += 2) {
+        const x = toPx(f.f[i] - HALF), z = toPx(f.f[i + 1] - HALF);
+        i ? wg.lineTo(x, z) : wg.moveTo(x, z);
+      }
+      wg.stroke();
+    }
+  };
+  strokeWays(['sidewalk', 'path'], 2.6, '#fff');   // 歩道
+  strokeWays(['steps'], 2.0, '#888');              // 階段(あとで縞にする)
+
   const A = lg.getImageData(0, 0, W, W), B = dg.getImageData(0, 0, W, W);
   const R = rg.getImageData(0, 0, W, W), RS = rsg.getImageData(0, 0, W, W);
-  const a = A.data, b = B.data, rr = R.data, rs = RS.data;
+  const WK = wg.getImageData(0, 0, W, W);
+  const a = A.data, b = B.data, rr = R.data, rs = RS.data, wv = WK.data;
   const PAVE = [154, 150, 142];             // 敷地(コンクリ)
   const ROAD = [110, 110, 114];             // 道路(アスファルト)
   const EDGE = [138, 134, 112];             // 路肩・未舗装
@@ -223,11 +247,17 @@ function groundTexture() {
     const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
     return t * t * (3 - 2 * t);
   };
+  const WALK = [176, 172, 163];             // 歩道(平板ブロック)
+  const STEPS = [150, 146, 138];            // 階段
   for (let i = 0; i < a.length; i += 4) {
     const solid = a[i], dens = b[i], rc = rr[i] / 255, rsv = rs[i] / 255;
+    const w = wv[i];
     let c;
+    // 歩道・階段は車道より上に描く(車道の縁に沿って通っているため)
+    if (w > 200) c = WALK;
+    else if (w > 60) c = STEPS;
     // 実データの道路が最優先。敷地の外周(建物から2.25m)と重なる帯は実際には路面
-    if (rc > 0.5) c = ROAD;
+    else if (rc > 0.5) c = ROAD;
     else if (solid > 128) c = PAVE;                       // 建物の敷地
     else {
       // 市街地なので、建物からよほど離れた所だけを緑地にする
@@ -241,6 +271,29 @@ function groundTexture() {
     a[i] = c[0] * n; a[i + 1] = c[1] * n; a[i + 2] = c[2] * n;
   }
   lg.putImageData(A, 0, 0);
+
+  // 横断歩道は最後に白い縞として重ねる。縞は歩行者の進む向きと平行な帯を
+  // 横に並べたものなので、way に沿う線を左右にずらして引く。
+  lg.lineCap = 'butt';
+  lg.strokeStyle = 'rgba(238,236,228,0.82)';
+  lg.lineWidth = 0.42 * s;
+  for (const f of world.footways ?? []) {
+    if (f.k !== 'crossing') continue;
+    for (let i = 0; i + 3 < f.f.length; i += 2) {
+      const ax = f.f[i] - HALF, az = f.f[i + 1] - HALF;
+      const bx = f.f[i + 2] - HALF, bz = f.f[i + 3] - HALF;
+      let dx = bx - ax, dz = bz - az;
+      const L = Math.hypot(dx, dz) || 1;
+      dx /= L; dz /= L;
+      const px = dz, pz = -dx;                    // 進行方向に直交する向き
+      for (let o = -2.2; o <= 2.2; o += 0.9) {    // 縞を横に並べる
+        lg.beginPath();
+        lg.moveTo(toPx(ax + px * o), toPx(az + pz * o));
+        lg.lineTo(toPx(bx + px * o), toPx(bz + pz * o));
+        lg.stroke();
+      }
+    }
+  }
 
   const t = new THREE.CanvasTexture(lot);
   t.colorSpace = THREE.SRGBColorSpace;
