@@ -78,10 +78,80 @@
     cursor:pointer; border:none; letter-spacing:.06em; }
   #card .go:hover { filter:brightness(1.08); }
   #card .go[disabled] { background:#4a5254; color:#9aa; cursor:default; }
+  #card .btns { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+  #card .go.alt { background:transparent; color:var(--paper); font-weight:600;
+    border:1px solid rgba(246,243,234,.34); }
+  #card .go.alt:hover { background:rgba(246,243,234,.12); filter:none; }
+
+  /* ---- 開発ログ ---- */
+  #logview { position:fixed; inset:0; z-index:20; display:none;
+    background:rgba(6,14,16,.86); backdrop-filter:blur(4px); padding:20px; }
+  #logview.on { display:grid; place-items:center; }
+  #logbox { width:min(760px, 100%); max-height:min(84vh, 100%);
+    display:flex; flex-direction:column;
+    background:#101f22; border:1px solid rgba(246,243,234,.18);
+    border-radius:12px; overflow:hidden; }
+  #loghead { display:flex; align-items:flex-start; justify-content:space-between;
+    gap:12px; padding:16px 18px 12px; border-bottom:1px solid rgba(246,243,234,.14); }
+  #loghead h2 { margin:0; font-size:17px; letter-spacing:.02em; }
+  #loghead .sub { font-size:11px; opacity:.55; margin-top:4px; }
+  #logclose { background:rgba(246,243,234,.14); border:1px solid rgba(246,243,234,.28);
+    color:var(--paper); border-radius:7px; width:32px; height:32px; font-size:14px;
+    cursor:pointer; font-family:inherit; flex:none; }
+  #logclose:hover { background:var(--accent); color:#160c06; }
+  #loglist { overflow-y:auto; padding:6px 18px 18px; -webkit-overflow-scrolling:touch; }
+  .lg { padding:13px 0; border-bottom:1px solid rgba(246,243,234,.09); }
+  .lg:last-child { border-bottom:none; }
+  .lg .top { display:flex; align-items:baseline; gap:9px; flex-wrap:wrap; }
+  .lg .k { font-size:10px; font-weight:700; letter-spacing:.08em; border-radius:3px;
+    padding:2px 7px; background:rgba(232,100,47,.2); color:var(--accent);
+    border:1px solid rgba(232,100,47,.4); }
+  .lg .k.fix { background:rgba(47,143,196,.2); color:#8fd0f0;
+    border-color:rgba(47,143,196,.45); }
+  .lg .k.docs, .lg .k.chore, .lg .k.refactor { background:rgba(246,243,234,.1);
+    color:rgba(246,243,234,.7); border-color:rgba(246,243,234,.22); }
+  .lg .t { font-size:13.5px; font-weight:700; flex:1 1 auto; min-width:200px; }
+  .lg .d { font-size:10.5px; opacity:.5; font-variant-numeric:tabular-nums; }
+  .lg ul { margin:8px 0 0; padding-left:17px; }
+  .lg li { font-size:12px; line-height:1.8; opacity:.82; }
+  .lg a { font-size:10.5px; color:var(--accent); text-decoration:none; opacity:.85; }
+  .lg a:hover { text-decoration:underline; }
+  @media (max-width:820px) {
+    #logview { padding:10px; }
+    #loghead { padding:13px 14px 10px; }
+    #loglist { padding:4px 14px 14px; }
+    .lg .t { font-size:12.5px; min-width:0; }
+    .lg li { font-size:11.5px; line-height:1.75; }
+  }
+
   #card .meta { margin-top:24px; font-size:11px; opacity:.45; line-height:1.9; }
   /* PLATEAU(PDL1.0/CC BY 4.0)は出典と「加工した旨」の表示が必須 */
   #card .credit { margin-top:12px; font-size:10.5px; opacity:.5; line-height:1.85; }
   #card .credit a { color:var(--paper); }
+
+  /* ---- バスの乗降 ---- */
+  #ride { display:none; left:50%; transform:translateX(-50%); bottom:22px;
+    pointer-events:none; align-items:center; gap:11px;
+    border-color:rgba(47,143,196,.5); padding:9px 13px; }
+  #ride.on { display:flex; }
+  #ride .rt { font-size:13px; font-weight:700; color:#8fd0f0; white-space:nowrap; }
+  #ride .msg { font-size:11.5px; opacity:.8; white-space:nowrap; }
+  #ride .rb { pointer-events:auto; font-family:inherit; cursor:pointer;
+    background:var(--sea); color:#eaf6fb; border:1px solid rgba(143,208,240,.6);
+    border-radius:999px; padding:6px 16px; font-size:12px; font-weight:700;
+    white-space:nowrap; }
+  #ride .rb:hover, #ride .rb:active { background:#8fd0f0; color:#0d1b1e; }
+  @media (max-width:820px), (max-height:560px) {
+    /* 上はコンパスとステータスで埋まっているので左下に置く */
+    #ride { left:calc(10px + env(safe-area-inset-left)); transform:none;
+      bottom:calc(10px + env(safe-area-inset-bottom));
+      padding:7px 9px; gap:7px; max-width:calc(100vw - 150px); }
+    #ride .rt { font-size:11px; overflow:hidden; text-overflow:ellipsis; }
+    #ride .msg { display:none; }
+    #ride .rb { padding:7px 13px; font-size:11.5px; }
+  }
+  /* 乗車中は移動スティックを出さない */
+  body.riding #stick { display:none !important; }
 
   /* ---- 市議会の言及パネル ---- */
   /* パネル自体はクリックを受け取らない。受け取るとパネルが画面を覆っている間
@@ -223,6 +293,13 @@
   <div id="reticle"></div>
   <div id="toast"></div>
 
+  <!-- バスの乗降 -->
+  <div id="ride" class="panel">
+    <span class="rt" id="rd-route"></span>
+    <span class="msg" id="rd-msg"></span>
+    <button class="rb" id="rd-btn"></button>
+  </div>
+
   <!-- 議会の言及パネル(近づくと出る) -->
   <div id="council" class="panel">
     <div class="ch">
@@ -247,6 +324,20 @@
   </div>
 </div>
 
+<!-- 開発ログ(git履歴から生成) -->
+<div id="logview">
+  <div id="logbox">
+    <div id="loghead">
+      <div>
+        <h2>開発ログ</h2>
+        <div class="sub" id="logsub">実際のコミット履歴です</div>
+      </div>
+      <button id="logclose" aria-label="閉じる">✕</button>
+    </div>
+    <div id="loglist"></div>
+  </div>
+</div>
+
 <div id="overlay">
   <div id="card">
     <h1>城東小あるき</h1>
@@ -262,7 +353,10 @@
       画面の<b>左半分</b>を押して動かすと歩き、<b>右半分</b>をなぞると見回せます<br>
       <b>ジャンプ長押し</b>で飛行モード（見上げ・見下ろした方へ飛べます）
     </div>
-    <button class="go" id="go" disabled>読み込み中…</button>
+    <div class="btns">
+      <button class="go" id="go" disabled>読み込み中…</button>
+      <button class="go alt" id="logbtn">開発ログ</button>
+    </div>
     <div class="meta" id="meta">建物データを準備しています</div>
     <div class="credit">
       建物・地形・道路・モノレール:

@@ -948,6 +948,7 @@ const buses = [];
 
     buses.push({
       g, path, stops, label: lab,
+      ref: r.ref, name: r.name.split('(')[0].split('（')[0].trim(),
       d: path.len * (0.13 + 0.21 * i), dir: 1, wait: 0,
     });
   }
@@ -1284,6 +1285,74 @@ const tape = $('tape');
   tape.innerHTML = html;
 }
 
+// ---------------------------------------------------------------- バスに乗る
+// バス停に停まっているバスへ近づくと乗れる。乗車中は移動入力を切り、
+// 座席の位置にプレイヤーを貼り付ける(見回しは自由)。
+const BOARD_R = 6.5;           // この距離まで近づくと乗れる(m)
+const SEAT = { x: -0.75, y: 2.15, z: 1.6 };   // バス内の座席(左の窓側)
+let riding = null, boardable = null;
+const rideEl = $('ride');
+
+function updateRideUI() {
+  if (riding) {
+    $('rd-route').textContent = `${riding.ref}　${riding.name}`;
+    $('rd-msg').textContent = '乗車中 — 景色をどうぞ';
+    $('rd-btn').textContent = TOUCH ? '降りる' : '降りる [E]';
+    rideEl.classList.add('on');
+  } else if (boardable) {
+    $('rd-route').textContent = `${boardable.ref}　${boardable.name}`;
+    $('rd-msg').textContent = 'が停まっています';
+    $('rd-btn').textContent = TOUCH ? '乗る' : '乗る [E]';
+    rideEl.classList.add('on');
+  } else {
+    rideEl.classList.remove('on');
+  }
+}
+
+function board() {
+  if (riding || !boardable) return;
+  riding = boardable;
+  boardable = null;
+  setFly(false);
+  player.vy = 0; player.onGround = true;
+  document.body.classList.add('riding');
+  stick = null; stickShow(false);
+  say(`${riding.ref} ${riding.name} に乗車`);
+  updateRideUI();
+}
+
+function alight() {
+  if (!riding) return;
+  const b = riding;
+  // 進行方向の右側(歩道側)に降ろす。塞がっていたら少しずつ試す
+  const yaw = b.g.rotation.y;
+  let done = false;
+  for (const [ox, oz] of [[2.6, 0], [3.4, 0], [2.6, 3], [2.6, -3], [-2.6, 0], [0, 5]]) {
+    const x = b.g.position.x + Math.cos(-yaw) * ox - Math.sin(-yaw) * oz;
+    const z = b.g.position.z + Math.sin(-yaw) * ox + Math.cos(-yaw) * oz;
+    if (!blocked(x, z, RADIUS, groundAt(x, z))) {
+      player.x = x; player.z = z; done = true; break;
+    }
+  }
+  if (!done) { player.x = b.g.position.x + 3; player.z = b.g.position.z; }
+  player.y = supportY(player.x, player.z) + EYE;
+  player.vy = 0; player.onGround = true;
+  riding = null;
+  document.body.classList.remove('riding');
+  say('降車');
+  updateRideUI();
+}
+
+$('rd-btn').addEventListener('click', () => (riding ? alight() : board()));
+$('rd-btn').addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  if (riding) alight(); else board();
+}, { passive: false });
+addEventListener('keydown', (e) => {
+  if (e.code !== 'KeyE' || !started) return;
+  if (riding) alight(); else if (boardable) board();
+});
+
 // ---------------------------------------------------------------- 議会パネル
 const COUNCIL_R = 16;          // この距離まで近づくと出る(m)
 let councilNear = null, councilIdx = 0, councilRead = 0;
@@ -1391,7 +1460,59 @@ function tick() {
   if (!active) running = false;
   if (active) autoQuality(dt, now);
 
-  if (active) {
+  // バス(バス停で少し停まる。端まで行ったら折り返す=上り下り)。
+  // 乗車中はプレイヤーを座席へ貼り付けるので、必ずプレイヤー更新より先に動かす。
+  for (const b of buses) {
+    if (b.wait > 0) {
+      b.wait -= dt;
+    } else {
+      const prev = b.d;
+      b.d += b.dir * 8.5 * dt;              // 約30km/h
+      if (b.d > b.path.len) { b.d = b.path.len; b.dir = -1; b.wait = 2.5; }
+      if (b.d < 0) { b.d = 0; b.dir = 1; b.wait = 2.5; }
+      for (const s of b.stops) {
+        if ((prev < s && b.d >= s) || (prev > s && b.d <= s)) {
+          // そばに人が居るバス停では長めに停まる(乗り込む余裕をつくる)
+          const q0 = pathAt(b.path, s);
+          const near = Math.hypot(q0.x - player.x, q0.z - player.z) < 22;
+          b.wait = near ? 7 : 2.2;
+          break;
+        }
+      }
+    }
+    const q = pathAt(b.path, b.d);
+    b.g.position.set(q.x, groundAt(q.x, q.z), q.z);
+    b.g.rotation.y = q.yaw + (b.dir < 0 ? Math.PI : 0);
+    b.label.visible = !riding &&
+      Math.hypot(q.x - player.x, q.z - player.z) < 110;
+  }
+
+  // 乗車中は座席に貼り付ける(見回しは自由)
+  if (riding) {
+    const yaw = riding.g.rotation.y;
+    const cos = Math.cos(yaw), sin = Math.sin(yaw);
+    player.x = riding.g.position.x + SEAT.x * cos + SEAT.z * sin;
+    player.z = riding.g.position.z - SEAT.x * sin + SEAT.z * cos;
+    player.y = riding.g.position.y + SEAT.y;
+    player.vy = 0; player.onGround = true;
+  }
+
+  // 乗れるバスを探す(停車中で、十分近いもの)
+  {
+    const prev = boardable;
+    boardable = null;
+    if (active && !riding) {
+      let best = Infinity;
+      for (const b of buses) {
+        if (b.wait <= 0) continue;
+        const d = Math.hypot(b.g.position.x - player.x, b.g.position.z - player.z);
+        if (d < BOARD_R && d < best) { best = d; boardable = b; }
+      }
+    }
+    if (prev !== boardable) updateRideUI();
+  }
+
+  if (active && !riding) {
     // 入力を「前後(fb)・左右(lr)」にまとめてから向きに乗せる
     let fb = 0, lr = 0, throttle = 1, run = keys.has('ShiftLeft') || keys.has('ShiftRight');
     if (keys.has('KeyW') || keys.has('ArrowUp')) fb += 1;
@@ -1469,27 +1590,6 @@ function tick() {
   sun.target.position.set(player.x, groundAt(player.x, player.z), player.z);
   sun.position.set(player.x + 150, groundAt(player.x, player.z) + 260, player.z + 110);
   sun.target.updateMatrixWorld();
-
-  // バス(バス停で少し停まる。端まで行ったら折り返す=上り下り)
-  for (const b of buses) {
-    if (b.wait > 0) {
-      b.wait -= dt;
-    } else {
-      const prev = b.d;
-      b.d += b.dir * 8.5 * dt;              // 約30km/h
-      if (b.d > b.path.len) { b.d = b.path.len; b.dir = -1; b.wait = 2.5; }
-      if (b.d < 0) { b.d = 0; b.dir = 1; b.wait = 2.5; }
-      // 通過したバス停で停車
-      for (const s of b.stops) {
-        if ((prev < s && b.d >= s) || (prev > s && b.d <= s)) { b.wait = 2.2; break; }
-      }
-    }
-    const q = pathAt(b.path, b.d);
-    b.g.position.set(q.x, groundAt(q.x, q.z), q.z);
-    b.g.rotation.y = q.yaw + (b.dir < 0 ? Math.PI : 0);
-    // 系統名は近くだけ
-    b.label.visible = Math.hypot(q.x - player.x, q.z - player.z) < 110;
-  }
 
   // モノレールの車両(端に着いたら折り返す)
   if (train && trainPath) {
@@ -1572,6 +1672,56 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
   council, councilPosts, showCouncil, buses,
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
+
+// ---------------------------------------------------------------- 開発ログ
+// changelog.json は tools/build_changelog.py が git log から作る(手書きではない)
+{
+  const view = $('logview'), list = $('loglist');
+  let loaded = false;
+
+  async function openLog() {
+    view.classList.add('on');
+    if (loaded) return;
+    loaded = true;
+    let data;
+    try {
+      const r = await fetch('./data/changelog.json');
+      if (!r.ok) throw new Error(String(r.status));
+      data = await r.json();
+    } catch {
+      list.innerHTML = '<div class="lg"><div class="t">ログを読み込めませんでした</div>' +
+        '<ul><li>tools/build_changelog.py が生成する data/changelog.json が要ります</li></ul></div>';
+      return;
+    }
+    $('logsub').textContent =
+      `${data.items.length}件のコミット（実際の git 履歴から生成）`;
+    list.innerHTML = data.items.map((it) => {
+      const k = it.kind
+        ? `<span class="k ${it.tag}">${it.kind}</span>` : '';
+      const body = it.body.length
+        ? `<ul>${it.body.map((l) =>
+            `<li>${esc(l.replace(/^[-*]\s*/, ''))}</li>`).join('')}</ul>` : '';
+      return `<div class="lg"><div class="top">${k}` +
+        `<span class="t">${esc(it.title)}</span>` +
+        `<span class="d">${esc(it.date)}</span></div>${body}` +
+        `<a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.sha)} ↗</a></div>`;
+    }).join('');
+  }
+  const esc = (s) => String(s).replace(/[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  $('logbtn').addEventListener('click', openLog);
+  $('logclose').addEventListener('click', () => view.classList.remove('on'));
+  view.addEventListener('click', (e) => {
+    if (e.target === view) view.classList.remove('on');   // 外側を押しても閉じる
+  });
+  addEventListener('keydown', (e) => {
+    if (e.code === 'Escape' && view.classList.contains('on')) {
+      e.stopPropagation();
+      view.classList.remove('on');
+    }
+  }, true);
+}
 
 // ---------------------------------------------------------------- 起動
 $('go').disabled = false;

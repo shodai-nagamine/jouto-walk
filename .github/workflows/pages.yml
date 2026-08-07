@@ -26,6 +26,10 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 開発ログを git log から作るので全履歴が要る
+      - name: 開発ログを生成
+        run: python3 tools/build_changelog.py --out public/data/changelog.json
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
