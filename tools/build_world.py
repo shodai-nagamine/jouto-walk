@@ -570,29 +570,42 @@ def main():
     )
 
     # ---- 地形 -------------------------------------------------------------
+    # fill_missing のラプラス緩和は外周を mode="edge"(勾配ゼロ)で閉じるので、
+    # タイルの縁をそのまま境界にすると、隣り合うタイルが互いに自分の縁を
+    # 平らとみなして標高が食い違う(実測で最大 2.5m の段差になった)。
+    # 余白ぶん広く作ってから切り出し、境界条件の影響をタイルの外へ追い出す。
+    # 緩和 80 回の効く範囲は約 sqrt(80)≒9 セルなので、20 セル(100m)あれば足りる。
+    DEM_PAD = 20
     n = args.size // args.cell + 1
+    pad_m = DEM_PAD * args.cell
+    nn = n + 2 * DEM_PAD
+    dem_bbox = (
+        lat_c - (half + pad_m) / m_lat, lat_c + (half + pad_m) / m_lat,
+        lon_c - (half + pad_m) / m_lon, lon_c + (half + pad_m) / m_lon,
+    )
     terrain = None
     for dem in args.dem:
         path = dem if os.path.isabs(dem) else os.path.join(NAHA, dem)
-        pts = load_points(path, bbox)
+        pts = load_points(path, dem_bbox)
         if not len(pts):
             print(f"  {os.path.basename(path)}: 範囲内に点なし", file=sys.stderr)
             continue
-        # cell m 格子へ平均で集約
-        gx = np.floor(((pts[:, 1] - lon_c) * m_lon + half) / args.cell).astype(int)
-        gz = np.floor((-(pts[:, 0] - lat_c) * m_lat + half) / args.cell).astype(int)
-        ok = (gx >= 0) & (gx < n) & (gz >= 0) & (gz < n)
+        # cell m 格子へ平均で集約(余白つき)
+        gx = np.floor(((pts[:, 1] - lon_c) * m_lon + half + pad_m) / args.cell).astype(int)
+        gz = np.floor((-(pts[:, 0] - lat_c) * m_lat + half + pad_m) / args.cell).astype(int)
+        ok = (gx >= 0) & (gx < nn) & (gz >= 0) & (gz < nn)
         gx, gz, zv = gx[ok], gz[ok], pts[ok, 2]
-        acc = np.zeros((n, n))
-        cnt = np.zeros((n, n))
+        acc = np.zeros((nn, nn))
+        cnt = np.zeros((nn, nn))
         np.add.at(acc, (gx, gz), zv)
         np.add.at(cnt, (gx, gz), 1)
         mask = cnt > 0
-        seed = np.zeros((n, n))
+        seed = np.zeros((nn, nn))
         seed[mask] = acc[mask] / cnt[mask]
-        cov = mask.sum() / (n * n)
+        cov = mask.sum() / (nn * nn)
         print(f"  {os.path.basename(path)}: {len(pts):,}点 被覆{cov:.1%}", file=sys.stderr)
-        grid = fill_missing(seed, mask, relax=80)
+        # 余白ごと緩和してから、タイルぶんだけ切り出す
+        grid = fill_missing(seed, mask, relax=80)[DEM_PAD:DEM_PAD + n, DEM_PAD:DEM_PAD + n]
         terrain = grid if terrain is None else np.maximum(terrain, grid)
 
     if terrain is None:
