@@ -110,10 +110,91 @@ const TILE_LIST = (qs.get('tiles') || '0,0').split(';')
   .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b));
 for (const [tx, tz] of TILE_LIST) await fetchTile(tx, tz);
 const tile0 = tiles.get('0,0') ?? tiles.values().next().value;
-// モノレール・駅・バス経路・歩道はまだタイル(0,0)のデータを使う
-// (corridor.json への切り替えは次の段)。
+// タイル(0,0)の生データ。描画には使わない(window.dbg から覗くためだけに残す)。
 const world = tile0.data;
-const wx = tile0.X, wz = tile0.Z;
+
+// モノレール線形・駅・バス経路は corridor.json(全線ぶん)。
+// タイルの中身ではないので座標は最初からワールド座標(meta.coords="global")で、
+// HALF を引いてはいけない。
+const corridor = await fetch('./data/corridor.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .catch(() => null);
+if (!corridor) console.error('corridor.json が読めません(モノレールとバスが出ません)');
+
+// 全線をそのまま建てると、地形の無い受け皿の上を桁が延々と伸びる。
+// 読み込み済みタイルの範囲 + この余白だけ建てる。
+// 歩ける端(タイルの縁)から先へ少しだけ続いて見えればよいので短くする。
+// 長いと、受け皿(平らな緑地)の上に高架だけが取り残されて目立つ。
+const CORRIDOR_PAD = 120;
+
+/** (x,z) が読み込み済みのどれかのタイル + pad の中にあるか。 */
+function nearLoaded(x, z, pad = CORRIDOR_PAD) {
+  for (const t of tiles.values()) {
+    if (x >= t.offX - HALF - pad && x <= t.offX + HALF + pad &&
+        z >= t.offZ - HALF - pad && z <= t.offZ + HALF + pad) return true;
+  }
+  return false;
+}
+
+/**
+ * ワールド座標の折れ線(flat = [x,z,x,z,...])を読み込み済みタイル+余白で切る。
+ * 途中で外へ出ると切れるので、戻りは [[x,z],...] の配列の配列。
+ * タイルの矩形ごとに判定するので、L字に読んでも間の空白は拾わない。
+ */
+function clipToLoaded(flat, pad = CORRIDOR_PAD) {
+  const inside = (p) => nearLoaded(p[0], p[1], pad);
+  const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+  // 内側の点と外側の点の境目。タイルの矩形の和なので解析的には解かず二分探索する。
+  // 外側の頂点をそのまま残すと、頂点が疎な区間(全線データは1区間400m超のこともある)
+  // が丸ごと余白の外へ出て、地形の無いところに桁が伸びる。
+  const edge = (ain, bout) => {
+    let lo = 0, hi = 1;
+    for (let k = 0; k < 24; k++) {
+      const m = (lo + hi) / 2;
+      if (inside(lerp(ain, bout, m))) lo = m; else hi = m;
+    }
+    return lerp(ain, bout, lo);
+  };
+  const out = [];
+  let run = null;
+  for (let i = 0; i + 3 < flat.length; i += 2) {
+    const a = [flat[i], flat[i + 1]], b = [flat[i + 2], flat[i + 3]];
+    const ia = inside(a), ib = inside(b);
+    if (ia && ib) {
+      if (!run) { run = [a]; out.push(run); }
+      run.push(b);
+    } else if (ia) {                       // 出ていく: 境目で止める
+      if (!run) { run = [a]; out.push(run); }
+      run.push(edge(a, b));
+      run = null;
+    } else if (ib) {                       // 入ってくる: 境目から始める
+      run = [edge(b, a), b];
+      out.push(run);
+    } else {
+      // 両端とも外。長い区間が範囲を横切ることがあるので刻んで中を探す
+      run = null;
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const steps = Math.max(1, Math.ceil(L / 25));
+      let hit = -1;
+      for (let s = 1; s < steps; s++) {
+        if (inside(lerp(a, b, s / steps))) { hit = s / steps; break; }
+      }
+      if (hit < 0) continue;
+      const m = lerp(a, b, hit);
+      out.push([edge(m, a), m, edge(m, b)]);
+    }
+  }
+  return out.filter((r) => r.length >= 2);
+}
+
+/** 折れ線 [[x,z],...] の長さ(m)。切れた断片からいちばん長いものを選ぶのに使う。 */
+function polyLen(pts) {
+  let s = 0;
+  for (let i = 1; i < pts.length; i++) {
+    s += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+  }
+  return s;
+}
 
 // ---------------------------------------------------------------- 3D基盤
 const scene = new THREE.Scene();
@@ -574,10 +655,10 @@ function buildMonorail() {
     push(a, nx, ny, nz); push(c, nx, ny, nz); push(d, nx, ny, nz);
   };
 
-  for (const flat of world.rail ?? []) {
+  // corridor.json は全線を1本の折れ線で持つ。読み込み済みタイル+余白で切るので、
+  // 途中でタイルが抜けていれば複数の線形に割れる。
+  for (const raw of (corridor?.rail ?? []).flatMap((f) => clipToLoaded(f))) {
     // 8m 間隔に打ち直す(元データは頂点が疎で、地形に沿わせるため)
-    const raw = [];
-    for (let i = 0; i < flat.length; i += 2) raw.push([wx(flat[i]), wz(flat[i + 1])]);
     const pts = [];
     for (let i = 0; i < raw.length - 1; i++) {
       const [ax, az] = raw[i], [bx, bz] = raw[i + 1];
@@ -632,7 +713,10 @@ function buildMonorail() {
       if (path.cum[i] < next) continue;
       next = path.cum[i] + PIER_EVERY;
       const [x, z] = pts[i];
-      if (!tileOf(x, z)) continue;             // 読み込み済みタイルの上だけ
+      // 桁は余白のぶんだけタイルの外へ出る。そこは受け皿(外周の標高を外へ
+      // 引き伸ばした帯)で、groundAt もその高さを返すので橋脚は接地する。
+      // 立てないと余白のぶんだけ桁が宙に浮いて見える。
+      if (!nearLoaded(x, z)) continue;
       const g = groundAt(x, z);
       const h = y[i] - BEAM_T / 2 - g;
       if (h < 1) continue;
@@ -1146,7 +1230,7 @@ function makeLabel(text, w = 9, h = 2.4) {
 // ---------------------------------------------------------------- 駅のホーム
 // 当たり判定は建物と同じ仕組み(footprint+天端)に足すだけでよい。
 // STEP(0.55m)以内の段差は登れるので、階段は箱を積むだけで昇れる。
-let stationStop = null;
+const stationStops = [];   // 線形の上に乗った駅 {name, q, d, p}
 
 /**
  * 中心(cx,cz)・向きyawの長方形を、天端topの固体として登録する。
@@ -1168,8 +1252,11 @@ function addSolid(cx, cz, w, d, yaw, top, tag) {
   hashInsert(bmap, rec);
 }
 
-/** 石嶺駅のホームと階段。桁の高さから床を決めるので数字は自動で合う。 */
-function buildPlatform(q) {
+/**
+ * 駅のホームと階段。桁の高さから床を決めるので数字は自動で合う。
+ * 描画も当たり判定も t にぶら下げる(タイルを捨てるとき一緒に消えるように)。
+ */
+function buildPlatform(q, t) {
   const g = new THREE.Group();
   const yaw = q.yaw;
   const cos = Math.cos(yaw), sin = Math.sin(yaw);
@@ -1193,7 +1280,7 @@ function buildPlatform(q) {
 
   // ホーム(床板)。厚み1mの板の上面が floorY になるように置く
   box(PW, 1.0, PL, SIDE, floorY - 0.5, 0, 0xcfcabc);
-  addSolid(...at(SIDE, 0), PW, PL, yaw, floorY);
+  addSolid(...at(SIDE, 0), PW, PL, yaw, floorY, t.key);
   // ホーム端の白線
   box(0.25, 0.06, PL, SIDE - PW / 2 + 0.35, floorY + 0.03, 0, 0xf1ede2);
 
@@ -1215,7 +1302,7 @@ function buildPlatform(q) {
     const top = gnd + rise * (i + 1);
     const oz = PL / 2 + 0.4 + tread * (steps - 1 - i);
     box(2.6, top - gnd + 0.1, tread, SIDE, (gnd + top) / 2 - 0.05, oz, 0xc6c2b6);
-    addSolid(...at(SIDE, oz), 2.6, tread, yaw, top);
+    addSolid(...at(SIDE, oz), 2.6, tread, yaw, top, t.key);
   }
   // 階段の手すり
   for (const ox of [SIDE - 1.45, SIDE + 1.45]) {
@@ -1228,13 +1315,17 @@ function buildPlatform(q) {
     g.add(m);
   }
 
-  scene.add(g);
-  console.log(`ホーム: 床 ${floorY.toFixed(1)}m / 地上 ${gnd.toFixed(1)}m / 階段${steps}段`);
+  t.group.add(g);
+  console.log(`[${t.key}] ホーム: 床 ${floorY.toFixed(1)}m / 地上 ${gnd.toFixed(1)}m / 階段${steps}段`);
 }
 
-// 駅(ホーム＋屋根＋駅名)。線形上のいちばん近い点に合わせて向きを決める
-for (const st of world.stations ?? []) {
-  const sx = wx(st.x), sz = wz(st.z);
+// 駅(ホーム＋屋根＋駅名)。線形上のいちばん近い点に合わせて向きを決める。
+// corridor.json は全16駅を持つので、読み込み済みタイルの上にあるものだけ建てる
+// (タイルの外は地形が縁で埋められた作り物なので、ホームの高さが出鱈目になる)。
+for (const st of corridor?.stations ?? []) {
+  const home = tileOf(st.x, st.z);
+  if (!home) continue;
+  const sx = st.x, sz = st.z;
   let best = null;
   for (const p of railPaths) {
     for (let d = 0; d <= p.len; d += 4) {
@@ -1245,15 +1336,17 @@ for (const st of world.stations ?? []) {
   }
   if (!best || best.dist > 90) continue;
   const { q } = best;
-  stationStop = { q, d: best.d, p: best.p };
-  buildPlatform(q);
+  stationStops.push({ name: st.name, q, d: best.d, p: best.p });
+  // ホームは桁の真下に建てるので、駅の点ではなく桁の点が乗るタイルに預ける
+  const t = tileOf(q.x, q.z) ?? home;
+  buildPlatform(q, t);
   // 駅舎は PLATEAU の建物として既にある(石嶺駅=17x53m/高さ約16m)。
   // 高架はその中をホーム高さで通り抜けるのが実際の姿なので、
-  // ホームを作らず駅名だけを建物の上に出す。
+  // 駅舎は建てず、駅名だけを建物の上に出す。
   const lab = makeLabel(`${st.name}駅`);
   lab.position.set(q.x, supportY(q.x, q.z) + 5.5, q.z);
-  scene.add(lab);
-  console.log(`駅名を設置: ${st.name} (${q.x.toFixed(0)}, ${q.z.toFixed(0)})`);
+  t.group.add(lab);
+  console.log(`[${t.key}] 駅名を設置: ${st.name} (${q.x.toFixed(0)}, ${q.z.toFixed(0)})`);
 }
 
 // ---------------------------------------------------------------- バス停
@@ -1458,7 +1551,7 @@ function addTrees(t, playSites) {
       col.setHSL(0.25 + Math.random() * 0.06, 0.30 + Math.random() * 0.20,
                  0.24 + Math.random() * 0.13);
       leaves.setColorAt(i, col);
-      addSolid(x, z, 0.55, 0.55, 0, y + h);      // 幹だけ固体にする
+      addSolid(x, z, 0.55, 0.55, 0, y + h, t.key);   // 幹だけ固体にする
     });
     trunks.castShadow = leaves.castShadow = leaves.receiveShadow = true;
     t.group.add(trunks); t.group.add(leaves);
@@ -1961,19 +2054,24 @@ const PED_ARM = 0.60, PED_LEG = PED_HIP;
 const walkLines = [];
 
 {
-  for (const f of world.footways ?? []) {
-    if (f.k !== 'sidewalk' && f.k !== 'path') continue;
-    const pts = [];
-    for (let i = 0; i < f.f.length; i += 2) pts.push({ x: wx(f.f[i]), z: wz(f.f[i + 1]) });
-    if (pts.length < 2) continue;
-    const cum = [0];
-    let len = 0;
-    for (let i = 1; i < pts.length; i++) {
-      len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
-      cum.push(len);
+  // 歩道は corridor.json ではなくタイルが持つ(OSM をタイルごとに切ってある)。
+  for (const t of tiles.values()) {
+    for (const f of t.data.footways ?? []) {
+      if (f.k !== 'sidewalk' && f.k !== 'path') continue;
+      const pts = [];
+      for (let i = 0; i < f.f.length; i += 2) {
+        pts.push({ x: t.X(f.f[i]), z: t.Z(f.f[i + 1]) });
+      }
+      if (pts.length < 2) continue;
+      const cum = [0];
+      let len = 0;
+      for (let i = 1; i < pts.length; i++) {
+        len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
+        cum.push(len);
+      }
+      if (len < 6) continue;               // 短すぎる断片は使わない
+      walkLines.push({ pts, cum, len });
     }
-    if (len < 6) continue;                 // 短すぎる断片は使わない
-    walkLines.push({ pts, cum, len });
   }
 
   if (walkLines.length) {
@@ -2375,24 +2473,39 @@ for (const t of tiles.values()) buildTileProps(t);
 // 経路は OSM のバス路線リレーション(那覇バスの実系統)。時刻表は持たないので
 // 走行は任意のタイミングだが、経路と停留所は実在のもの。
 const buses = [];
+/**
+ * 系統名から末尾の行き先を落とす。
+ * 「石嶺（開南）線 （具志営業所行き)」のように線名そのものに全角括弧が入る系統が
+ * あるので、最初の括弧ではなく **末尾の括弧ひとつ** だけを取る。
+ */
+function routeName(s) {
+  return s.replace(/\s*[（(][^（(]*[)）]?\s*$/, '').trim() || s.trim();
+}
 {
   const LIVERY = [0xf2f0ea, 0xe8642f];   // 白地にオレンジ帯(那覇バスのイメージ)
-  for (const [i, r] of (world.busRoutes ?? []).entries()) {
-    const pts = [];
-    for (let k = 0; k < r.f.length; k += 2) pts.push([wx(r.f[k]), wz(r.f[k + 1])]);
+  let n = 0;
+  for (const r of corridor?.busRoutes ?? []) {
+    // 全系統ぶん(1系統13km超)あるので、読み込み済みタイル+余白で切る。
+    // 切れて複数になったら、いちばん長い断片の上を走らせる。
+    const segs = clipToLoaded(r.f);
+    if (!segs.length) continue;
+    const pts = segs.reduce((a, b) => (polyLen(b) > polyLen(a) ? b : a));
     if (pts.length < 2) continue;
     const path = { pts: pts.map(([x, z]) => ({ x, z })), cum: [0], len: 0 };
     for (let k = 1; k < pts.length; k++) {
       path.len += Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]);
       path.cum.push(path.len);
     }
+    if (path.len < 60) continue;         // かすっただけの系統は走らせない
+    const i = n++;
 
-    // 経路上でバス停に近づく地点(そこで少し停まる)
+    // 経路上でバス停に近づく地点(そこで少し停まる)。
+    // バス停はタイルが持つので、建て終わった標識(busSigns)の位置で見る
     const stops = [];
     for (let d = 0; d < path.len; d += 5) {
       const q = pathAt(path, d);
-      for (const b of world.bus ?? []) {
-        if (Math.hypot(wx(b.x) - q.x, wz(b.z) - q.z) < 13) {
+      for (const b of busSigns) {
+        if (Math.hypot(b.position.x - q.x, b.position.z - q.z) < 13) {
           if (!stops.length || d - stops[stops.length - 1] > 45) stops.push(d);
           break;
         }
@@ -2414,7 +2527,7 @@ const buses = [];
         new THREE.MeshLambertMaterial({ color: 0x24282a }));
       t.rotation.z = Math.PI / 2; t.position.set(wx, 0.45, wz); g.add(t);
     }
-    const lab = makeLabel(`${r.ref}  ${r.name.split('(')[0].trim()}`, 7.6, 1.9);
+    const lab = makeLabel(`${r.ref}  ${routeName(r.name)}`, 7.6, 1.9);
     lab.position.y = 4.4;
     g.add(lab);
     scene.add(g);
@@ -2436,12 +2549,12 @@ const buses = [];
 
     buses.push({
       g, path, stops, sigs, label: lab,
-      ref: r.ref, name: r.name.split('(')[0].split('（')[0].trim(),
-      d: path.len * (0.13 + 0.21 * i), dir: 1, wait: 0,
+      ref: r.ref, name: routeName(r.name),
+      // 初期位置をばらす。系統が増えても経路の外へ出ないよう 1 で折り返す
+      d: path.len * ((0.13 + 0.21 * i) % 1), dir: 1, wait: 0,
     });
   }
-  console.log(`バス ${buses.length}台 / 経路 ` +
-    (world.busRoutes ?? []).map((r) => r.ref).join('、'));
+  console.log(`バス ${buses.length}台 / 経路 ` + buses.map((b) => b.ref).join('、'));
 }
 
 /** 折れ線の距離 d の地点と方位(バス用。高さは地形から取る)。 */
@@ -2460,11 +2573,14 @@ function pathAt(path, d) {
 
 // 走る車両(2両)。線形を往復するので端で消えたり湧いたりしない
 let train = null, trainPath = null, trainD = 0, trainDir = 1;
-let trainStopD = null, trainWait = 0;
+let trainStopDs = [], trainWait = 0;
 if (railPaths.length) {
-  // 駅のある線形を走らせる(無ければいちばん長い線形)。
-  // 長さで選ぶと駅が別の線形に乗っていて永久に停まらないことがある。
-  trainPath = stationStop?.p ?? railPaths.reduce((a, b) => (b.len > a.len ? b : a));
+  // 駅がいちばん多く乗っている線形を走らせる(同数なら長いほう)。
+  // 長さだけで選ぶと、駅が別の線形に乗っていて永久に停まらないことがある。
+  const nSt = new Map();
+  for (const s of stationStops) nSt.set(s.p, (nSt.get(s.p) ?? 0) + 1);
+  trainPath = railPaths.reduce((a, b) =>
+    ((nSt.get(b) ?? 0) - (nSt.get(a) ?? 0) || b.len - a.len) > 0 ? b : a);
   train = new THREE.Group();
   for (const cz of [-7.2, 7.2]) {
     const car = new THREE.Group();
@@ -2487,10 +2603,42 @@ if (railPaths.length) {
   scene.add(train);
   trainD = trainPath.len * 0.25;
 
-  // 駅での停車位置(線形上の距離)
-  if (stationStop && stationStop.p === trainPath) trainStopD = stationStop.d;
+  // 駅での停車位置(線形上の距離)。この線形に乗った駅ぜんぶに停まる
+  trainStopDs = stationStops.filter((s) => s.p === trainPath)
+    .map((s) => s.d).sort((a, b) => a - b);
   console.log(`列車の線形 ${Math.round(trainPath.len)}m / 停車位置 ` +
-    (trainStopD === null ? 'なし' : `${Math.round(trainStopD)}m`));
+    (trainStopDs.length
+      ? trainStopDs.map((d) => `${Math.round(d)}m`).join('、') : 'なし'));
+}
+
+/** モノレールの車両を進める(駅ぜんぶで停車し、端に着いたら折り返す)。 */
+function stepTrain(dt) {
+  if (!train || !trainPath) return;
+  if (trainWait > 0) {
+    trainWait -= dt;
+  } else {
+    const prev = trainD;
+    trainD += trainDir * 11 * dt;               // 約40km/h
+    if (trainD > trainPath.len) { trainD = trainPath.len; trainDir = -1; trainWait = 3; }
+    if (trainD < 0) { trainD = 0; trainDir = 1; trainWait = 3; }
+    // 通り過ぎた駅があれば、そこへ戻して停める。
+    // 1フレームで進むのは約0.2mなので普通は1駅ぶんだが、
+    // タブが止まって dt が伸びたときのために手前の駅を選ぶ
+    let stopAt = null;
+    for (const sd of trainStopDs) {
+      if ((prev < sd && trainD >= sd) || (prev > sd && trainD <= sd)) {
+        if (stopAt === null || Math.abs(sd - prev) < Math.abs(stopAt - prev)) stopAt = sd;
+      }
+    }
+    if (stopAt !== null) {
+      trainD = stopAt;
+      trainWait = 9;                            // 乗り降りできる長さ
+    }
+  }
+  const q = railAt(trainPath, trainD);
+  train.position.set(q.x, q.y + 0.9, q.z);      // 桁をまたぐので少し上に乗せる
+  train.rotation.y = q.yaw + (trainDir < 0 ? Math.PI : 0);
+  if (trainRide) trainRide.wait = trainWait;
 }
 
 // 乗り物としてのモノレール(バスと同じ扱いにして乗降処理を共通化する)
@@ -3207,27 +3355,7 @@ function tick() {
   sun.position.set(player.x + 150, groundAt(player.x, player.z) + 260, player.z + 110);
   sun.target.updateMatrixWorld();
 
-  // モノレールの車両(駅で停車し、端に着いたら折り返す)
-  if (train && trainPath) {
-    if (trainWait > 0) {
-      trainWait -= dt;
-    } else {
-      const prev = trainD;
-      trainD += trainDir * 11 * dt;             // 約40km/h
-      if (trainD > trainPath.len) { trainD = trainPath.len; trainDir = -1; trainWait = 3; }
-      if (trainD < 0) { trainD = 0; trainDir = 1; trainWait = 3; }
-      if (trainStopD !== null &&
-          ((prev < trainStopD && trainD >= trainStopD) ||
-           (prev > trainStopD && trainD <= trainStopD))) {
-        trainD = trainStopD;
-        trainWait = 9;                          // 乗り降りできる長さ
-      }
-    }
-    const q = railAt(trainPath, trainD);
-    train.position.set(q.x, q.y + 0.9, q.z);  // 桁をまたぐので少し上に乗せる
-    train.rotation.y = q.yaw + (trainDir < 0 ? Math.PI : 0);
-    if (trainRide) trainRide.wait = trainWait;
-  }
+  stepTrain(dt);
 
   // 市議会の言及。近づいた地点のパネルを出す
   {
@@ -3374,6 +3502,11 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   rmap, bmap, hashInsert, hashRemove, distToBuilding,
   // タイル関係(検証用)
   tiles, tileOf, worldBounds, fetchTile, buildTileCore, buildTileProps, TILE, HALF,
+  // 全線データ(検証用)。切り出しの効きを直接見られる
+  corridor, clipToLoaded, nearLoaded, polyLen, CORRIDOR_PAD,
+  stationStops, trainStopDs: () => trainStopDs, trainPath: () => trainPath,
+  // 列車(検証用)。tick を待たずに走らせられる
+  stepTrain, trainState: () => ({ d: +trainD.toFixed(1), dir: trainDir, wait: +trainWait.toFixed(1) }),
   // シーサー(検証用)。tick を待たずに歩きだけ回せる
   stepSeesaa, seatSeesaa, walkLines, walkAt,
   // 完成アニメーション(検証用)。10体集めずに再生できる
@@ -3398,10 +3531,11 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   // tick を待たずに出入りする(ペインが隠れていると rAF が止まって検証できないため)
   visitShop: (i) => { enterable = shopSigns[i] ?? null; enterShop(); },
   leaveShop: () => exitShop(),
-  // 検証用: 列車を駅に着けて長く停める
-  trainToStation: (sec = 60) => {
-    if (trainStopD === null) return false;
-    trainD = trainStopD; trainWait = sec;
+  // 検証用: 列車を駅に着けて長く停める(k 番目の停車位置)
+  trainToStation: (sec = 60, k = 0) => {
+    if (!trainStopDs.length) return false;
+    trainD = trainStopDs[Math.min(k, trainStopDs.length - 1)];
+    trainWait = sec;
     return true;
   },
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
