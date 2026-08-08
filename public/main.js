@@ -134,19 +134,24 @@ const SKY_TOP = new THREE.Color(0x2f7fc4);
 const SKY_BOT = new THREE.Color(0xcfe4ec);
 scene.fog = new THREE.Fog(SKY_BOT.getHex(), 260, 1250);
 
-// 空(内側から見るドーム)
-scene.add(new THREE.Mesh(
+// 空(内側から見るドーム)。
+// ドームは毎フレームプレイヤーの真上へ動かす(tick)。原点に固定すると、
+// 離れたぶん反対側が遠のいてカメラの far(2600m)で切れ、空に黒い穴が開く。
+// タイルを増やすと必ず出る(2タイルで x=-1500 に立つと反対側は 3500m)。
+// そのため階調はワールド座標ではなく **ドーム内のローカル座標** から取る。
+const sky = new THREE.Mesh(
   new THREE.SphereGeometry(2000, 24, 16),
   new THREE.ShaderMaterial({
     side: THREE.BackSide, depthWrite: false,
     uniforms: { top: { value: SKY_TOP }, bot: { value: SKY_BOT } },
     vertexShader: `varying float h;
-      void main(){ vec4 w = modelMatrix*vec4(position,1.0); h = normalize(w.xyz).y;
+      void main(){ h = normalize(position).y;
         gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
     fragmentShader: `uniform vec3 top; uniform vec3 bot; varying float h;
       void main(){ gl_FragColor = vec4(mix(bot, top, clamp(h*1.5+0.08,0.0,1.0)), 1.0); }`,
   })
-));
+);
+scene.add(sky);
 
 scene.add(new THREE.HemisphereLight(0xbcd9ea, 0x6f6a55, 1.5));
 const sun = new THREE.DirectionalLight(0xfff2dc, 2.3);
@@ -771,15 +776,57 @@ function addTerrain(t) {
   console.log(`[${t.key}] 地形 ${n}×${n} (${cell}m格子)`);
 }
 
-// タイルの外側。端が崖に見えないよう、平均標高の広い受け皿を敷く(世界に1枚)
+// タイルの外側。端が崖に見えないよう、外周の標高をそのまま外へ引き伸ばす(世界に1枚)。
+//
+// 以前は「平均標高の水平な円盤」を敷いていたが、標高 82.7〜154.0m の街に対して
+// 円盤は 112.3m にあり、それより低い所に立つと円盤の裏側が空を覆っていた。
+// 歩道網の 41% がその高さより下で、シーサー 10 体中 4 体がその中を歩いていたので、
+// 「全部保護する」遊びそのものが壊れていた。
+// 外周に沿って高さを拾えば、どこに立っても頭上に板が来ない。
 {
-  const skirt = new THREE.Mesh(
-    new THREE.CircleGeometry(4000, 48),
-    new THREE.MeshLambertMaterial({ color: 0x7d9159 })
-  );
-  skirt.rotation.x = -Math.PI / 2;
-  skirt.position.y = (tile0.data.meta.minZ + tile0.data.meta.maxZ) / 2 - 6;
+  const B = worldBounds();
+  const OUT = 1500;            // 霧が 1250m で閉じるのでこれで足りる
+  const STEP = 20;             // 外周を刻む間隔(m)
+  const IN = 0.5;              // 端ちょうどはタイルの引き当てが不安定なので少し内側
+
+  // 外周を反時計回りに一周する閉じた折れ線(角は1回だけ入れる)
+  const ring = [];
+  const x0 = B.minx + IN, x1 = B.maxx - IN, z0 = B.minz + IN, z1 = B.maxz - IN;
+  for (let x = x0; x < x1; x += STEP) ring.push([x, z0]);
+  for (let z = z0; z < z1; z += STEP) ring.push([x1, z]);
+  for (let x = x1; x > x0; x -= STEP) ring.push([x, z1]);
+  for (let z = z1; z > z0; z -= STEP) ring.push([x0, z]);
+
+  // 各頂点の外向きは、隣り合う辺の法線の平均。角も隙間なく広がる(マイター)
+  const V = [];
+  const n = ring.length;
+  const quad = (a, b, c, d) => V.push(...a, ...b, ...c, ...a, ...c, ...d);
+  const outAt = (i) => {
+    const p = ring[i], q = ring[(i + 1) % n], r = ring[(i - 1 + n) % n];
+    const e1 = [p[0] - r[0], p[1] - r[1]], e2 = [q[0] - p[0], q[1] - p[1]];
+    const nl = (e) => { const L = Math.hypot(e[0], e[1]) || 1; return [e[1] / L, -e[0] / L]; };
+    const a = nl(e1), b = nl(e2);
+    const m = [a[0] + b[0], a[1] + b[1]];
+    const L = Math.hypot(m[0], m[1]) || 1;
+    return [m[0] / L, m[1] / L];
+  };
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    const pi = ring[i], pj = ring[j];
+    const yi = groundAt(pi[0], pi[1]), yj = groundAt(pj[0], pj[1]);
+    const oi = outAt(i), oj = outAt(j);
+    // 外側はゆるく下げる。真っ平らだと地形との継ぎ目が板に見える
+    quad([pi[0], yi, pi[1]], [pj[0], yj, pj[1]],
+         [pj[0] + oj[0] * OUT, yj - 12, pj[1] + oj[1] * OUT],
+         [pi[0] + oi[0] * OUT, yi - 12, pi[1] + oi[1] * OUT]);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+  geo.computeVertexNormals();
+  const skirt = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: 0x7d9159 }));
+  // 影は受けない。影カメラは ±105m しかないので、その外側が真っ黒に落ちる
   scene.add(skirt);
+  console.log(`受け皿 外周${n}点 / 外へ${OUT}m`);
 }
 
 // ---------------------------------------------------------------- 電柱
@@ -3032,6 +3079,10 @@ function tick() {
 
   camera.position.set(player.x, player.y, player.z);
   camera.rotation.set(player.pitch, player.yaw, 0, 'YXZ');
+
+  // 空ドームをプレイヤーの真上へ運ぶ(far で切れて黒い穴が開くのを防ぐ)。
+  // 高さは 0 のまま。上げるとドームの底が地面の下から出てこなくなる
+  sky.position.set(player.x, 0, player.z);
 
   // 太陽(影のカメラ)をプレイヤーに追従させる
   sun.target.position.set(player.x, groundAt(player.x, player.z), player.z);
