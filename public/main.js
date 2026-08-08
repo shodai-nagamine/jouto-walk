@@ -3920,6 +3920,43 @@ if (TOUCH) {
   $('pause')?.addEventListener('click', () => { if (started) pause(); });
 }
 
+// ---------------------------------------------------------------- 人口メッシュ
+// 令和2年国勢調査の地域メッシュ統計(e-Stat 統計GIS T001102、250m メッシュ)。
+// **小地域(町丁字)ではなくメッシュを選んだ**。この world は 3 次メッシュ由来の
+// 1km タイルでできているので、メッシュはコードから緯度経度が出せてそのまま
+// 座標に乗る。町丁字だと境界ポリゴンを別に落として名前で突き合わせる工程が要る。
+//
+// 那覇の緯度では 1 セルは約 232m × 312m(3 次メッシュが 30秒×45秒で正方形でない)。
+const meshCells = [];
+const meshMap = new Map();                 // 空間ハッシュ。升目 500m
+const MESH_HASH = 500;
+fetch('./data/mesh_pop.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .then((d) => {
+    for (const c of d?.cells ?? []) {
+      meshCells.push(c);
+      const gx = Math.floor(c.x / MESH_HASH), gz = Math.floor(c.z / MESH_HASH);
+      for (let i = -1; i <= 1; i++) {
+        for (let j = -1; j <= 1; j++) {
+          const k = `${gx + i},${gz + j}`;
+          (meshMap.get(k) ?? meshMap.set(k, []).get(k)).push(c);
+        }
+      }
+    }
+    if (meshCells.length) console.log(`人口メッシュ ${meshCells.length}セル`);
+  })
+  .catch(() => {});
+
+/** (x,z) を含むメッシュのセル。無ければ null。 */
+function meshAt(x, z) {
+  const hits = meshMap.get(`${Math.floor(x / MESH_HASH)},${Math.floor(z / MESH_HASH)}`);
+  if (!hits) return null;
+  for (const c of hits) {
+    if (Math.abs(x - c.x) <= c.w / 2 && Math.abs(z - c.z) <= c.d / 2) return c;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- ミニマップ
 // 世界が 10km × 7km まで広がるので、全体を1枚に収めると 53m/px になって
 // 街が潰れる(建物1棟が 0.28px)。**プレイヤーの周りだけを一定の縮尺で見せる**。
@@ -4740,6 +4777,13 @@ function tick() {
     (nearest === Infinity ? '—' : `${nearest.toFixed(0)} m`);
   // 店内の舞台は街の外にあるので、標高は入る前の値のまま見せる
   $('alt').textContent = `${((inShop ? shopReturn.y : player.y) - EYE).toFixed(1)} m`;
+  // いま立っている 250m メッシュの人口密度(令和2年国勢調査)
+  if ((frame & 15) === 0) {
+    const c = meshAt(hereX(), hereZ());
+    $('pop').textContent = c
+      ? `${Math.round(c.p / (c.w * c.d / 1e6) / 100) / 10}千人/km²`
+      : (meshCells.length ? '—' : '');
+  }
   const mm = (elapsed / 60) | 0, ss = (elapsed % 60) | 0;
   $('time').textContent = `${mm}:${String(ss).padStart(2, '0')}`;
   // コンパス: yaw=0 が北(-Z)。yaw増加=反時計回りなので方位は 360-yaw。
@@ -4770,6 +4814,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   setTileRange: (load, drop) => { TILE_LOAD = load; TILE_DROP = drop; },
   rebuildDerived, dropWalkLines, addWalkLines, bakeMap, buildApron, seesaaGroup,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
+  meshCells, meshAt,
   SEESAA_TOTAL, busSigns, shopSigns,
   stationStops, trainStopDs: () => trainStopDs, trainPath: () => trainPath,
   // 列車(検証用)。tick を待たずに走らせられる
