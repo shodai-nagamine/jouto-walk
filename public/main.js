@@ -1568,9 +1568,9 @@ function addShopSigns(t) {
     const sp = new THREE.Sprite(new THREE.SpriteMaterial({
       map: new THREE.CanvasTexture(cv), transparent: true, depthWrite: false,
     }));
-    sp.scale.set(5.2, 1.3, 1);
+    sp.scale.set(4.3, 1.08, 1);
     // 看板は入口の庇の上。地物の座標(建物の重心あたり)に出すと屋根に載る
-    sp.position.set(door.x, door.gy + 3.15 * door.scale, door.z);
+    sp.position.set(door.x, door.gy + 3.28 * door.scale, door.z);
     sp.visible = false;
     // 中に入れるようにするので、店の素性と入口を看板に持たせておく
     sp.userData = { name: l.name, mark, color, kind: s.val, oh: l.oh || '',
@@ -1682,6 +1682,11 @@ function buildRoom(sp) {
   g.add(fill);
 
   // ---- 分類ごとの什器 -------------------------------------------------
+  // 大きいものだけ固体にする。細い脚や椅子まで固くすると 8.4×6.4m の部屋で
+  // 引っかかって歩けなくなる(屋外の遊具を当たり判定に入れていないのと同じ理由)。
+  // 天端が STEP(0.55m)以内のもの(長椅子など)は、登録しても跨げるので入れない。
+  const solid = (w2, d2, ox, oz, topH) =>
+    addSolid(STAGE.x + ox, STAGE.z + oz, w2, d2, 0, STAGE.y + topH, SOLID_SHOP);
   // 商品棚。壁と同系色だと白く飛んで一枚の板に見えるので、本体は暗めにして
   // 段を切り、商品を段ごとに並べる(のっぺりした塊に見えないように)
   const shelf = (ox, oz, len) => {
@@ -1700,10 +1705,12 @@ function buildRoom(sp) {
             oy + 0.18, oz, c.getHex());
       }
     }
+    solid(len, dep, ox, oz, 1.45);
   };
   const counter = (ox, oz, len, dep = 0.7) => {
     box(len, 1.05, dep, ox, 0.52, oz, WOOD);
     box(len + 0.1, 0.06, dep + 0.1, ox, 1.08, oz, 0x6f5a41);
+    solid(len, dep, ox, oz, 1.08);
   };
   const chair = (ox, oz) => {
     box(0.42, 0.08, 0.42, ox, 0.45, oz, WOOD);
@@ -1728,22 +1735,27 @@ function buildRoom(sp) {
       box(0.1, 0.72, 0.1, tx, 0.36, tz, METAL);         // 脚
       box(0.55, 0.05, 0.55, tx, 0.03, tz, METAL);
       chair(tx, tz + 0.72); chair(tx, tz - 0.72);
+      solid(1.0, 0.9, tx, tz, 0.78);            // 椅子は跨げるので卓だけ
     }
     counter(3.0, -1.0, 3.4, 0.75);                      // 厨房カウンター
     box(0.9, 1.5, 0.55, 3.3, 0.75, -2.5, METAL);        // 冷蔵庫
+    solid(0.9, 0.55, 3.3, -2.5, 1.5);
     box(1.8, 0.44, 0.12, 1.6, 1.62, -2.98, accent);     // 品書き
   } else if (P.mark === '買') {
-    shelf(-0.5, -2.3, 5.6);                             // 陳列棚(奥から2列)
-    shelf(-0.5, -0.9, 5.6);
-    shelf(-3.4, 0.7, 1.4);                              // 左手前
-    counter(2.9, 0.5, 2.6);                             // レジ
-    box(0.42, 0.3, 0.34, 3.2, 1.25, 0.5, 0x2f3338);
+    // 全幅の棚を2列並べると、間も両端も半径 0.55m のプレイヤーが通れず、
+    // 手前半分しか歩けなくなる(実測で到達奥行き 2.7m。他の分類は 5.4m)。
+    // 奥は全幅1列にして、もう1列は左半分だけにし、右から奥へ回れるようにする
+    shelf(-0.5, -2.5, 5.6);                             // 奥の棚
+    shelf(-2.2, -0.9, 2.2);                             // 左の棚
+    counter(2.6, 0.9, 2.2);                             // レジ(右手前)
+    box(0.42, 0.3, 0.34, 2.9, 1.25, 0.9, 0x2f3338);     // レジ機
   } else if (P.mark === '医') {
     counter(0, -2.2, 4.4, 0.8);                         // 受付
     box(1.4, 0.5, 0.12, 0, 1.7, -2.98, accent);         // 受付表示
     bench(-2.6, 0.8, 2.8);
     bench(2.6, 0.8, 2.8);
     box(0.08, 1.7, 2.2, 2.7, 0.85, -0.9, 0xdfe7ea);     // 間仕切り
+    solid(0.2, 2.2, 2.7, -0.9, 1.7);
     box(0.5, 0.9, 0.4, -3.5, 0.45, -1.2, 0xd8d3c6);     // 観葉鉢
   } else if (P.mark === '金') {
     counter(0, -2.2, 5.2, 0.8);
@@ -1754,6 +1766,7 @@ function buildRoom(sp) {
       box(0.85, 1.9, 0.7, ox, 0.95, 0.6, 0xcdd3d6);
       box(0.5, 0.35, 0.06, ox, 1.45, 0.22, 0x22303a);
       box(0.6, 0.12, 0.06, ox, 1.02, 0.22, accent);
+      solid(0.85, 0.7, ox, 0.6, 1.9);
     }
     box(2.0, 0.45, 0.75, 2.6, 0.4, 0.4, 0x59636b);      // 長椅子
     box(2.0, 0.5, 0.12, 2.6, 0.85, 0.7, 0x59636b);
@@ -1763,12 +1776,14 @@ function buildRoom(sp) {
       box(1.15, 0.06, 0.55, tx, 0.72, tz, WOOD);
       for (const sx of [-0.5, 0.5]) box(0.06, 0.7, 0.06, tx + sx, 0.35, tz, METAL);
       chair(tx, tz + 0.6);
+      solid(1.15, 0.55, tx, tz, 0.75);
     }
     // 白板は店名の板(oy 2.42)に掛からない高さに収める
     box(4.6, 1.3, 0.08, 0, 1.32, -d / 2 + 0.2, 0xf6f5ef);
     box(4.6, 0.1, 0.16, 0, 0.64, -d / 2 + 0.26, WOOD);
     box(0.95, 0.06, 0.9, 3.3, 0.9, -2.2, WOOD);             // 教卓
     for (const sx of [-0.4, 0.4]) box(0.07, 0.87, 0.07, 3.3 + sx, 0.44, -2.2, METAL);
+    solid(0.95, 0.9, 3.3, -2.2, 0.93);
   } else if (P.mark === '公') {
     // 公園・運動施設は「管理棟」に見立てる(屋外そのものには入れない)
     counter(0, -2.2, 3.0, 0.75);
@@ -1776,7 +1791,10 @@ function buildRoom(sp) {
     bench(2.8, 0.4, 2.4);
     box(2.6, 1.5, 0.1, 0, 1.6, -d / 2 + 0.2, 0x3d4a3a);     // 掲示板
     box(2.3, 1.2, 0.03, 0, 1.6, -d / 2 + 0.27, 0xe8e4d6);
-    for (const ox of [3.3, 3.9]) box(0.5, 1.8, 0.5, ox, 0.9, -1.9, METAL);  // ロッカー
+    for (const ox of [3.3, 3.9]) {                          // ロッカー
+      box(0.5, 1.8, 0.5, ox, 0.9, -1.9, METAL);
+      solid(0.5, 0.5, ox, -1.9, 1.8);
+    }
   } else {
     counter(0, -2.2, 3.4);
     shelf(-2.9, 0.3, 2.2);
