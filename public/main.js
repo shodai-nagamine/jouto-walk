@@ -3920,6 +3920,46 @@ if (TOUCH) {
   $('pause')?.addEventListener('click', () => { if (started) pause(); });
 }
 
+// ---------------------------------------------------------------- 史跡の案内
+// 説明は **出典のあるものだけ**（OSM の碑文・現地案内板の写し／Wikipedia 日本語版の
+// 冒頭）。289 件ぜんぶに機械が解説を書くと、史実でないことを史実として載せる
+// ことになる。議事の要約を言い換えなかったのと同じ理由。
+// 出典が無い史跡は名前と種別だけ出す。それでよい。
+let siteNotes = {};
+fetch('./data/site_notes.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .then((d) => {
+    siteNotes = d ?? {};
+    const n = Object.keys(siteNotes).length;
+    if (n) console.log(`史跡の説明 ${n}件（出典つき）`);
+  })
+  .catch(() => {});
+
+const SITE_R = 22;                 // この距離まで近づくと案内が出る(m)
+let siteNear = null, siteClosed = false;
+const svEl = $('site');
+
+function showSite(g) {
+  if (!g || siteClosed) { svEl.classList.remove('on'); return; }
+  const h = g.userData.site;
+  const note = siteNotes[h.name];
+  $('sv-kind').textContent = h.k;
+  $('sv-name').textContent = h.name;
+  $('sv-text').textContent = note?.text
+    ?? (h.text ?? 'この場所の説明はまだ集まっていません。');
+  const a = $('sv-link');
+  const url = note?.url ?? '';
+  a.href = url || '#';
+  a.style.visibility = url ? 'visible' : 'hidden';
+  $('sv-src').textContent = note?.src ?? (h.text ? 'OpenStreetMap' : '');
+  svEl.classList.add('on');
+}
+
+$('sv-close').addEventListener('click', (e) => {
+  e.preventDefault(); e.stopPropagation();
+  siteClosed = true; svEl.classList.remove('on');
+});
+
 // ---------------------------------------------------------------- 人口メッシュ
 // 令和2年国勢調査の地域メッシュ統計(e-Stat 統計GIS T001102、250m メッシュ)。
 // **小地域(町丁字)ではなくメッシュを選んだ**。この world は 3 次メッシュ由来の
@@ -4643,6 +4683,17 @@ function tick() {
   if ((frame & 31) === 0) syncTiles();
   if (bakes.length) stepBakes();      // 地面テクスチャを少しずつ焼く
 
+  // 史跡の案内。近づいた1件を出す(議会より近い距離で、こちらは名前だけでも出す)
+  {
+    let near = null, nd = Infinity;
+    for (const g of historicPosts) {
+      const dd = Math.hypot(g.position.x - hereX(), g.position.z - hereZ());
+      if (dd < nd) { nd = dd; near = g; }
+    }
+    const hit = nd < SITE_R ? near : null;
+    if (hit !== siteNear) { siteNear = hit; siteClosed = false; showSite(hit); }
+  }
+
   // 市議会の言及。近づいた地点のパネルを出す
   {
     let near = null, nd = Infinity;
@@ -4814,7 +4865,9 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   setTileRange: (load, drop) => { TILE_LOAD = load; TILE_DROP = drop; },
   rebuildDerived, dropWalkLines, addWalkLines, bakeMap, buildApron, seesaaGroup,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
-  meshCells, meshAt,
+  meshCells, meshAt, siteNotes: () => siteNotes,
+  visitSite: (i = 0) => { const g = historicPosts[i]; if (!g) return null;
+    siteNear = g; siteClosed = false; showSite(g); return g.userData.site.name; },
   SEESAA_TOTAL, busSigns, shopSigns,
   stationStops, trainStopDs: () => trainStopDs, trainPath: () => trainPath,
   // 列車(検証用)。tick を待たずに走らせられる
