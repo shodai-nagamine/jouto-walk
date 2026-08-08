@@ -968,6 +968,7 @@ function addAura(g) {
   );
   beam.position.y = 45;
   g.add(beam);
+  g.userData.beam = beam;      // 探すための目印。見つけ終わったら消す
   const ring = new THREE.Mesh(
     new THREE.TorusGeometry(1.5, 0.07, 8, 30),
     new THREE.MeshBasicMaterial({ color: 0xffc27a, transparent: true, opacity: 0.85 })
@@ -2072,6 +2073,123 @@ function seatSeesaa() {
 }
 
 seatSeesaa();
+
+// ---------------------------------------------------------------- ぜんぶ保護できた
+// 保護したシーサーは消えているだけなので、最後に呼び戻して主役にする。
+// 沖縄のシーサーは屋根や門の上から街を見張る守り神なので、
+// 「集まる → 空へ昇って持ち場に就く」という筋にした。
+const FIN = { GATHER: 1.6, RISE: 3.6, HOLD: 6.4 };   // 各段の終わり(秒)
+let finale = null;
+
+/** 全部保護したときに1回だけ呼ぶ。 */
+function startFinale() {
+  if (finale) return;
+  const cx = hereX(), cz = hereZ(), gy = groundAt(cx, cz);
+  finale = { t: 0, cx, cz, gy, motes: null, said: false };
+  seesaa.forEach((s, i) => {
+    // プレイヤーを囲む輪に、少し外側から歩み寄る形で並べる
+    const a = (i / seesaa.length) * Math.PI * 2;
+    s.userData.fin = { a, r0: 11 + (i % 3) * 1.4, r1: 5.4, spin: (i % 2 ? 1 : -1) };
+    s.visible = true;
+    s.userData.ring.visible = true;
+    // 光の柱は「遠くから見つける」ための目印。10本が輪になると視界を塞ぐだけなので消す
+    s.userData.beam.visible = false;
+  });
+  // 舞い上がるときの光の粒。1つの InstancedMesh に畳む
+  const N = 170;
+  const im = new THREE.InstancedMesh(
+    new THREE.IcosahedronGeometry(0.10, 0),
+    new THREE.MeshBasicMaterial({ toneMapped: false, transparent: true, opacity: 0.9 }),
+    N
+  );
+  im.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(N * 3), 3);
+  im.frustumCulled = false;            // 毎フレーム行列を書き換えるので境界球が当てにならない
+  const col = new THREE.Color();
+  finale.motes = { im, seed: [] };
+  for (let i = 0; i < N; i++) {
+    finale.motes.seed.push({
+      a: rnd() * Math.PI * 2, r: 2.5 + rnd() * 7, up: 3 + rnd() * 12,
+      w: 0.6 + rnd() * 2.2, ph: rnd() * Math.PI * 2, d: 0.3 + rnd() * 0.7,
+    });
+    col.setHSL(0.06 + rnd() * 0.10, 0.75, 0.55 + rnd() * 0.2);  // 提灯のような橙〜黄
+    im.setColorAt(i, col);
+  }
+  im.instanceColor.needsUpdate = true;
+  scene.add(im);
+  say('🎉 ぜんぶ保護できた！');
+}
+
+/** 完成アニメーションを1フレーム進める。 */
+function stepFinale(dt, now) {
+  const f = finale;
+  f.t += dt;
+  const ease = (x) => x * x * (3 - 2 * x);            // なめらかな出入り
+  const p1 = Math.min(1, f.t / FIN.GATHER);                       // 集まる
+  const p2 = Math.min(1, Math.max(0, (f.t - FIN.GATHER) / (FIN.RISE - FIN.GATHER)));  // 昇る
+  const p3 = Math.min(1, Math.max(0, (f.t - FIN.RISE) / (FIN.HOLD - FIN.RISE)));      // 見送る
+
+  seesaa.forEach((s, i) => {
+    const u = s.userData, F = u.fin;
+    if (!F) return;
+    // 1段目: 輪の外から歩み寄る。2段目: 渦を巻きながら頭上へ寄り集まる。
+    // 3段目: 街へ散っていく。半径 5.4m の輪のまま昇らせると視野に2体しか
+    // 入らないので、いったん真上へ集めて「10体そろった」画をつくる
+    const r = p3 > 0
+      ? 1.8 + ease(p3) * 34
+      : (F.r0 + (F.r1 - F.r0) * ease(p1)) + (1.8 - F.r1) * ease(p2);
+    const a = F.a + (ease(p2) * 1.9 + ease(p3) * 1.2) * F.spin;
+    const x = f.cx + Math.cos(a) * r, z = f.cz + Math.sin(a) * r;
+    const lift = ease(p2) * (9 + (i % 4) * 0.8) + ease(p3) * 30;
+    s.position.set(x, f.gy + lift + Math.sin(now * 0.004 + i) * 0.12, z);
+    // 内側(プレイヤー)を向く。造形の前方は -Z なので π 足す
+    s.rotation.y = Math.atan2(f.cx - x, f.cz - z) + Math.PI;
+    s.rotation.z = ease(p2) * 0.12 * F.spin;         // 昇るときに少し傾ぐ
+    const P = u.parts;
+    if (P) {
+      // 歩いて来る間は脚を振り、浮いたら前足を揃えて胸を張る
+      const sw = p1 < 1 ? Math.sin(f.t * 7 + i) * 0.3 : -0.25 * ease(p2);
+      P.legFL.rotation.x = sw;  P.legBR.rotation.x = sw;
+      P.legFR.rotation.x = p1 < 1 ? -sw : sw;
+      P.legBL.rotation.x = p1 < 1 ? -sw : sw;
+      P.tail.rotation.x = Math.sin(f.t * 5 + i) * 0.4 - 0.1;
+      P.head.rotation.y = Math.sin(f.t * 1.4 + i) * 0.3 * (1 - p2);
+    }
+    u.ring.rotation.z += dt * (1.1 + p2 * 6);        // 昇るほど速く回る
+    u.ring.position.y = 0.1;
+    u.ring.material.opacity = 0.85 * (1 - p3);
+    s.visible = p3 < 1;
+  });
+
+  // 光の粒。集まり終わってから湧き、上へ流れて消える
+  const M = f.motes, m4 = new THREE.Matrix4();
+  const pv = new THREE.Vector3(), qt = new THREE.Quaternion(), sv = new THREE.Vector3();
+  const rise = Math.max(0, f.t - FIN.GATHER * 0.6);
+  M.seed.forEach((g, i) => {
+    const t = rise * g.d;
+    const a = g.a + t * g.w * 0.5;
+    const y = f.gy + t * g.up * 0.9;
+    const fade = Math.max(0, 1 - t / 3.2);
+    qt.setFromAxisAngle(new THREE.Vector3(0, 1, 0), t * g.w);
+    pv.set(f.cx + Math.cos(a) * g.r, y + Math.sin(t * 3 + g.ph) * 0.3,
+           f.cz + Math.sin(a) * g.r);
+    sv.setScalar(fade * (0.6 + Math.sin(t * 6 + g.ph) * 0.25));
+    m4.compose(pv, qt, sv);
+    M.im.setMatrixAt(i, m4);
+  });
+  M.im.instanceMatrix.needsUpdate = true;
+  M.im.material.opacity = 0.9 * Math.max(0, 1 - Math.max(0, f.t - FIN.RISE) / 2.4);
+
+  if (!f.said && f.t > FIN.RISE) {
+    f.said = true;
+    say('10体そろって、街の見張りに戻っていった');
+  }
+  if (f.t > FIN.HOLD + 1.2) {                        // 片付けて通常へ戻す
+    scene.remove(M.im);
+    M.im.geometry.dispose(); M.im.material.dispose();
+    for (const s of seesaa) s.visible = false;
+    finale = null;
+  }
+}
 
 /** 1体ぶんの歩きと脚の振り。dist はプレイヤーとの距離。 */
 function stepSeesaa(g, dist, dt, now) {
@@ -3214,13 +3332,18 @@ function tick() {
     stepSeesaa(s, d, dt, now);                    // 歩く・脚を振る・近いと早足
     s.userData.ring.rotation.z += dt * 1.1;
     s.userData.ring.position.y = 0.1 + Math.sin(now * 0.003 + s.position.x) * 0.25;
-    if (d < PICKUP && active) {
+    // 店内に居る間は回収しない。距離は入る前の位置で測っているので、
+    // 店の中に居るあいだにシーサーが表を通ると、見えない所で最後の1体が
+    // 埋まってフィナーレが誰にも見られずに終わってしまう
+    if (d < PICKUP && active && !inShop) {
       s.userData.taken = true;
       s.visible = false;
       taken++;
-      say(taken >= seesaa.length ? '🎉 ぜんぶ保護できた！' : `シーサーを保護した（${taken}/${seesaa.length}）`);
+      if (taken >= seesaa.length) startFinale();
+      else say(`シーサーを保護した（${taken}/${seesaa.length}）`);
     }
   }
+  if (finale) stepFinale(dt, now);
 
   // HUD
   elapsed = running ? (now - t0) / 1000 : elapsed;
@@ -3253,6 +3376,10 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   tiles, tileOf, worldBounds, fetchTile, buildTileCore, buildTileProps, TILE, HALF,
   // シーサー(検証用)。tick を待たずに歩きだけ回せる
   stepSeesaa, seatSeesaa, walkLines, walkAt,
+  // 完成アニメーション(検証用)。10体集めずに再生できる
+  startFinale, stepFinale, finaleState: () => finale && {
+    t: +finale.t.toFixed(2), 粒: finale.motes.im.count,
+    見えている体数: seesaa.filter((s) => s.visible).length },
   // 店の中(検証用)。看板の前まで歩かずに寄れる
   shopSigns, shopState: () => ({ inShop: inShop?.userData ?? null,
     enterable: enterable?.userData ?? null, solids: bstore.filter((r) => r.tile === 'shop').length }),
