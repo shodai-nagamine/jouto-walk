@@ -811,34 +811,107 @@ function addPoles(t) {
 }
 
 // ---------------------------------------------------------------- シーサー
+// シーサーの造形は Antigravity(agy)に契約を渡して書かせたものを検分して取り込んだ。
+// 契約: 原点=足の裏 / 前方=-Z / 体高1.0〜1.2m / 基本ジオメトリのみ /
+//       マテリアル使い回し / メッシュ30個以内 / userData.parts に可動部を出す。
+// 光の柱と足元のリングは歩くと邪魔になる位置が変わるので、呼び出し側で足す。
 function makeSeesaa() {
   const g = new THREE.Group();
-  const stone = new THREE.MeshLambertMaterial({ color: 0xd9c9a8 });
-  const dark = new THREE.MeshLambertMaterial({ color: 0xa08a63 });
-  const add = (geo, mat, x, y, z, sx = 1, sy = 1, sz = 1) => {
-    const m = new THREE.Mesh(geo, mat);
-    m.position.set(x, y, z); m.scale.set(sx, sy, sz);
-    m.castShadow = true; g.add(m); return m;
-  };
-  add(new THREE.BoxGeometry(1.1, 0.5, 1.1), dark, 0, 0.25, 0);            // 台座
-  add(new THREE.SphereGeometry(0.42, 12, 10), stone, 0, 0.86, 0, 1, 1.05, 1.35); // 胴
-  add(new THREE.SphereGeometry(0.33, 12, 10), stone, 0, 1.42, 0.16);      // 頭
-  add(new THREE.ConeGeometry(0.13, 0.26, 6), stone, -0.19, 1.68, 0.1);    // 耳
-  add(new THREE.ConeGeometry(0.13, 0.26, 6), stone, 0.19, 1.68, 0.1);
-  add(new THREE.SphereGeometry(0.09, 8, 6), dark, -0.13, 1.44, 0.44);     // 目
-  add(new THREE.SphereGeometry(0.09, 8, 6), dark, 0.13, 1.44, 0.44);
-  add(new THREE.ConeGeometry(0.11, 0.6, 6), stone, 0, 1.15, -0.42).rotation.x = 0.9; // 尾
-  for (const s of [-1, 1]) {                                              // 前足
-    add(new THREE.CylinderGeometry(0.11, 0.13, 0.5, 6), stone, s * 0.24, 0.72, 0.38);
-  }
-  add(new THREE.SphereGeometry(0.17, 10, 8), stone, 0, 1.30, 0.36, 1, 0.75, 1);  // 鼻づら
-  for (let i = 0; i < 9; i++) {                                           // たてがみ
-    const a = (i / 8 - 0.5) * 2.2;
-    add(new THREE.SphereGeometry(0.095, 7, 6), dark,
-        Math.sin(a) * 0.33, 1.40 + Math.cos(a) * 0.29, -0.13);
-  }
 
-  // 遠くからでも見つけられる光の柱
+  // 素焼き・赤瓦のシーサーらしい配色とドローコール削減のためのマテリアル定義
+  const matBody = new THREE.MeshLambertMaterial({ color: 0xd45b38 });
+  const matMane = new THREE.MeshLambertMaterial({ color: 0x5c2612 });
+  const matWhite = new THREE.MeshLambertMaterial({ color: 0xfff9e6 });
+  const matDark = new THREE.MeshLambertMaterial({ color: 0x1a110e });
+
+  const add = (geo, mat, parent, x, y, z, rx = 0, ry = 0, rz = 0, sx = 1, sy = 1, sz = 1) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    if (rx || ry || rz) m.rotation.set(rx, ry, rz);
+    if (sx !== 1 || sy !== 1 || sz !== 1) m.scale.set(sx, sy, sz);
+    m.castShadow = true;
+    parent.add(m);
+    return m;
+  };
+
+  // 1. 胴体
+  add(new THREE.CapsuleGeometry(0.2, 0.32, 8, 12), matBody, g, 0, 0.52, 0, Math.PI / 2, 0, 0);
+  add(new THREE.SphereGeometry(0.24, 10, 8), matMane, g, 0, 0.54, -0.18, 0, 0, 0, 1, 1.1, 1);
+
+  // 2. 脚（付け根を原点にして歩行回転を容易にする）
+  const makeLeg = (x, z, isFront) => {
+    const leg = new THREE.Group();
+    leg.position.set(x, 0.52, z);
+    g.add(leg);
+    add(new THREE.CylinderGeometry(0.07, 0.05, 0.32, 8), matBody, leg, 0, -0.16, 0);
+    add(new THREE.BoxGeometry(0.12, 0.2, 0.16), matBody, leg, 0, -0.42, isFront ? -0.02 : 0.02);
+    return leg;
+  };
+  const legFL = makeLeg(-0.24, -0.22, true);
+  const legFR = makeLeg(0.24, -0.22, true);
+  const legBL = makeLeg(-0.24, 0.22, false);
+  const legBR = makeLeg(0.24, 0.22, false);
+
+  // 3. 頭部（首付け根を原点にし、左右の見回しに対応）
+  const head = new THREE.Group();
+  head.position.set(0, 0.62, -0.28);
+  g.add(head);
+
+  // 頭部ベース
+  add(new THREE.SphereGeometry(0.19, 12, 10), matBody, head, 0, 0.18, -0.05);
+
+  // 大きく開けた口（上顎・下顎・口内の暗がり）
+  add(new THREE.BoxGeometry(0.2, 0.08, 0.18), matBody, head, 0, 0.15, -0.19);
+  add(new THREE.BoxGeometry(0.18, 0.06, 0.18), matBody, head, 0, 0.01, -0.19);
+  add(new THREE.BoxGeometry(0.16, 0.08, 0.12), matDark, head, 0, 0.08, -0.17);
+
+  // 上下の牙（暗がりを背景にして遠くからでも視認可能に）
+  add(new THREE.ConeGeometry(0.02, 0.06, 6), matWhite, head, -0.05, 0.1, -0.23, Math.PI, 0, 0);
+  add(new THREE.ConeGeometry(0.02, 0.06, 6), matWhite, head, 0.05, 0.1, -0.23, Math.PI, 0, 0);
+  add(new THREE.ConeGeometry(0.02, 0.06, 6), matWhite, head, -0.04, 0.05, -0.23, 0, 0, 0);
+  add(new THREE.ConeGeometry(0.02, 0.06, 6), matWhite, head, 0.04, 0.05, -0.23, 0, 0, 0);
+
+  // 獅子鼻
+  add(new THREE.SphereGeometry(0.055, 8, 8), matMane, head, 0, 0.19, -0.26);
+
+  // 正面寄りの愛嬌のある目（白目・黒目）
+  add(new THREE.SphereGeometry(0.045, 8, 8), matWhite, head, -0.075, 0.23, -0.19);
+  add(new THREE.SphereGeometry(0.045, 8, 8), matWhite, head, 0.075, 0.23, -0.19);
+  add(new THREE.SphereGeometry(0.028, 8, 8), matDark, head, -0.075, 0.235, -0.22);
+  add(new THREE.SphereGeometry(0.028, 8, 8), matDark, head, 0.075, 0.235, -0.22);
+
+  // 眉毛パーツ（顔の立体感・表情強化）
+  add(new THREE.SphereGeometry(0.045, 8, 6), matMane, head, -0.08, 0.28, -0.17);
+  add(new THREE.SphereGeometry(0.045, 8, 6), matMane, head, 0.08, 0.28, -0.17);
+
+  // 耳
+  add(new THREE.ConeGeometry(0.055, 0.15, 6), matMane, head, -0.16, 0.31, -0.06, -0.1, 0, 0.4);
+  add(new THREE.ConeGeometry(0.055, 0.15, 6), matMane, head, 0.16, 0.31, -0.06, -0.1, 0, -0.4);
+
+  // たてがみ（顔の正面を空け、外周のシルエットとして配置）
+  const maneGeo = new THREE.SphereGeometry(0.07, 8, 6);
+  add(new THREE.SphereGeometry(0.075, 8, 6), matMane, head, 0, 0.36, -0.04);
+  add(maneGeo, matMane, head, -0.15, 0.33, 0);
+  add(maneGeo, matMane, head, 0.15, 0.33, 0);
+  add(maneGeo, matMane, head, -0.18, 0.2, 0.02);
+  add(maneGeo, matMane, head, 0.18, 0.2, 0.02);
+
+  // 4. 尻尾
+  const tail = new THREE.Group();
+  tail.position.set(0, 0.58, 0.3);
+  g.add(tail);
+  add(new THREE.CylinderGeometry(0.03, 0.02, 0.35, 6), matBody, tail, 0, 0.15, 0.1, 0.8, 0, 0);
+  add(new THREE.ConeGeometry(0.09, 0.22, 8), matMane, tail, 0, 0.3, 0.22, 1.2, 0, 0);
+
+  g.userData.parts = { legFL, legFR, legBL, legBR, head, tail };
+  return g;
+}
+
+/**
+ * 遠くからでも見つけられる光の柱と足元のリング。
+ * 造形とは別にしてあるのは、歩くようになって「像の台座」が無くなったため。
+ */
+function addAura(g) {
   const beam = new THREE.Mesh(
     new THREE.CylinderGeometry(0.34, 0.62, 90, 10, 1, true),
     new THREE.MeshBasicMaterial({
@@ -855,7 +928,6 @@ function makeSeesaa() {
   ring.rotation.x = Math.PI / 2; ring.position.y = 0.1;
   g.add(ring);
   g.userData.ring = ring;
-  return g;
 }
 
 // 街のなかの、建物に当たらない場所へ散らす(擬似乱数=毎回同じ配置)
@@ -914,9 +986,11 @@ function addSeesaa(t) {
     if (!placed) continue;
     const [x, z] = placed;
     const g = makeSeesaa();
+    addAura(g);
     g.position.set(x, groundAt(x, z), z);
-    g.rotation.y = rnd() * Math.PI * 2;  // 以降 tick でゆっくり回る(どの向きから来ても顔が見える)
+    g.rotation.y = rnd() * Math.PI * 2;
     g.userData.taken = false;
+    // 歩道網に乗せ替えるのは walkLines が揃ってから(seatSeesaa)。ここは仮置き
     t.group.add(g);
     seesaa.push(g);
     n++;
@@ -1909,6 +1983,83 @@ const walkLines = [];
     for (const im of [pedBody, pedHead, pedHair, pedLimb]) im.instanceColor.needsUpdate = true;
     console.log(`歩行者 ${PED_N}人 / 歩道 ${walkLines.length}本`);
   }
+}
+
+// ---------------------------------------------------------------- シーサーが歩く
+// 像だった頃はその場でゆっくり回っていた。歩道網の上を歩かせ、近づかれると
+// 早足になる。ただし直線では逃げ切らせない: 早足(1.45m/s)はプレイヤーの歩き
+// (4.6m/s)よりずっと遅いので、追いつけないのではなく「曲がり角で回り込む」遊びになる。
+const SEESAA_WALK = 0.75;      // ふだんの速さ(m/s)。人(1.0〜1.5)より遅い
+const SEESAA_TROT = 1.45;      // 早足
+const SEESAA_NEAR = 16;        // この距離まで近づかれると早足になる(m)
+const SEESAA_PAUSE = 4.5;      // 立ち止まる秒数の上限
+
+/** シーサーを歩道網に乗せる。walkLines が揃ってから呼ぶこと。 */
+function seatSeesaa() {
+  if (!walkLines.length) return;
+  const used = [];
+  for (const g of seesaa) {
+    // 互いになるべく離れた歩道を選ぶ。固まって湧くと探す楽しみが無くなる
+    let best = null, bestSep = -1;
+    for (let k = 0; k < 60; k++) {
+      const L = walkLines[(rnd() * walkLines.length) | 0];
+      if (L.len < 12) continue;              // 短い断片では歩いているように見えない
+      const d = rnd() * L.len;
+      const q = walkAt(L, d);
+      const sep = used.length
+        ? Math.min(...used.map((u) => Math.hypot(u[0] - q.x, u[1] - q.z))) : 1e9;
+      if (sep > bestSep) { bestSep = sep; best = { L, d, q }; }
+    }
+    if (!best) continue;
+    used.push([best.q.x, best.q.z]);
+    Object.assign(g.userData, {
+      line: walkLines.indexOf(best.L), d: best.d,
+      dir: rnd() < 0.5 ? 1 : -1,
+      phase: rnd() * Math.PI * 2,
+      pause: rnd() * SEESAA_PAUSE,
+      trot: 0,
+    });
+    g.position.set(best.q.x, groundAt(best.q.x, best.q.z), best.q.z);
+  }
+  console.log(`シーサー ${seesaa.length} 体を歩道に乗せた`);
+}
+
+seatSeesaa();
+
+/** 1体ぶんの歩きと脚の振り。dist はプレイヤーとの距離。 */
+function stepSeesaa(g, dist, dt, now) {
+  const u = g.userData;
+  // 近づかれると早足。急に切り替わると不自然なので、なまして寄せる
+  const want = dist < SEESAA_NEAR ? 1 : 0;
+  u.trot += (want - u.trot) * Math.min(1, dt * 1.8);
+  const speed = SEESAA_WALK + (SEESAA_TROT - SEESAA_WALK) * u.trot;
+
+  if (u.line !== undefined && walkLines.length) {
+    if (u.pause > 0 && u.trot < 0.25) {
+      u.pause -= dt;                         // 追われている間は立ち止まらない
+    } else {
+      const L = walkLines[u.line];
+      u.d += u.dir * speed * dt;
+      // 端で折り返す。歩道は途中で曲がるので、これだけで角を曲がって見える
+      if (u.d > L.len) { u.d = L.len; u.dir = -1; u.pause = 1 + rnd() * SEESAA_PAUSE; }
+      if (u.d < 0) { u.d = 0; u.dir = 1; u.pause = 1 + rnd() * SEESAA_PAUSE; }
+      const q = walkAt(L, u.d);
+      const bob = Math.sin(u.phase * 2) * 0.025;
+      g.position.set(q.x, groundAt(q.x, q.z) + bob, q.z);
+      // 造形の前方は -Z なので、進行方向へ向けるには π 足す
+      g.rotation.y = q.yaw + (u.dir > 0 ? Math.PI : 0);
+      u.phase += speed * 3.4 * dt;
+    }
+  }
+  const P = u.parts;
+  if (!P) return;
+  // 四つ足は対角が同時に出る(速歩)。脚は付け根が原点なので rotation.x だけで振れる
+  const sw = Math.sin(u.phase) * (0.30 + u.trot * 0.20);
+  P.legFL.rotation.x = sw;  P.legBR.rotation.x = sw;
+  P.legFR.rotation.x = -sw; P.legBL.rotation.x = -sw;
+  P.tail.rotation.x = Math.sin(u.phase * 2) * 0.28 - 0.1;
+  // 首を振るのは止まっている間だけ。歩いている間は進む先を見る
+  P.head.rotation.y = u.pause > 0 ? Math.sin(now * 0.0012 + u.phase) * 0.45 : 0;
 }
 
 /** 歩道上の距離 d の地点。 */
@@ -3009,7 +3160,7 @@ function tick() {
     // 店内に居るあいだは入る前の位置で測る(街から離れた舞台に居るため)
     const d = Math.hypot(s.position.x - hereX(), s.position.z - hereZ());
     if (d < nearest) nearest = d;
-    s.rotation.y += dt * 0.42;                    // 台座ごとゆっくり回す
+    stepSeesaa(s, d, dt, now);                    // 歩く・脚を振る・近いと早足
     s.userData.ring.rotation.z += dt * 1.1;
     s.userData.ring.position.y = 0.1 + Math.sin(now * 0.003 + s.position.x) * 0.25;
     if (d < PICKUP && active) {
@@ -3049,6 +3200,8 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   rmap, bmap, hashInsert, hashRemove, distToBuilding,
   // タイル関係(検証用)
   tiles, tileOf, worldBounds, fetchTile, buildTileCore, buildTileProps, TILE, HALF,
+  // シーサー(検証用)。tick を待たずに歩きだけ回せる
+  stepSeesaa, seatSeesaa, walkLines, walkAt,
   // 店の中(検証用)。看板の前まで歩かずに寄れる
   shopSigns, shopState: () => ({ inShop: inShop?.userData ?? null,
     enterable: enterable?.userData ?? null, solids: bstore.filter((r) => r.tile === 'shop').length }),
