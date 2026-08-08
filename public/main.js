@@ -3536,11 +3536,26 @@ function pathAt(path, d) {
   };
 }
 
-// 走る車両(2両)。線形を往復するので端で消えたり湧いたりしない
-let train = null, trainPath = null, trainD = 0, trainDir = 1;
-let trainStopDs = [], trainWait = 0;
-if (railPaths.length) {
-  train = new THREE.Group();
+// 走る車両(2両編成)。線形を往復するので端で消えたり湧いたりしない。
+//
+// **本数は線形の長さで決める**。世界が1kmだった頃は線形1,025mに1本で往復3分
+// だったが、10kmに広げたら線形が最大6,277mになり、同じ駅に次が来るまで
+// **11.5〜21分**になって事実上乗れなくなった(実測)。
+// 約800mに1本にすると、どの長さでも2〜3分に落ち着く。
+// 本数と「同じ駅での最悪の待ち時間」の実測(線形3,177m・駅3):
+//   3本=4.0分 / 4本=2.7分 / 5本=2.1分 / 6本=1.7分 / 8本=1.4分
+// 往復の線形なので往路と復路が駅の近くで擦れ違い、到着にムラが出る。
+// 均されないぶん、最悪値で見て 550m に1本にしている。
+const TRAIN_GAP = 550;                        // この距離に1本の割合
+const TRAIN_MIN = 3, TRAIN_MAX = 12;
+const TRAIN_SPEED = 11;                       // m/s。約40km/h
+const TRAIN_DWELL = 9;                        // 駅での停車(秒)。乗り降りできる長さ
+const trains = [];            // {g, d, dir, wait, ride}
+let trainPath = null, trainStopDs = [];
+
+/** 2両編成の車両。 */
+function makeTrainCars() {
+  const g = new THREE.Group();
   for (const cz of [-7.2, 7.2]) {
     const car = new THREE.Group();
     const body = new THREE.Mesh(new THREE.BoxGeometry(2.6, 3.1, 13.2),
@@ -3556,21 +3571,27 @@ if (railPaths.length) {
     stripe.position.y = -0.55;
     car.add(stripe);
     car.position.z = cz;
-    train.add(car);
+    g.add(car);
   }
-  train.position.y = -9999;                   // 初回 tick で正しい位置に移す
-  scene.add(train);
-  retargetTrain();
-  trainD = trainPath.len * 0.25;              // 駅と駅の間から始める
+  g.position.y = -9999;                       // 初回 tick で正しい位置に移す
+  scene.add(g);
+  return g;
 }
+
+if (railPaths.length) retargetTrain();
 
 /**
  * 線形を作り直したあとに、走らせる線形と停車位置を選び直す。
  * 走行位置は距離ではなく **世界座標** で引き継ぐ(線形が伸びると距離の意味が
  * 変わるので、そのまま渡すと列車が数百m飛ぶ)。
  */
-function retargetTrain(keep = null) {
-  if (!railPaths.length) { trainPath = null; trainStopDs = []; return; }
+function retargetTrain(keeps = null) {
+  if (!railPaths.length) {
+    trainPath = null; trainStopDs = [];
+    for (const tr of trains) { scene.remove(tr.g); disposeTree(tr.g); }
+    trains.length = 0;
+    return;
+  }
   // 駅がいちばん多く乗っている線形を走らせる(同数なら長いほう)。
   // 長さだけで選ぶと、駅が別の線形に乗っていて永久に停まらないことがある。
   const nSt = new Map();
@@ -3578,60 +3599,84 @@ function retargetTrain(keep = null) {
   trainPath = railPaths.reduce((a, b) =>
     ((nSt.get(b) ?? 0) - (nSt.get(a) ?? 0) || b.len - a.len) > 0 ? b : a);
 
-  if (keep) {
-    let bd = Infinity;
-    for (let d = 0; d <= trainPath.len; d += 4) {
-      const q = railAt(trainPath, d);
-      const e = Math.hypot(q.x - keep.x, q.z - keep.z);
-      if (e < bd) { bd = e; trainD = d; }
-    }
-  }
-  trainD = Math.max(0, Math.min(trainPath.len, trainD));
-
   // 駅での停車位置(線形上の距離)。この線形に乗った駅ぜんぶに停まる
   trainStopDs = stationStops.filter((s) => s.p === trainPath)
     .map((s) => s.d).sort((a, b) => a - b);
-  console.log(`列車の線形 ${Math.round(trainPath.len)}m / 停車位置 ` +
-    (trainStopDs.length
-      ? trainStopDs.map((d) => `${Math.round(d)}m`).join('、') : 'なし'));
+
+  // 本数を線形の長さに合わせる
+  const want = Math.max(TRAIN_MIN,
+    Math.min(TRAIN_MAX, Math.round(trainPath.len / TRAIN_GAP)));
+  while (trains.length > want) {
+    const tr = trains.pop();
+    scene.remove(tr.g); disposeTree(tr.g);
+  }
+  while (trains.length < want) {
+    const g = makeTrainCars();
+    trains.push({
+      g, d: 0, dir: 1, wait: 0,
+      // 乗り物としての顔(バスと同じ扱いにして乗降処理を共通化する)
+      ride: { g, ref: 'ゆいレール', name: '沖縄都市モノレール線',
+              seat: { x: 0, y: 0.15, z: 7.2 },   // 前寄りの車両の中ほど
+              isTrain: true, wait: 0 },
+    });
+  }
+
+  // 位置。引き継ぎがあれば世界座標で拾い直し、無ければ **線形上を等分して
+  // 向きを交互にする**。往復1周(2×len)を等分すると、往路の車両と復路の車両が
+  // 同じ地点に重なり(位相 p と 2len-p が同じ d を指す)、駅に2本まとめて着いて
+  // しまう(実測で到着の間隔が 0分と1.1分の繰り返しになった)。
+  const cyc = trainPath.len * 2;
+  trains.forEach((tr, i) => {
+    const keep = keeps?.[i];
+    if (keep) {
+      let bd = Infinity;
+      for (let d = 0; d <= trainPath.len; d += 4) {
+        const q = railAt(trainPath, d);
+        const e = Math.hypot(q.x - keep.x, q.z - keep.z);
+        if (e < bd) { bd = e; tr.d = d; }
+      }
+      tr.dir = keep.dir;
+    } else {
+      tr.d = (i / trains.length) * trainPath.len;
+      tr.dir = (i % 2) ? -1 : 1;
+    }
+    tr.d = Math.max(0, Math.min(trainPath.len, tr.d));
+  });
+
+  const round = cyc / TRAIN_SPEED + trainStopDs.length * 2 * TRAIN_DWELL + 6;
+  console.log(`列車 ${trains.length}本 / 線形 ${Math.round(trainPath.len)}m / ` +
+    `停車 ${trainStopDs.length}駅 / 同じ駅に次が来るまで約` +
+    `${(round / trains.length / 60).toFixed(1)}分`);
 }
 
 /** モノレールの車両を進める(駅ぜんぶで停車し、端に着いたら折り返す)。 */
 function stepTrain(dt) {
-  if (!train || !trainPath) return;
-  if (trainWait > 0) {
-    trainWait -= dt;
-  } else {
-    const prev = trainD;
-    trainD += trainDir * 11 * dt;               // 約40km/h
-    if (trainD > trainPath.len) { trainD = trainPath.len; trainDir = -1; trainWait = 3; }
-    if (trainD < 0) { trainD = 0; trainDir = 1; trainWait = 3; }
-    // 通り過ぎた駅があれば、そこへ戻して停める。
-    // 1フレームで進むのは約0.2mなので普通は1駅ぶんだが、
-    // タブが止まって dt が伸びたときのために手前の駅を選ぶ
-    let stopAt = null;
-    for (const sd of trainStopDs) {
-      if ((prev < sd && trainD >= sd) || (prev > sd && trainD <= sd)) {
-        if (stopAt === null || Math.abs(sd - prev) < Math.abs(stopAt - prev)) stopAt = sd;
+  if (!trainPath) return;
+  for (const tr of trains) {
+    if (tr.wait > 0) {
+      tr.wait -= dt;
+    } else {
+      const prev = tr.d;
+      tr.d += tr.dir * TRAIN_SPEED * dt;
+      if (tr.d > trainPath.len) { tr.d = trainPath.len; tr.dir = -1; tr.wait = 3; }
+      if (tr.d < 0) { tr.d = 0; tr.dir = 1; tr.wait = 3; }
+      // 通り過ぎた駅があれば、そこへ戻して停める。
+      // 1フレームで進むのは約0.2mなので普通は1駅ぶんだが、
+      // タブが止まって dt が伸びたときのために手前の駅を選ぶ
+      let stopAt = null;
+      for (const sd of trainStopDs) {
+        if ((prev < sd && tr.d >= sd) || (prev > sd && tr.d <= sd)) {
+          if (stopAt === null || Math.abs(sd - prev) < Math.abs(stopAt - prev)) stopAt = sd;
+        }
       }
+      if (stopAt !== null) { tr.d = stopAt; tr.wait = TRAIN_DWELL; }
     }
-    if (stopAt !== null) {
-      trainD = stopAt;
-      trainWait = 9;                            // 乗り降りできる長さ
-    }
+    const q = railAt(trainPath, tr.d);
+    tr.g.position.set(q.x, q.y + 0.9, q.z);     // 桁をまたぐので少し上に乗せる
+    tr.g.rotation.y = q.yaw + (tr.dir < 0 ? Math.PI : 0);
+    tr.ride.wait = tr.wait;
   }
-  const q = railAt(trainPath, trainD);
-  train.position.set(q.x, q.y + 0.9, q.z);      // 桁をまたぐので少し上に乗せる
-  train.rotation.y = q.yaw + (trainDir < 0 ? Math.PI : 0);
-  if (trainRide) trainRide.wait = trainWait;
 }
-
-// 乗り物としてのモノレール(バスと同じ扱いにして乗降処理を共通化する)
-const trainRide = train ? {
-  g: train, ref: 'ゆいレール', name: '沖縄都市モノレール線',
-  seat: { x: 0, y: 0.15, z: 7.2 },          // 前寄りの車両の中ほど
-  isTrain: true, wait: 0,
-} : null;
 
 // ---------------------------------------------------------------- 操作
 const player = {
@@ -4010,7 +4055,8 @@ function dropTile(t) {
 /** タイルを足し引きしたあとに、タイルをまたぐもの(線形・駅・バス・地図)を組み直す。 */
 function rebuildDerived() {
   // 列車の居場所は距離ではなく世界座標で覚える(線形が伸び縮みするため)
-  const keep = train && trainPath ? railAt(trainPath, trainD) : null;
+  const keep = trainPath
+    ? trains.map((tr) => ({ ...railAt(trainPath, tr.d), dir: tr.dir })) : null;
   buildApron();
   rebuildMonorail();
   buildStations();
@@ -4345,7 +4391,7 @@ function tick() {
     boardable = null;
     if (active && !riding) {
       let best = Infinity;
-      const cands = trainRide ? [...buses, trainRide] : buses;
+      const cands = [...buses, ...trains.map((t) => t.ride)];
       for (const v of cands) {
         if (v.wait <= 0) continue;
         const d = Math.hypot(v.g.position.x - player.x, v.g.position.z - player.z);
@@ -4617,7 +4663,7 @@ let elapsed = 0, frame = 0;
 // 動作確認用(コンソールから位置や視点を動かせる)
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
-  council, councilPosts, showCouncil, buses, trainRide, bstore, sigPhase, signals,
+  council, councilPosts, showCouncil, buses, trains, bstore, sigPhase, signals,
   rmap, bmap, hashInsert, hashRemove, distToBuilding,
   // タイル関係(検証用)
   tiles, tileOf, worldBounds, fetchTile, buildTileCore, buildTileProps, TILE, HALF,
@@ -4632,7 +4678,9 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   SEESAA_TOTAL, busSigns, shopSigns,
   stationStops, trainStopDs: () => trainStopDs, trainPath: () => trainPath,
   // 列車(検証用)。tick を待たずに走らせられる
-  stepTrain, trainState: () => ({ d: +trainD.toFixed(1), dir: trainDir, wait: +trainWait.toFixed(1) }),
+  stepTrain, retargetTrain, TRAIN_SPEED, TRAIN_DWELL,
+  trainState: () => trains.map((tr) => ({
+    d: +tr.d.toFixed(1), dir: tr.dir, wait: +tr.wait.toFixed(1) })),
   // シーサー(検証用)。tick を待たずに歩きだけ回せる
   stepSeesaa, seatSeesaa, walkLines, walkAt,
   // 完成アニメーション(検証用)。10体集めずに再生できる
@@ -4657,11 +4705,11 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   // tick を待たずに出入りする(ペインが隠れていると rAF が止まって検証できないため)
   visitShop: (i) => { enterable = shopSigns[i] ?? null; enterShop(); },
   leaveShop: () => exitShop(),
-  // 検証用: 列車を駅に着けて長く停める(k 番目の停車位置)
-  trainToStation: (sec = 60, k = 0) => {
-    if (!trainStopDs.length) return false;
-    trainD = trainStopDs[Math.min(k, trainStopDs.length - 1)];
-    trainWait = sec;
+  // 検証用: i 本目の列車を k 番目の停車位置に着けて長く停める
+  trainToStation: (sec = 60, k = 0, i = 0) => {
+    if (!trainStopDs.length || !trains[i]) return false;
+    trains[i].d = trainStopDs[Math.min(k, trainStopDs.length - 1)];
+    trains[i].wait = sec;
     return true;
   },
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
