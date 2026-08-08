@@ -1407,6 +1407,88 @@ const SHOP_CATS = [
   ['他', 0x9aa3a6, []],
 ];
 const shopSigns = [];
+
+/** 点が多角形リングの内側か。あちこちで書いていたので1つにまとめる。 */
+function pointInRing(ring, x, z) {
+  let inside = false;
+  for (let k = 0, l = ring.length - 1; k < ring.length; l = k++) {
+    const a = ring[k], c = ring[l];
+    if ((a.y > z) !== (c.y > z) &&
+        x < (c.x - a.x) * (z - a.y) / (c.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+/** (x,z) の周りの建物レコード。ホームや木の幹(tile を持たない)は除く。 */
+function nearbyBuildings(x, z, r) {
+  const out = new Set();
+  const gx = Math.floor(x / HASH), gz = Math.floor(z / HASH);
+  const n = Math.ceil(r / HASH);
+  for (let i = -n; i <= n; i++) {
+    for (let j = -n; j <= n; j++) {
+      for (const b of bmap.get(`${gx + i},${gz + j}`) ?? []) {
+        if (b.tile && b.tile !== SOLID_SHOP) out.add(b);
+      }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * 店が入っている建物を探し、街に面した外壁に入口の位置を決める。
+ *
+ * OSM の地物は建物の重心あたりに落ちるので、48件中41件は建物の輪郭の内側にある。
+ * そのまま看板を出すと supportY() が屋根の天端を返し、40件が屋根の上に浮いた
+ * (実測)。街の側から入口が見えないので、外壁のどの辺が街に開いているかを
+ * 自分で決めて、そこに扉を付ける。PLATEAU の LOD1 に開口は無いので自前で足すしかない。
+ *
+ * @returns {{x,z,yaw,gy,host:boolean}} 扉の位置・向き・足元の高さ
+ */
+function findDoor(x, z) {
+  const cands = nearbyBuildings(x, z, 26);
+  let host = null, hostD = Infinity;
+  for (const b of cands) {
+    if (pointInRing(b.ring, x, z)) { host = b; hostD = 0; break; }
+    const dx = Math.max(b.minx - x, 0, x - b.maxx);
+    const dz = Math.max(b.minz - z, 0, z - b.maxz);
+    const d = Math.hypot(dx, dz);
+    if (d < hostD && d < 12) { hostD = d; host = b; }
+  }
+  // 建物が見つからない(屋外の施設など)ときは、その場を入口にする
+  if (!host) return { x, z, yaw: 0, gy: groundAt(x, z), host: false, scale: 1 };
+
+  const ring = host.ring, m = ring.length;
+  let best = null;
+  for (let i = 0; i < m; i++) {
+    const a = ring[i], c = ring[(i + 1) % m];
+    const ex = c.x - a.x, ez = c.y - a.y;
+    const L = Math.hypot(ex, ez);
+    if (L < 2.0) continue;                       // 扉が入らない短い辺は使わない
+    const nx = ez / L, nz = -ex / L;             // 辺の法線。外向きがどちらかは試して決める
+    for (const u of [0.35, 0.5, 0.65]) {
+      const ax = a.x + ex * u, az = a.y + ez * u;
+      for (const s of [1, -1]) {
+        const ox = nx * s, oz = nz * s;
+        const px = ax + ox * 1.4, pz = az + oz * 1.4;   // 扉の前に立つ場所
+        if (pointInRing(ring, px, pz)) continue;        // 内側を向いていた
+        const gy = groundAt(px, pz);
+        if (blocked(px, pz, 0.6, gy)) continue;         // 隣の建物に埋まる
+        // 街に開いているほど良い。道路に面していれば最優先
+        const score = (onRoad(px, pz) ? 40 : 0) + distToBuilding(px, pz, 14) * 2 + L * 0.25;
+        if (!best || score > best.score) {
+          const dy = groundAt(ax + ox * 0.3, az + oz * 0.3);
+          best = { score, x: ax + ox * 0.3, z: az + oz * 0.3,
+                   yaw: Math.atan2(ox, oz), gy: dy, host: true,
+                   // 平屋より低い建物では扉が屋根を突き抜けるので縮める
+                   scale: Math.min(1, Math.max(0.55, (host.top - dy) / 3.2)) };
+        }
+      }
+    }
+  }
+  // どの辺も塞がっていたら諦めて地物の位置に置く(地表の高さにはする)
+  return best ?? { x, z, yaw: 0, gy: groundAt(x, z), host: false, scale: 1 };
+}
+
 function addShopSigns(t) {
   const skip = new Set(['school', 'library', 'community_centre', 'townhall',
     'fire_station', 'parking', 'bicycle_rental', 'shelter', 'bench', 'toilets',
@@ -1414,7 +1496,8 @@ function addShopSigns(t) {
     'kindergarten', 'social_facility', 'place_of_worship', 'train_station']);
   const catOf = (v) => SHOP_CATS.find((c) => c[2].includes(v)) ?? SHOP_CATS.at(-1);
 
-  let n = 0;
+  // まず対象を集めて入口を決める。扉は InstancedMesh に畳むので数が先に要る
+  const list = [];
   for (const l of t.data.landmarks ?? []) {
     const [key, val] = (l.kind || '').split('=');
     if (!['shop', 'amenity', 'office', 'craft', 'healthcare',
@@ -1422,6 +1505,43 @@ function addShopSigns(t) {
     if (skip.has(val)) continue;
     const [mark, color] = catOf(val);
     const x = t.X(l.x), z = t.Z(l.z);
+    list.push({ l, mark, color, val, x, z, door: findDoor(x, z) });
+  }
+  if (!list.length) { console.log(`[${t.key}] 店舗 0件`); return; }
+
+  // 扉一式。1軒につき Mesh を並べると 48軒で 300 近いドローコールになるので、
+  // 部品ごとに1つの InstancedMesh へ畳む(この街の他の反復物と同じやり方)。
+  const piece = (geo, mat) => {
+    const im = new THREE.InstancedMesh(geo, mat, list.length);
+    im.castShadow = im.receiveShadow = true;
+    return im;
+  };
+  const gStep = new THREE.BoxGeometry(1.9, 0.1, 0.8); gStep.translate(0, 0.05, 0.4);
+  const gFrame = new THREE.BoxGeometry(1.7, 2.45, 0.14); gFrame.translate(0, 1.22, 0.03);
+  const gPanel = new THREE.BoxGeometry(1.34, 2.05, 0.07); gPanel.translate(0, 1.04, 0.1);
+  const gBar = new THREE.BoxGeometry(0.07, 0.62, 0.07); gBar.translate(0.46, 1.06, 0.16);
+  const gAwn = new THREE.BoxGeometry(2.3, 0.13, 0.95); gAwn.translate(0, 2.66, 0.48);
+  const steps = piece(gStep, new THREE.MeshLambertMaterial({ color: 0xb3aa9a }));
+  const frames = piece(gFrame, new THREE.MeshLambertMaterial({ color: 0x6f6a60 }));
+  const panels = piece(gPanel, new THREE.MeshLambertMaterial({ color: 0x5d7a86 }));
+  const bars = piece(gBar, new THREE.MeshLambertMaterial({ color: 0xd8d3c6 }));
+  const awns = piece(gAwn, new THREE.MeshLambertMaterial({ color: 0xffffff }));
+  awns.instanceColor = new THREE.InstancedBufferAttribute(
+    new Float32Array(list.length * 3), 3);
+
+  const m4 = new THREE.Matrix4(), qt = new THREE.Quaternion();
+  const up = new THREE.Vector3(0, 1, 0), pv = new THREE.Vector3();
+  const sv = new THREE.Vector3(), col = new THREE.Color();
+
+  let n = 0;
+  for (const s of list) {
+    const { l, mark, color, door } = s;
+    // 扉は地表に立てる。yaw は外向き(+Z が街を向く)
+    qt.setFromAxisAngle(up, door.yaw);
+    m4.compose(pv.set(door.x, door.gy, door.z), qt,
+               sv.set(door.scale, door.scale, door.scale));
+    for (const im of [steps, frames, panels, bars, awns]) im.setMatrixAt(n, m4);
+    awns.setColorAt(n, col.setHex(color));      // 庇を分類の色にする
 
     const cv = document.createElement('canvas');
     cv.width = 384; cv.height = 96;
@@ -1449,15 +1569,23 @@ function addShopSigns(t) {
       map: new THREE.CanvasTexture(cv), transparent: true, depthWrite: false,
     }));
     sp.scale.set(5.2, 1.3, 1);
-    sp.position.set(x, supportY(x, z) + 2.4, z);
+    // 看板は入口の庇の上。地物の座標(建物の重心あたり)に出すと屋根に載る
+    sp.position.set(door.x, door.gy + 3.15 * door.scale, door.z);
     sp.visible = false;
-    // 中に入れるようにするので、店の素性を看板に持たせておく
-    sp.userData = { name: l.name, mark, color, kind: val, oh: l.oh || '', x, z };
+    // 中に入れるようにするので、店の素性と入口を看板に持たせておく
+    sp.userData = { name: l.name, mark, color, kind: s.val, oh: l.oh || '',
+                    x: s.x, z: s.z, door };
     t.group.add(sp);
     shopSigns.push(sp);
     n++;
   }
-  console.log(`[${t.key}] 店舗 ${n}件`);
+  for (const im of [steps, frames, panels, bars, awns]) {
+    im.instanceMatrix.needsUpdate = true;
+    t.group.add(im);
+  }
+  awns.instanceColor.needsUpdate = true;
+  const attached = list.filter((s) => s.door.host).length;
+  console.log(`[${t.key}] 店舗 ${n}件(うち建物の外壁に入口 ${attached}件)`);
 }
 
 // ---------------------------------------------------------------- 店の中
@@ -2644,9 +2772,14 @@ function tick() {
     enterable = null;
     if (active && !riding && !inShop && !boardable) {
       let best = Infinity;
+      const feet = player.y - EYE;
       for (const s of shopSigns) {
-        const d = Math.hypot(s.userData.x - player.x, s.userData.z - player.z);
-        if (d < ENTER_R && d < best) { best = d; enterable = s; }
+        const D = s.userData.door;
+        const d = Math.hypot(D.x - player.x, D.z - player.z);
+        if (d >= ENTER_R || d >= best) continue;
+        // 高さも見る。屋根の上や飛行中に入れてしまわないように
+        if (Math.abs(feet - D.gy) > 2.5) continue;
+        best = d; enterable = s;
       }
     }
     if (prev !== enterable) updateRideUI();
@@ -2904,10 +3037,14 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   gotoShop: (i) => {
     const s = shopSigns[i];
     if (!s) return null;
-    player.x = s.userData.x; player.z = s.userData.z + 2;
+    // 扉の正面 2m に立ち、扉を向く
+    const D = s.userData.door;
+    player.x = D.x + Math.sin(D.yaw) * 2.0;
+    player.z = D.z + Math.cos(D.yaw) * 2.0;
     player.y = supportY(player.x, player.z) + EYE;
-    player.yaw = Math.PI; player.pitch = 0;
-    return s.userData;
+    // 前方は (-sin yaw, -cos yaw)。扉は外向き(sin,cos)にあるので yaw はそのままで振り向く
+    player.yaw = D.yaw; player.pitch = 0;
+    return { ...s.userData, standGround: +groundAt(player.x, player.z).toFixed(1) };
   },
   // tick を待たずに出入りする(ペインが隠れていると rAF が止まって検証できないため)
   visitShop: (i) => { enterable = shopSigns[i] ?? null; enterShop(); },
