@@ -4242,16 +4242,36 @@ let councilNear = null, councilIdx = 0, councilRead = 0;
 let councilClosed = false;     // ✕で閉じた。離れるまで出し直さない
 const cvEl = $('council');
 
+// 発言の全文は council_full.json(1.4MB)。抜粋の10.2倍あるので council.json には
+// 混ぜず、「全文」を押したときに一度だけ落とす。起動を止めない。
+let councilFull = null, councilFullBusy = false, councilShowFull = false;
+function loadCouncilFull() {
+  if (councilFull || councilFullBusy) return Promise.resolve(councilFull);
+  councilFullBusy = true;
+  return fetch('./data/council_full.json')
+    .then((r) => (r.ok ? r.json() : null))
+    .then((j) => { councilFull = j ?? {}; return councilFull; })
+    .catch(() => { councilFull = {}; return councilFull; })
+    .finally(() => { councilFullBusy = false; });
+}
+
 function showCouncil(g) {
   if (!g || councilClosed) { cvEl.classList.remove('on'); return; }
   const p = g.userData.place;
-  const s = p.speeches[councilIdx % p.speeches.length];
+  const i = councilIdx % p.speeches.length;
+  const s = p.speeches[i];
   // 収録は那覇市議会と沖縄県議会の両方。発言ごとにどちらかを名乗る
   $('cv-body').textContent = `${s.body || '議会'}で言及`;
   $('cv-place').textContent = p.label;
+  // 地点の要約。**発言の中身は言い換えない**(実在の人の発言を機械が要約すると、
+  // 言っていないことを言ったことにしかねない)。数えれば分かる事実だけ
+  $('cv-sum').textContent = p.sum ?? '';
   $('cv-speaker').textContent = s.speaker || '(発言者不明)';
   $('cv-date').textContent = `${s.date}　${s.meeting}`;
-  $('cv-quote').textContent = s.excerpt;
+  const full = councilShowFull ? councilFull?.[p.term]?.[i] : null;
+  $('cv-quote').textContent = full ?? s.excerpt;
+  $('cv-quote').classList.toggle('full', !!full);
+  $('cv-all').textContent = councilShowFull ? '抜粋' : '全文';
   const a = $('cv-link');
   a.href = s.url || '#';
   a.style.visibility = s.url ? 'visible' : 'hidden';
@@ -4273,6 +4293,21 @@ function nextCouncil() {
   showCouncil(councilNear);
 }
 
+/** 抜粋 ↔ 全文 を切り替える。全文は押されたときに一度だけ落とす。 */
+function toggleCouncilFull() {
+  if (!councilNear) return;
+  if (councilShowFull) { councilShowFull = false; showCouncil(councilNear); return; }
+  if (councilFull) { councilShowFull = true; showCouncil(councilNear); return; }
+  $('cv-all').textContent = '…';
+  loadCouncilFull().then(() => {
+    councilShowFull = true;
+    showCouncil(councilNear);
+  });
+}
+
+$('cv-all').addEventListener('click', (e) => {
+  e.preventDefault(); e.stopPropagation(); toggleCouncilFull();
+});
 $('cv-close').addEventListener('click', closeCouncil);
 $('cv-next').addEventListener('click', nextCouncil);
 // タッチはクリック合成を待たずに反応させる(押しても反応しないと感じさせない)
@@ -4544,6 +4579,7 @@ function tick() {
     if (hit !== councilNear) {
       councilNear = hit;
       councilIdx = 0;
+      councilShowFull = false;      // 別の地点に移ったら抜粋に戻す
       councilClosed = false;      // 別の地点(や圏外)に移ったら閉じた状態は解除
       showCouncil(hit);
       if (hit && !hit.userData.read) {
@@ -4716,6 +4752,18 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   },
   // tick を待たずに出入りする(ペインが隠れていると rAF が止まって検証できないため)
   visitShop: (i) => { enterable = shopSigns[i] ?? null; enterShop(); },
+  // 議会パネル(検証用)。近づかずに開ける。全文の切り替えも試せる
+  visitCouncil: (i = 0) => {
+    const g = councilPosts.filter((q) => q.visible)[i] ?? councilPosts[i];
+    if (!g) return null;
+    councilNear = g; councilIdx = 0; councilClosed = false; councilShowFull = false;
+    showCouncil(g);
+    return g.userData.place.label;
+  },
+  toggleCouncilFull, councilState: () => ({
+    地点: councilNear?.userData.place.label ?? null,
+    全文表示: councilShowFull, 全文を読み込み済み: !!councilFull,
+  }),
   leaveShop: () => exitShop(),
   // 検証用: i 本目の列車を k 番目の停車位置に着けて長く停める
   trainToStation: (sec = 60, k = 0, i = 0) => {

@@ -142,6 +142,7 @@ def main():
     print(f"検索語 {len(places)}件: {'、'.join(sorted(places))}", file=sys.stderr)
 
     results = []
+    full = {}
     for term, p in sorted(places.items()):
         n = psql_json(args.db, f"""
             select json_build_object('n', count(*))
@@ -178,10 +179,40 @@ def main():
             ) r;""")
         if not rows:
             continue
+        # 地点の要約。**発言の中身は言い換えない**。
+        # 実在の議員・執行部の発言を機械が要約して公開物に載せると、言っていない
+        # ことを言ったことにしかねない。要約は「誰が・いつ・どの議会で・何件」と
+        # いう **数えれば分かる事実** だけにして、中身は逐語の抜粋と原文リンクに任せる。
+        bodies, kinds, dates, speakers = {}, {}, [], []
+        for r in rows:
+            bodies[r["body"]] = bodies.get(r["body"], 0) + 1
+            k = r["kind"] or "その他"
+            kinds[k] = kinds.get(k, 0) + 1
+            if r["date"]:
+                dates.append(r["date"])
+            nm = (r["speaker"] or "").strip()
+            if nm and nm not in speakers:
+                speakers.append(nm)
+        parts = []
+        parts.append("・".join(f"{b}{c}件" for b, c in
+                               sorted(bodies.items(), key=lambda kv: -kv[1])))
+        if kinds:
+            parts.append("・".join(f"{k}{c}" for k, c in
+                                   sorted(kinds.items(), key=lambda kv: -kv[1])))
+        if dates:
+            lo, hi = min(dates), max(dates)
+            parts.append(lo if lo == hi else f"{lo}〜{hi}")
+        if speakers:
+            head = "、".join(speakers[:3])
+            parts.append(head + (f" ほか{len(speakers) - 3}名"
+                                 if len(speakers) > 3 else ""))
+        summary = " ／ ".join(parts)
+
         results.append({
             "term": term, "label": p["label"], "kind": p["kind"],
             "x": p["x"], "z": p["z"],
             "hits": n,
+            "sum": summary,
             "speeches": [{
                 "speaker": r["speaker"], "title": r["title"], "kind": r["kind"],
                 "date": r["date"], "meeting": r["meeting"], "url": r["url"],
@@ -189,6 +220,10 @@ def main():
                 "excerpt": excerpt_around(r["text"], term),
             } for r in rows],
         })
+        # 全文は別ファイルに出す。ここに混ぜると council.json が 210KB → 1.6MB に
+        # 膨らみ、起動時に必ず落とすことになる(実測で抜粋の10.2倍。採用する発言は
+        # 長いものが優先されるので、平均179字ではなく2,562字ある)。
+        full[term] = [r["text"] for r in rows]
         print(f"  {term}: {n}件 → {len(rows)}件を採用", file=sys.stderr)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -198,6 +233,14 @@ def main():
     }, open(args.out, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     total = sum(len(r["speeches"]) for r in results)
     print(f"\n地点 {len(results)} / 発言 {total} → {args.out}", file=sys.stderr)
+
+    # 全文は別ファイル。描画側はパネルで「全文を読む」を押したときだけ落とす
+    fp = os.path.join(os.path.dirname(os.path.abspath(args.out)), "council_full.json")
+    json.dump(full, open(fp, "w", encoding="utf-8"),
+              ensure_ascii=False, separators=(",", ":"))
+    chars = sum(len(t) for v in full.values() for t in v)
+    print(f"全文 {chars:,} 字 → {fp} "
+          f"({os.path.getsize(fp) / 1024:.0f}KB)", file=sys.stderr)
 
 
 if __name__ == "__main__":

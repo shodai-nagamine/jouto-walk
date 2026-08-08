@@ -197,11 +197,17 @@
     background:var(--accent); border-radius:3px; padding:2px 7px; font-weight:700;
     white-space:nowrap; }
   #council .place { font-size:14px; font-weight:700; }
+  /* 地点の要約。中身の言い換えではなく「誰が・いつ・何件」の事実だけ */
+  #council .csum { font-size:11px; line-height:1.75; opacity:.55;
+    margin:1px 0 8px; letter-spacing:.02em; }
   #council .who { font-size:12px; opacity:.85; margin-bottom:6px; }
   #council .who b { color:#ffd0b4; }
   #council .who span { opacity:.6; margin-left:9px; font-variant-numeric:tabular-nums; }
   #council .quote { font-size:12.5px; line-height:1.85; max-height:8.4em;
     overflow:hidden; border-left:2px solid rgba(232,100,47,.5); padding-left:10px; }
+  /* 全文はスクロールさせる。抜粋のときは高さを抑えて画面を塞がない */
+  #council .quote.full { max-height:38vh; overflow-y:auto; pointer-events:auto;
+    -webkit-overflow-scrolling:touch; }
   #council .foot { display:flex; justify-content:space-between; align-items:center;
     gap:10px; margin-top:9px; font-size:11px; }
   #council .foot a { color:var(--accent); text-decoration:none; font-weight:700;
@@ -326,10 +332,12 @@
       <span class="place" id="cv-place"></span>
       <button class="x" id="cv-close" aria-label="閉じる">✕</button>
     </div>
+    <div class="csum" id="cv-sum"></div>
     <div class="who"><b id="cv-speaker"></b><span id="cv-date"></span></div>
     <div class="quote" id="cv-quote"></div>
     <div class="foot">
       <a id="cv-link" href="#" target="_blank" rel="noopener">原文を読む ↗</a>
+      <button class="nx" id="cv-all">全文</button>
       <button class="nx" id="cv-next">次の発言 ›</button>
       <span class="nav" id="cv-nav"></span>
     </div>
