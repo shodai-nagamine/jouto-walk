@@ -201,12 +201,21 @@
   #site .tag { font-size:10px; letter-spacing:.14em; color:#0d1b1e;
     background:#9fc4ac; border-radius:3px; padding:2px 7px; font-weight:700; }
   #site .place { font-size:14px; font-weight:700; }
-  #site .quote { font-size:12.5px; line-height:1.9; max-height:9em; overflow:hidden;
+  /* 文化庁の解説は 350 字ほどある。切ると文の途中で終わるので、
+     枠を広げたうえで、はみ出すぶんはスクロールで読めるようにする */
+  #site .quote { font-size:12.5px; line-height:1.9; max-height:32vh; overflow-y:auto;
+    pointer-events:auto; overscroll-behavior:contain;
     border-left:2px solid rgba(159,196,172,.6); padding-left:10px; }
+  #site .quote::-webkit-scrollbar { width:5px; }
+  #site .quote::-webkit-scrollbar-thumb { background:rgba(159,196,172,.4); border-radius:3px; }
   #site .foot { display:flex; justify-content:space-between; align-items:center;
     gap:10px; margin-top:9px; font-size:11px; }
   #site .foot a { color:#9fc4ac; text-decoration:none; font-weight:700; }
   #site .nav { opacity:.5; }
+  /* 同じ史跡に付いている他の国指定(玉陵の各墓室など)。本文より小さく */
+  #sv-more { font-size:11px; line-height:1.6; opacity:.62; margin-top:6px;
+    white-space:pre-line; }
+  #sv-more:empty { display:none; }
 
   #council { display:none; left:50%; transform:translateX(-50%); bottom:96px;
     width:min(620px, calc(100vw - 28px)); padding:13px 16px 11px;
@@ -252,6 +261,9 @@
       width:calc(100vw - 20px); padding:10px 12px 9px; }
     #council .quote { font-size:11.5px; max-height:7em; line-height:1.75; }
     #council .place { font-size:13px; }
+    /* 縦に伸びるとタッチ操作のボタンに重なる。狭めてスクロールに任せる */
+    #site .quote { font-size:11.5px; max-height:22vh; line-height:1.8; }
+    #sv-more { font-size:10px; max-height:4.4em; overflow-y:auto; }
   }
 
   #card .ctl { font-size:12.5px; opacity:.72; margin:0 0 22px; line-height:1.8; }
@@ -385,6 +397,7 @@
       <button class="x" id="sv-close" aria-label="閉じる">✕</button>
     </div>
     <div class="quote" id="sv-text"></div>
+    <div id="sv-more"></div>
     <div class="foot">
       <a id="sv-link" href="#" target="_blank" rel="noopener">出典 ↗</a>
       <span class="nav" id="sv-src"></span>
@@ -441,7 +454,10 @@
       を加工して作成（PDL1.0 ／ CC BY 4.0 互換）<br>
       バス停: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">©
       OpenStreetMap contributors</a>（ODbL 1.0）を加工して作成<br>
-      史跡の説明:
+      国指定文化財の解説:
+      <a href="https://kunishitei.bunka.go.jp/" target="_blank" rel="noopener">文化庁
+      国指定文化財等データベース</a>より引用（文字情報のみ・画像は不使用）<br>
+      その他の史跡の説明:
       <a href="https://ja.wikipedia.org/" target="_blank" rel="noopener">Wikipedia 日本語版</a>
       （CC BY-SA 4.0）と OpenStreetMap の碑文・案内板の写しを引用<br>
       人口: 令和2年国勢調査 地域メッシュ統計（総務省統計局・e-Stat）を加工して作成<br>

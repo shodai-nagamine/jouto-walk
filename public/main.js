@@ -1655,6 +1655,41 @@ function settleCouncil() {
 // 街のなかに数多く残っていて、これが土地の性格をよく表すので落とさない。
 // 議会の言及は朱の光柱、史跡は白木の標柱で見分ける(色も形も変える)。
 const historicPosts = [];
+// 国指定文化財（文化庁 国指定文化財等データベース）。
+// 規約に「文字情報は、出典を記載の上、自由にご利用ください」とあるので使える。
+// **画像は個別許諾が要るので取っていない。**
+// 国土数値情報の都道府県指定文化財(P32)は「非商用」で再配布できないため使わない
+// （バス停の P11 と同じ罠）。
+//
+// OSM の史跡とどれが同じものかは tools/fetch_heritage.py が突き合わせ済みで、
+// `osm` に相手の鍵が入っている。ここでは引くだけ。
+// 走りながら近さで当てると「沖縄師範学校跡 → 天女橋」のように別物の由緒が
+// 付く（実測）ので、当て方の判断は取得側に置いてある。
+const heritageByOsm = new Map();   // 鍵 -> 文化財[]（1つの史跡に複数の指定がある）
+const heritageSolo = [];           // OSM に対応の無いもの。独立して標柱を立てる
+fetch('./data/heritage.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .then((d) => {
+    for (const h of d?.sites ?? []) {
+      if (!h.osm) { heritageSolo.push(h); continue; }
+      const a = heritageByOsm.get(h.osm) ?? [];
+      a.push(h);
+      heritageByOsm.set(h.osm, a);
+    }
+    // 解説は、名前が史跡そのものを指すもの（「玉陵」＞「玉陵 墓室（西室）」）を選ぶ
+    for (const a of heritageByOsm.values()) a.sort((p, q) => p.name.length - q.name.length);
+    if (heritageByOsm.size || heritageSolo.length) {
+      console.log(`国指定文化財 対応 ${heritageByOsm.size}件 / 独立 ${heritageSolo.length}件（文化庁DB）`);
+      addSoloHeritage();
+    }
+  })
+  .catch(() => {});
+
+/** その史跡に付いている国指定文化財。無ければ空配列。 */
+function heritageFor(site, x, z) {
+  return heritageByOsm.get(`${site.name}|${Math.round(x)}|${Math.round(z)}`) ?? [];
+}
+
 function addHistoric(t) {
   const list = t.data.historic ?? [];
   if (!list.length) return;
@@ -1679,6 +1714,42 @@ function addHistoric(t) {
     historicPosts.push(g);
   }
   console.log(`[${t.key}] 史跡 ${list.length}件`);
+  addSoloHeritageTo(t);
+}
+
+/**
+ * OSM に対応の無い国指定文化財を、このタイルに標柱として立てる。
+ * OSM の史跡（白木）と混ざらないよう石の柱にする。
+ */
+function addSoloHeritageTo(t) {
+  if (t.hzDone || !heritageSolo.length) return;
+  t.hzDone = true;
+  const stone = new THREE.MeshLambertMaterial({ color: 0x9aa0a0 });
+  const cap = new THREE.MeshLambertMaterial({ color: 0x4a6b5a });   // 緑青
+  let n = 0;
+  for (const h of heritageSolo) {
+    if (Math.round(h.x / TILE) !== t.tx || Math.round(h.z / TILE) !== t.tz) continue;
+    const x = h.x, z = h.z;
+    const g = new THREE.Group();
+    g.position.set(x, groundAt(x, z), z);
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.22, 2.1, 0.22), stone);
+    post.position.y = 1.05; post.castShadow = true; g.add(post);
+    const hat = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.12, 0.4), cap);
+    hat.position.y = 2.16; hat.castShadow = true; g.add(hat);
+    const lab = makeLabel(`⛩ ${h.name}`, 7.0, 1.75);
+    lab.position.y = 3.2;
+    g.add(lab);
+    g.userData = { site: h, label: lab, tile: t.key, solo: true };
+    t.group.add(g);
+    historicPosts.push(g);
+    n++;
+  }
+  if (n) console.log(`[${t.key}] 国指定文化財 ${n}件`);
+}
+
+/** 文化財が史跡より後に届いたとき、読み込み済みのタイルに後追いで立てる。 */
+function addSoloHeritage() {
+  for (const t of tiles.values()) addSoloHeritageTo(t);
 }
 
 /** 捨てたタイルの史跡を登録簿から外す。 */
@@ -3931,9 +4002,13 @@ fetch('./data/site_notes.json')
   .then((d) => {
     siteNotes = d ?? {};
     const n = Object.keys(siteNotes).length;
-    if (n) console.log(`史跡の説明 ${n}件（出典つき）`);
+    if (n) console.log(`史跡の説明 ${n}件（OSM・Wikipedia）`);
   })
   .catch(() => {});
+
+// 指定の強さ。バッジに一つだけ出すときの順番
+const KIND_ORDER = ['登録有形文化財', '史跡名勝天然記念物', '国宝・重要文化財', '世界遺産'];
+const KIND_RANK = (k) => KIND_ORDER.findIndex((o) => k.startsWith(o));
 
 const SITE_R = 22;                 // この距離まで近づくと案内が出る(m)
 let siteNear = null, siteClosed = false;
@@ -3942,16 +4017,44 @@ const svEl = $('site');
 function showSite(g) {
   if (!g || siteClosed) { svEl.classList.remove('on'); return; }
   const h = g.userData.site;
+  // 1つの史跡がいくつもの指定を持つ（玉陵は世界遺産・史跡・国宝が計7件）。
+  // 解説は全体を指すものを使い、指定の種別はぜんぶ並べる
+  const hz = g.userData.solo ? [h] : heritageFor(h, g.position.x, g.position.z);
   const note = siteNotes[h.name];
-  $('sv-kind').textContent = h.k;
+  const lead = hz.find((r) => r.text) ?? hz[0];
+  let text, src, url;
+  if (lead?.text) {
+    // 文化庁の解説を最優先にする。公的な文で、出典がはっきりしている
+    text = lead.text; src = '文化庁 国指定文化財等データベース'; url = lead.url;
+  } else if (note?.text) {
+    text = note.text; src = note.src; url = note.url;
+  } else if (h.text) {
+    text = h.text; src = 'OpenStreetMap';
+    url = 'https://www.openstreetmap.org/copyright';
+  } else {
+    text = 'この場所の説明はまだ集まっていません。'; src = ''; url = '';
+  }
+  // 見出しのバッジは強い指定を一つだけ。玉陵は3種類の指定を持つので
+  // 全部並べるとバッジが2行になり、名前が押し出される（実機375pxで実測）
+  const kinds = [...new Set((g.userData.solo ? h.k.split('／') : hz.map((r) => r.k)))];
+  $('sv-kind').textContent = kinds.length
+    ? [...kinds].sort((p, q) => KIND_RANK(q) - KIND_RANK(p))[0]
+    : h.k;
   $('sv-name').textContent = h.name;
-  $('sv-text').textContent = note?.text
-    ?? (h.text ?? 'この場所の説明はまだ集まっていません。');
+  $('sv-text').textContent = text;
+  // 同じ史跡に付いている他の指定（玉陵の各墓室、新垣家住宅の主屋・ヒンプン…）
+  // は名前だけ添える。まとめたものは取得側が parts に持っている
+  // 同名の指定が重なる（玉陵は世界遺産と史跡の両方が「玉陵」）ので名前で畳む
+  const more = [...new Set((g.userData.solo ? (h.parts ?? [])
+    : hz.map((r) => r.name)).filter((n) => n !== lead?.name && n !== h.name))];
+  const lines = [];
+  if (kinds.length > 1) lines.push(`指定: ${kinds.join('／')}`);
+  if (more.length) lines.push(`国指定: ${more.join('、')}`);
+  $('sv-more').textContent = lines.join('\n');
   const a = $('sv-link');
-  const url = note?.url ?? '';
   a.href = url || '#';
   a.style.visibility = url ? 'visible' : 'hidden';
-  $('sv-src').textContent = note?.src ?? (h.text ? 'OpenStreetMap' : '');
+  $('sv-src').textContent = src;
   svEl.classList.add('on');
 }
 
@@ -4852,6 +4955,8 @@ let elapsed = 0, frame = 0;
 
 // 動作確認用(コンソールから位置や視点を動かせる)
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
+  // ペインが隠れていると rAF が止まり、canvas が古い絵のままになる。確認用に手で描く
+  draw: () => renderer.render(scene, camera),
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
   council, councilPosts, showCouncil, buses, trains, bstore, sigPhase, signals,
   rmap, bmap, hashInsert, hashRemove, distToBuilding,
@@ -4866,6 +4971,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   rebuildDerived, dropWalkLines, addWalkLines, bakeMap, buildApron, seesaaGroup,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
+  heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
   visitSite: (i = 0) => { const g = historicPosts[i]; if (!g) return null;
     siteNear = g; siteClosed = false; showSite(g); return g.userData.site.name; },
   SEESAA_TOTAL, busSigns, shopSigns,
