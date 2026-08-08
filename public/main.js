@@ -24,21 +24,96 @@ const TOUCH = qs.has('touch')
   : (matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0);
 if (TOUCH) document.body.classList.add('touch');
 
-// ---------------------------------------------------------------- ワールド
-const world = await fetch('./data/world.json').then((r) => r.json());
-const { size, cell, n, groundAtCenter } = world.meta;
-const HALF = size / 2;
-const terrain = world.terrain;               // terrain[ix*n + iz]
+// ---------------------------------------------------------------- タイル
+// 世界は 1km 角のタイルに分かれている。タイル内の座標は 0..TILE なので
+//   ワールド座標 = タイル内座標 - HALF + meta.offset
+// オフセットは全タイル共通の原点から測ってあるので、タイルを足しても
+// 縮尺はずれない(緯度経度→メートルの換算を原点の緯度で統一してある)。
+//
+// タイルごとに持つもの: 地形・道路・建物・電柱・信号・バス停・店舗看板・
+//                       公園(面/木/遊具)・シーサー
+// 世界に1つのもの:     モノレール線形と列車・バス経路と車両・歩行者・
+//                       市議会マーカー(council.json は最初からワールド座標)
+const TILE = 1000;                 // タイル1辺(m)
+const HALF = TILE / 2;
+const tiles = new Map();           // "tx,tz" -> タイル
 
-/** 世界座標(x,z) の地表標高。グリッドを双一次補間する。 */
+/** タイルの JSON の場所。 */
+function tileUrl(tx, tz) {
+  // tiles/t_0_0.json は --parks 以前の生成物なので、公園を持つ world.json を
+  // タイル(0,0)の中身として使う。41タイルを作り直したら差し替える。
+  return (tx === 0 && tz === 0)
+    ? './data/world.json' : `./data/tiles/t_${tx}_${tz}.json`;
+}
+
+/** タイルを読んで登録簿に入れる(まだ何も建てない)。 */
+async function fetchTile(tx, tz) {
+  const key = `${tx},${tz}`;
+  if (tiles.has(key)) return tiles.get(key);
+  const data = await fetch(tileUrl(tx, tz)).then((r) => {
+    if (!r.ok) throw new Error(`タイル ${key} が読めません (${r.status})`);
+    return r.json();
+  });
+  const [offX, offZ] = data.meta.offset ?? [0, 0];
+  const t = {
+    key, tx, tz, data, offX, offZ,
+    n: data.meta.n, cell: data.meta.cell, terrain: data.terrain,
+    group: new THREE.Group(),      // このタイルの描画物。破棄はここを畳めばよい
+    X: (v) => v - HALF + offX,     // タイル内座標 -> ワールド座標
+    Z: (v) => v - HALF + offZ,
+  };
+  tiles.set(key, t);
+  return t;
+}
+
+/** (x,z) を含むタイル。読み込んでいなければ null。 */
+function tileOf(x, z) {
+  return tiles.get(`${Math.round(x / TILE)},${Math.round(z / TILE)}`) ?? null;
+}
+
+/** 読み込み済みタイルが覆う範囲 {minx,maxx,minz,maxz}。移動の制限と地図に使う。 */
+function worldBounds() {
+  let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
+  for (const t of tiles.values()) {
+    minx = Math.min(minx, t.offX - HALF); maxx = Math.max(maxx, t.offX + HALF);
+    minz = Math.min(minz, t.offZ - HALF); maxz = Math.max(maxz, t.offZ + HALF);
+  }
+  return { minx, maxx, minz, maxz };
+}
+
+/** 世界座標(x,z) の地表標高。そのタイルのグリッドを双一次補間する。 */
 function groundAt(x, z) {
-  const fx = Math.min(n - 1.001, Math.max(0, (x + HALF) / cell));
-  const fz = Math.min(n - 1.001, Math.max(0, (z + HALF) / cell));
-  const i = fx | 0, j = fz | 0, tx = fx - i, tz = fz - j;
+  let t = tileOf(x, z);
+  if (!t) {
+    // タイルの外。いちばん近いタイルの縁の値で埋める(穴を開けない)
+    let bd = Infinity;
+    for (const q of tiles.values()) {
+      const d = Math.hypot(q.offX - x, q.offZ - z);
+      if (d < bd) { bd = d; t = q; }
+    }
+    if (!t) return 0;
+  }
+  const { terrain, n, cell } = t;
+  const fx = Math.min(n - 1.001, Math.max(0, (x - t.offX + HALF) / cell));
+  const fz = Math.min(n - 1.001, Math.max(0, (z - t.offZ + HALF) / cell));
+  const i = fx | 0, j = fz | 0, sx = fx - i, sz = fz - j;
   const a = terrain[i * n + j],       b = terrain[(i + 1) * n + j];
   const c = terrain[i * n + j + 1],   d = terrain[(i + 1) * n + j + 1];
-  return (a * (1 - tx) + b * tx) * (1 - tz) + (c * (1 - tx) + d * tx) * tz;
+  return (a * (1 - sx) + b * sx) * (1 - sz) + (c * (1 - sx) + d * sx) * sz;
 }
+
+// いま読むタイル。既定は1枚(=従来と同じ1km四方)。
+// tiles/*.json は .gitignore してあり公開物には含まれないので、
+// 複数タイルは手元で `?tiles=0,0;-1,0` のように指定して試す。
+const TILE_LIST = (qs.get('tiles') || '0,0').split(';')
+  .map((s) => s.split(',').map(Number))
+  .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b));
+for (const [tx, tz] of TILE_LIST) await fetchTile(tx, tz);
+const tile0 = tiles.get('0,0') ?? tiles.values().next().value;
+// モノレール・駅・バス経路・歩道はまだタイル(0,0)のデータを使う
+// (corridor.json への切り替えは次の段)。
+const world = tile0.data;
+const wx = tile0.X, wz = tile0.Z;
 
 // ---------------------------------------------------------------- 3D基盤
 const scene = new THREE.Scene();
@@ -141,22 +216,27 @@ function hashRemove(map, pred) {
 // 高さは持たない(一律0)ため平面として扱い、地面テクスチャに焼いて地形へ伏せる。
 const rstore = [];
 const rmap = new Map();
-{
-  for (const r of world.roads ?? []) {
+
+/** タイル t の道路面を当たり判定と地面テクスチャ用に登録する。 */
+function addRoads(t) {
+  let count = 0;
+  for (const r of t.data.roads ?? []) {
     const f = r.f, m = f.length / 2;
     const ring = new Array(m);
     let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
     for (let i = 0; i < m; i++) {
-      const x = f[i * 2] - HALF, z = f[i * 2 + 1] - HALF;
+      const x = t.X(f[i * 2]), z = t.Z(f[i * 2 + 1]);
       ring[i] = new THREE.Vector2(x, z);
       if (x < minx) minx = x; if (x > maxx) maxx = x;
       if (z < minz) minz = z; if (z > maxz) maxz = z;
     }
-    const rec = { ring, minx, maxx, minz, maxz };
+    // tile を持たせておくと、タイル破棄のとき filter 一発で外せる
+    const rec = { ring, minx, maxx, minz, maxz, tile: t.key };
     rstore.push(rec);
     hashInsert(rmap, rec);
+    count++;
   }
-  console.log(`道路面 ${rstore.length}`);
+  console.log(`[${t.key}] 道路面 ${count}`);
 }
 
 /** (x,z) が道路面の上か。シーサーの設置場所選びに使う。 */
@@ -194,20 +274,24 @@ function roadPath(ctx, toX, toZ) {
  * 私道・路地は密度から弱く推定して補う。
  * bstore / rstore に依存するので建物と道路を組み立てたあとに呼ぶこと。
  */
-function groundTexture() {
+function groundTexture(t) {
   const W = TOUCH ? 1024 : 2048;   // 生成は素のJSループなので端末に合わせる
-  const s = W / size;                       // px / m
+  const s = W / TILE;                       // px / m
+  // ワールド座標 -> このタイルの canvas 画素。範囲外は canvas 側で切られる。
+  const pxX = (x) => (x - t.offX + HALF) * s;
+  const pxZ = (z) => (z - t.offZ + HALF) * s;
   const lot = document.createElement('canvas'); lot.width = lot.height = W;
   const lg = lot.getContext('2d', { willReadFrequently: true });
   lg.fillStyle = '#000'; lg.fillRect(0, 0, W, W);
   lg.fillStyle = lg.strokeStyle = '#fff';
   lg.lineJoin = 'round';
   lg.lineWidth = 4.5 * s;                   // 建物の外側 2.25m までを敷地とみなす
+  // 隣のタイルの建物も焼く(縁で敷地色が切れないように)。範囲外は canvas が切る
   for (const b of bstore) {
     lg.beginPath();
-    lg.moveTo((b.ring[0].x + HALF) * s, (b.ring[0].y + HALF) * s);
+    lg.moveTo(pxX(b.ring[0].x), pxZ(b.ring[0].y));
     for (let i = 1; i < b.ring.length; i++) {
-      lg.lineTo((b.ring[i].x + HALF) * s, (b.ring[i].y + HALF) * s);
+      lg.lineTo(pxX(b.ring[i].x), pxZ(b.ring[i].y));
     }
     lg.closePath(); lg.fill(); lg.stroke();
   }
@@ -222,7 +306,7 @@ function groundTexture() {
   const rg = rd.getContext('2d', { willReadFrequently: true });
   rg.fillStyle = '#000'; rg.fillRect(0, 0, W, W);
   rg.fillStyle = '#fff';
-  roadPath(rg, (x) => (x + HALF) * s, (z) => (z + HALF) * s);
+  roadPath(rg, pxX, pxZ);
   rg.fill();
 
   const rds = document.createElement('canvas'); rds.width = rds.height = W;
@@ -236,15 +320,14 @@ function groundTexture() {
   const wg = wk.getContext('2d', { willReadFrequently: true });
   wg.fillStyle = '#000'; wg.fillRect(0, 0, W, W);
   wg.lineCap = 'round'; wg.lineJoin = 'round';
-  const toPx = (v) => (v + HALF) * s;
   const strokeWays = (kinds, widthM, style) => {
     wg.strokeStyle = style;
     wg.lineWidth = widthM * s;
-    for (const f of world.footways ?? []) {
+    for (const f of t.data.footways ?? []) {
       if (!kinds.includes(f.k)) continue;
       wg.beginPath();
       for (let i = 0; i < f.f.length; i += 2) {
-        const x = toPx(f.f[i] - HALF), z = toPx(f.f[i + 1] - HALF);
+        const x = pxX(t.X(f.f[i])), z = pxZ(t.Z(f.f[i + 1]));
         i ? wg.lineTo(x, z) : wg.moveTo(x, z);
       }
       wg.stroke();
@@ -260,11 +343,11 @@ function groundTexture() {
   const pk = document.createElement('canvas'); pk.width = pk.height = W;
   const pg = pk.getContext('2d', { willReadFrequently: true });
   pg.fillStyle = '#000'; pg.fillRect(0, 0, W, W);
-  for (const p of world.parks ?? []) {
+  for (const p of t.data.parks ?? []) {
     pg.fillStyle = p.k === 'pitch' ? '#0f0' : '#f00';
     pg.beginPath();
     for (let i = 0; i < p.f.length; i += 2) {
-      const x = toPx(p.f[i] - HALF), z = toPx(p.f[i + 1] - HALF);
+      const x = pxX(t.X(p.f[i])), z = pxZ(t.Z(p.f[i + 1]));
       i ? pg.lineTo(x, z) : pg.moveTo(x, z);
     }
     pg.closePath(); pg.fill();
@@ -322,28 +405,28 @@ function groundTexture() {
   lg.lineCap = 'butt';
   lg.strokeStyle = 'rgba(238,236,228,0.82)';
   lg.lineWidth = 0.42 * s;
-  for (const f of world.footways ?? []) {
+  for (const f of t.data.footways ?? []) {
     if (f.k !== 'crossing') continue;
     for (let i = 0; i + 3 < f.f.length; i += 2) {
-      const ax = f.f[i] - HALF, az = f.f[i + 1] - HALF;
-      const bx = f.f[i + 2] - HALF, bz = f.f[i + 3] - HALF;
+      const ax = t.X(f.f[i]), az = t.Z(f.f[i + 1]);
+      const bx = t.X(f.f[i + 2]), bz = t.Z(f.f[i + 3]);
       let dx = bx - ax, dz = bz - az;
       const L = Math.hypot(dx, dz) || 1;
       dx /= L; dz /= L;
       const px = dz, pz = -dx;                    // 進行方向に直交する向き
       for (let o = -2.2; o <= 2.2; o += 0.9) {    // 縞を横に並べる
         lg.beginPath();
-        lg.moveTo(toPx(ax + px * o), toPx(az + pz * o));
-        lg.lineTo(toPx(bx + px * o), toPx(bz + pz * o));
+        lg.moveTo(pxX(ax + px * o), pxZ(az + pz * o));
+        lg.lineTo(pxX(bx + px * o), pxZ(bz + pz * o));
         lg.stroke();
       }
     }
   }
 
-  const t = new THREE.CanvasTexture(lot);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = MAXANISO;
-  return t;
+  const tex = new THREE.CanvasTexture(lot);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = MAXANISO;
+  return tex;
 }
 
 /** 1枚テクスチャは 0.5m/px しかないので、足元用に細かい明暗を別途重ねる。 */
@@ -369,7 +452,8 @@ function detailTexture() {
 const bmap = new Map();          // 空間ハッシュ: "gx,gz" -> [建物レコードの参照]
 const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,maxx,minz,maxz}
 
-{
+/** タイル t の建物を1つの BufferGeometry に詰めて建てる。 */
+function addBuildings(t) {
   // 壁と屋根は別マテリアルにしたいので、頂点を2群に分けてから連結する
   const WV = [], WC = [], WU = [], RV = [], RC = [], RU = [];
   const wall = new THREE.Color(), roof = new THREE.Color();
@@ -378,7 +462,7 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
 
   // 駅の位置を含む建物は、この後ホーム・階段を自前で建てるので除く。
   // PLATEAU の駅舎は中身のない箱なので、残すとホームが壁の中に閉じ込められる。
-  const stationPts = (world.stations ?? []).map((s) => [s.x - HALF, s.z - HALF]);
+  const stationPts = (t.data.stations ?? []).map((s) => [t.X(s.x), t.Z(s.z)]);
   const inRing = (ring, x, z) => {
     let inside = false;
     for (let k = 0, l = ring.length - 1; k < ring.length; l = k++) {
@@ -390,12 +474,12 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
   };
   let skipped = 0;
 
-  for (const b of world.buildings) {
+  for (const b of t.data.buildings) {
     const f = b.f, m = f.length / 2;
     const ring = new Array(m);
     let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
     for (let i = 0; i < m; i++) {
-      const x = f[i * 2] - HALF, z = f[i * 2 + 1] - HALF;
+      const x = t.X(f[i * 2]), z = t.Z(f[i * 2 + 1]);
       ring[i] = new THREE.Vector2(x, z);
       if (x < minx) minx = x; if (x > maxx) maxx = x;
       if (z < minz) minz = z; if (z > maxz) maxz = z;
@@ -414,8 +498,8 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
     const top = b.b + b.h;
 
     // 沖縄のRC造をイメージした白〜生成りの外壁。棟ごとに少し振る
-    const t = (Math.sin(minx * 0.37 + minz * 0.71) * 0.5 + 0.5);
-    wall.setHSL(0.09 + t * 0.05, 0.10 + t * 0.10, 0.56 + t * 0.16);
+    const tone = (Math.sin(minx * 0.37 + minz * 0.71) * 0.5 + 0.5);
+    wall.setHSL(0.09 + tone * 0.05, 0.10 + tone * 0.10, 0.56 + tone * 0.16);
     // 低層の一部は赤瓦屋根に(俯瞰したときの沖縄らしさ)
     const tile = Math.sin(minx * 1.13 - minz * 0.61) * 0.5 + 0.5;
     if (b.h < 9.5 && tile < 0.38) roof.setHSL(0.045, 0.44, 0.36 + tile * 0.18);
@@ -440,7 +524,7 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
     }
 
     // 当たり判定用の登録
-    const rec = { ring, minx, maxx, minz, maxz, top };
+    const rec = { ring, minx, maxx, minz, maxz, top, tile: t.key };
     bstore.push(rec);
     hashInsert(bmap, rec);
   }
@@ -458,8 +542,8 @@ const bstore = [];               // 当たり判定用 {ring:[x,z,...], minx,max
     new THREE.MeshLambertMaterial({ vertexColors: true }),
   ]);
   mesh.castShadow = mesh.receiveShadow = true;
-  scene.add(mesh);
-  console.log(`建物 ${world.buildings.length} 棟(駅舎 ${skipped} 棟は除外) / ` +
+  t.group.add(mesh);
+  console.log(`[${t.key}] 建物 ${t.data.buildings.length} 棟(駅舎 ${skipped} 棟は除外) / ` +
     `壁 ${nWall} + 屋根 ${RV.length / 3} 頂点`);
 }
 
@@ -488,7 +572,7 @@ function buildMonorail() {
   for (const flat of world.rail ?? []) {
     // 8m 間隔に打ち直す(元データは頂点が疎で、地形に沿わせるため)
     const raw = [];
-    for (let i = 0; i < flat.length; i += 2) raw.push([flat[i] - HALF, flat[i + 1] - HALF]);
+    for (let i = 0; i < flat.length; i += 2) raw.push([wx(flat[i]), wz(flat[i + 1])]);
     const pts = [];
     for (let i = 0; i < raw.length - 1; i++) {
       const [ax, az] = raw[i], [bx, bz] = raw[i + 1];
@@ -543,7 +627,7 @@ function buildMonorail() {
       if (path.cum[i] < next) continue;
       next = path.cum[i] + PIER_EVERY;
       const [x, z] = pts[i];
-      if (Math.abs(x) > HALF - 2 || Math.abs(z) > HALF - 2) continue;
+      if (!tileOf(x, z)) continue;             // 読み込み済みタイルの上だけ
       const g = groundAt(x, z);
       const h = y[i] - BEAM_T / 2 - g;
       if (h < 1) continue;
@@ -654,52 +738,63 @@ function distToBuilding(x, z, max = 20) {
   return best;
 }
 
-{
+// 細かいノイズは全タイルで共用する(1枚を繰り返し貼るだけなので)
+let detailMap = null;
+
+/** タイル t の地形メッシュ。地面テクスチャは建物・道路の後でないと焼けない。 */
+function addTerrain(t) {
   // UVは PlaneGeometry の既定(u=東 0→1, v=北で1)。groundTexture の画素配置と一致する。
-  const geo = new THREE.PlaneGeometry(size, size, n - 1, n - 1);
+  const { n, cell } = t;
+  const geo = new THREE.PlaneGeometry(TILE, TILE, n - 1, n - 1);
   geo.rotateX(-Math.PI / 2);   // 頂点順: ix が東(+X)、iz が南(+Z)
   const pos = geo.attributes.position;
   for (let iz = 0; iz < n; iz++) {
-    for (let ix = 0; ix < n; ix++) pos.setY(iz * n + ix, terrain[ix * n + iz]);
+    for (let ix = 0; ix < n; ix++) pos.setY(iz * n + ix, t.terrain[ix * n + iz]);
   }
   geo.computeVertexNormals();
-  const gmat = new THREE.MeshLambertMaterial({ map: groundTexture() });
+  const gmat = new THREE.MeshLambertMaterial({ map: groundTexture(t) });
   // 近景がぼけないよう、地面のUVを何度も繰り返す細かいノイズを乗算する
-  const detail = detailTexture();
+  detailMap ??= detailTexture();
   gmat.onBeforeCompile = (sh) => {
-    sh.uniforms.detailMap = { value: detail };
+    sh.uniforms.detailMap = { value: detailMap };
     sh.fragmentShader = 'uniform sampler2D detailMap;\n' + sh.fragmentShader.replace(
       '#include <map_fragment>',
       `#include <map_fragment>
-       diffuseColor.rgb *= texture2D(detailMap, vMapUv * ${(size / 3).toFixed(1)}).rgb;`
+       diffuseColor.rgb *= texture2D(detailMap, vMapUv * ${(TILE / 3).toFixed(1)}).rgb;`
     );
   };
   const ground = new THREE.Mesh(geo, gmat);
+  // 地形の頂点Yは標高そのものなので、載せるのは水平位置だけ
+  ground.position.set(t.offX, 0, t.offZ);
   ground.receiveShadow = true;
-  scene.add(ground);
+  t.group.add(ground);
+  console.log(`[${t.key}] 地形 ${n}×${n} (${cell}m格子)`);
+}
 
-  // 1km四方の外側。端が崖に見えないよう、平均標高の広い受け皿を敷く
+// タイルの外側。端が崖に見えないよう、平均標高の広い受け皿を敷く(世界に1枚)
+{
   const skirt = new THREE.Mesh(
     new THREE.CircleGeometry(4000, 48),
     new THREE.MeshLambertMaterial({ color: 0x7d9159 })
   );
   skirt.rotation.x = -Math.PI / 2;
-  skirt.position.y = (world.meta.minZ + world.meta.maxZ) / 2 - 6;
+  skirt.position.y = (tile0.data.meta.minZ + tile0.data.meta.maxZ) / 2 - 6;
   scene.add(skirt);
 }
 
 // ---------------------------------------------------------------- 電柱
 // 垂直の目印が無いと街の奥行きが読めないので、道路際とおぼしき所に立てる
-{
+function addPoles(t) {
   const spots = [];
-  for (let x = -HALF + 25; x < HALF - 25; x += 17) {
-    for (let z = -HALF + 25; z < HALF - 25; z += 17) {
+  for (let x = t.offX - HALF + 25; x < t.offX + HALF - 25; x += 17) {
+    for (let z = t.offZ - HALF + 25; z < t.offZ + HALF - 25; z += 17) {
       const jx = x + Math.sin(x * 0.7 + z) * 5.5;   // 機械的な等間隔を崩す
       const jz = z + Math.cos(z * 0.9 - x) * 5.5;
       const d = distToBuilding(jx, jz, 12);
       if (d > 3.2 && d < 6.8) spots.push([jx, jz]);
     }
   }
+  if (!spots.length) return;
   const geoP = new THREE.CylinderGeometry(0.13, 0.17, 9.5, 6);
   geoP.translate(0, 4.75, 0);
   const poles = new THREE.InstancedMesh(
@@ -711,8 +806,8 @@ function distToBuilding(x, z, max = 20) {
     poles.setMatrixAt(i, m4);
   });
   poles.castShadow = true;
-  scene.add(poles);
-  console.log(`電柱 ${spots.length} 本`);
+  t.group.add(poles);
+  console.log(`[${t.key}] 電柱 ${spots.length} 本`);
 }
 
 // ---------------------------------------------------------------- シーサー
@@ -768,16 +863,17 @@ let seed = 20260805;
 const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
 const seesaa = [];
 
-/** 道路面の上から、互いに離れた設置点を選ぶ(道沿いに立つので必ず辿り着ける)。 */
-function roadSpots(want) {
+/** タイル t の道路面から、互いに離れた設置点を選ぶ(道沿いなので必ず辿り着ける)。 */
+function roadSpots(t, want) {
   const cand = [];
   for (const r of rstore) {
+    if (r.tile !== t.key) continue;
     let cx = 0, cz = 0;
     for (const p of r.ring) { cx += p.x; cz += p.y; }
     cx /= r.ring.length; cz /= r.ring.length;
-    const d = Math.hypot(cx, cz);
+    const d = Math.hypot(cx - t.offX, cz - t.offZ);  // タイル中心からの距離
     if (d < 50 || d > 400) continue;                 // 近すぎ・遠すぎを除く
-    if (Math.abs(cx) > HALF - 30 || Math.abs(cz) > HALF - 30) continue;
+    if (Math.abs(cx - t.offX) > HALF - 30 || Math.abs(cz - t.offZ) > HALF - 30) continue;
     if (!onRoad(cx, cz)) continue;                   // 凹多角形の重心は外に出うる
     if (blocked(cx, cz, 2.4)) continue;              // 台座ぶんの余裕をとる
     cand.push([cx, cz]);
@@ -799,28 +895,64 @@ function roadSpots(want) {
   return out;
 }
 
-const spots = roadSpots(N_SEESAA);
-for (let i = 0; i < N_SEESAA; i++) {
-  let placed = spots[i] ?? null;
-  if (!placed) {                                     // 道路が無い区画向けの保険
-    const ang = (i / N_SEESAA) * Math.PI * 2 + rnd() * 0.55;
-    for (let tries = 0; tries < 260 && !placed; tries++) {
-      const rad = 55 + rnd() * 330;
-      const x = Math.cos(ang + (rnd() - 0.5) * 0.5) * rad;
-      const z = Math.sin(ang + (rnd() - 0.5) * 0.5) * rad;
-      if (Math.abs(x) > HALF - 30 || Math.abs(z) > HALF - 30) continue;
-      if (!blocked(x, z, 2.4)) placed = [x, z];
+/** タイル t にシーサーを散らす。 */
+function addSeesaa(t) {
+  const spots = roadSpots(t, N_SEESAA);
+  let n = 0;
+  for (let i = 0; i < N_SEESAA; i++) {
+    let placed = spots[i] ?? null;
+    if (!placed) {                                   // 道路が無い区画向けの保険
+      const ang = (i / N_SEESAA) * Math.PI * 2 + rnd() * 0.55;
+      for (let tries = 0; tries < 260 && !placed; tries++) {
+        const rad = 55 + rnd() * 330;
+        const x = t.offX + Math.cos(ang + (rnd() - 0.5) * 0.5) * rad;
+        const z = t.offZ + Math.sin(ang + (rnd() - 0.5) * 0.5) * rad;
+        if (Math.abs(x - t.offX) > HALF - 30 || Math.abs(z - t.offZ) > HALF - 30) continue;
+        if (!blocked(x, z, 2.4)) placed = [x, z];
+      }
     }
+    if (!placed) continue;
+    const [x, z] = placed;
+    const g = makeSeesaa();
+    g.position.set(x, groundAt(x, z), z);
+    g.rotation.y = rnd() * Math.PI * 2;  // 以降 tick でゆっくり回る(どの向きから来ても顔が見える)
+    g.userData.taken = false;
+    t.group.add(g);
+    seesaa.push(g);
+    n++;
   }
-  if (!placed) continue;
-  const [x, z] = placed;
-  const g = makeSeesaa();
-  g.position.set(x, groundAt(x, z), z);
-  g.rotation.y = rnd() * Math.PI * 2;   // 以降 tick でゆっくり回る(どの向きから来ても顔が見える)
-  g.userData.taken = false;
-  scene.add(g);
-  seesaa.push(g);
+  console.log(`[${t.key}] シーサー ${n} 体`);
 }
+
+// ---------------------------------------------------------------- タイルを建てる
+// 2段に分かれているのは、後半で使う入れ物(busSigns / shopSigns / signals など)が
+// ファイルの下の方で宣言されているため。順序そのものに意味があるのは
+//   道路・建物 → 地形(ここで地面テクスチャを焼く) → addSolid を使うもの
+// の3点だけで、README の「addSolid は groundTexture より後」を守っている。
+
+/** タイル t の地形と、当たり判定に関わるものを建てる(道路・建物は登録済み)。 */
+function buildTileCore(t) {
+  addTerrain(t);        // 地面テクスチャは道路・建物の後でないと焼けない
+  addPoles(t);
+  addSeesaa(t);         // 木より先に置く(幹が固体になると設置点が減るため)
+  scene.add(t.group);
+}
+
+/** タイル t の付属物(当たり判定に影響しないもの)を建てる。 */
+function buildTileProps(t) {
+  addBusStops(t);
+  addSignals(t);
+  addShopSigns(t);
+  const playSites = playSitesOf(t);
+  addTrees(t, playSites);   // 幹は addSolid で固体にする(groundTexture の後)
+  addPlayground(t, playSites);
+}
+
+// 道路・建物を全タイルぶん先に入れてから地形を焼くと、隣のタイルの建物が
+// 縁の敷地色に効いて継ぎ目が目立たない。なので2周に分ける。
+for (const t of tiles.values()) { addRoads(t); addBuildings(t); }
+for (const t of tiles.values()) buildTileCore(t);
+const BOUNDS = worldBounds();
 
 // ---------------------------------------------------------------- 城東小の目印
 {
@@ -977,7 +1109,7 @@ function buildPlatform(q) {
 
 // 駅(ホーム＋屋根＋駅名)。線形上のいちばん近い点に合わせて向きを決める
 for (const st of world.stations ?? []) {
-  const sx = st.x - HALF, sz = st.z - HALF;
+  const sx = wx(st.x), sz = wz(st.z);
   let best = null;
   for (const p of railPaths) {
     for (let d = 0; d <= p.len; d += 4) {
@@ -1003,8 +1135,8 @@ for (const st of world.stations ?? []) {
 // 出典は OpenStreetMap(ODbL)。国土数値情報のバス停(P11)は「非商用」区分で
 // 複製物の再配布が禁止なので、公開物には使えない。
 const busSigns = [];
-{
-  const stops = world.bus ?? [];
+function addBusStops(t) {
+  const stops = t.data.bus ?? [];
   if (stops.length) {
     // 支柱はまとめて1ドローコール
     const poleGeo = new THREE.CylinderGeometry(0.055, 0.07, 2.75, 6);
@@ -1017,7 +1149,7 @@ const busSigns = [];
     const m = new THREE.Matrix4();
 
     stops.forEach((s, i) => {
-      const x = s.x - HALF, z = s.z - HALF;
+      const x = t.X(s.x), z = t.Z(s.z);
       const g = groundAt(x, z);
       m.makeTranslation(x, g + 1.38, z);
       poles.setMatrixAt(i, m);
@@ -1046,14 +1178,14 @@ const busSigns = [];
       }));
       sp.scale.set(3.9, 1.3, 1);
       sp.position.set(x, g + 3.1, z);
-      scene.add(sp);
+      t.group.add(sp);
       busSigns.push(sp);
     });
     poles.instanceMatrix.needsUpdate = true;
     bases.instanceMatrix.needsUpdate = true;
     poles.castShadow = bases.castShadow = true;
-    scene.add(poles, bases);
-    console.log(`バス停 ${stops.length}基`);
+    t.group.add(poles, bases);
+    console.log(`[${t.key}] バス停 ${stops.length}基`);
   }
 }
 
@@ -1108,26 +1240,29 @@ const councilPosts = [];
 // leisure=park で登録され playground が付かない)ので、児童公園サイズの
 // park も対象にする。広すぎる公園の真ん中に遊具1組だけ置いても嘘になるので
 // 上限を切る。
-const playSites = [];
-for (const p of world.parks ?? []) {
-  if (p.k !== 'playground' && p.k !== 'park') continue;
-  let cx = 0, cz = 0, a2 = 0;
-  const m = p.f.length / 2;
-  const pts = [];
-  for (let i = 0; i < p.f.length; i += 2) {
-    const x = p.f[i] - HALF, z = p.f[i + 1] - HALF;
-    pts.push([x, z]); cx += x; cz += z;
+function playSitesOf(t) {
+  const out = [];
+  for (const p of t.data.parks ?? []) {
+    if (p.k !== 'playground' && p.k !== 'park') continue;
+    let cx = 0, cz = 0, a2 = 0;
+    const m = p.f.length / 2;
+    const pts = [];
+    for (let i = 0; i < p.f.length; i += 2) {
+      const x = t.X(p.f[i]), z = t.Z(p.f[i + 1]);
+      pts.push([x, z]); cx += x; cz += z;
+    }
+    for (let i = 0; i < pts.length; i++) {
+      const [x, z] = pts[i], [nx, nz] = pts[(i + 1) % pts.length];
+      a2 += x * nz - nx * z;
+    }
+    const area = Math.abs(a2) / 2;
+    cx /= m; cz /= m;
+    if (p.k === 'park' && (area < 260 || area > 2600)) continue;
+    if (Math.abs(cx - t.offX) > HALF - 6 || Math.abs(cz - t.offZ) > HALF - 6) continue;
+    if (blocked(cx, cz, 3.0)) continue;          // 建物に埋まる場所は避ける
+    out.push([cx, cz]);
   }
-  for (let i = 0; i < pts.length; i++) {
-    const [x, z] = pts[i], [nx, nz] = pts[(i + 1) % pts.length];
-    a2 += x * nz - nx * z;
-  }
-  const area = Math.abs(a2) / 2;
-  cx /= m; cz /= m;
-  if (p.k === 'park' && (area < 260 || area > 2600)) continue;
-  if (Math.abs(cx) > HALF - 6 || Math.abs(cz) > HALF - 6) continue;
-  if (blocked(cx, cz, 3.0)) continue;            // 建物に埋まる場所は避ける
-  playSites.push([cx, cz]);
+  return out;
 }
 
 // ---------------------------------------------------------------- 公園の木
@@ -1136,12 +1271,12 @@ for (const p of world.parks ?? []) {
 // グラウンド(pitch)には生やさない。競技面に木が立つと嘘になる。
 // 幹だけ addSolid で固体にする(樹冠まで固くすると枝の下を歩けない)。
 // 地面テクスチャは既に焼き終わっているので、ここで足しても敷地色にはならない。
-{
+function addTrees(t, playSites) {
   const spots = [];
-  for (const p of world.parks ?? []) {
+  for (const p of t.data.parks ?? []) {
     if (p.k === 'pitch') continue;
     const pts = [];
-    for (let i = 0; i < p.f.length; i += 2) pts.push([p.f[i] - HALF, p.f[i + 1] - HALF]);
+    for (let i = 0; i < p.f.length; i += 2) pts.push([t.X(p.f[i]), t.Z(p.f[i + 1])]);
     if (pts.length < 3) continue;
     let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity, a2 = 0;
     for (let i = 0; i < pts.length; i++) {
@@ -1163,7 +1298,7 @@ for (const p of world.parks ?? []) {
     for (let k = 0, guard = 0; k < want && guard < want * 40; guard++) {
       const x = minx + Math.random() * (maxx - minx);
       const z = minz + Math.random() * (maxz - minz);
-      if (Math.abs(x) > HALF - 5 || Math.abs(z) > HALF - 5) continue;
+      if (Math.abs(x - t.offX) > HALF - 5 || Math.abs(z - t.offZ) > HALF - 5) continue;
       if (!inside(x, z)) continue;
       if (blocked(x, z, 2.2)) continue;          // 建物際は避ける
       if (onRoad(x, z)) continue;                // 園内の車路も避ける
@@ -1201,8 +1336,8 @@ for (const p of world.parks ?? []) {
       addSolid(x, z, 0.55, 0.55, 0, y + h);      // 幹だけ固体にする
     });
     trunks.castShadow = leaves.castShadow = leaves.receiveShadow = true;
-    scene.add(trunks); scene.add(leaves);
-    console.log(`公園の木 ${spots.length} 本`);
+    t.group.add(trunks); t.group.add(leaves);
+    console.log(`[${t.key}] 公園の木 ${spots.length} 本`);
   }
 }
 
@@ -1210,7 +1345,7 @@ for (const p of world.parks ?? []) {
 // 滑り台とブランコを1組ずつ置く。数が少ないので InstancedMesh にはしない。
 // 当たり判定には入れない(すり抜けても実害が無く、細い支柱を固体にすると
 // 園内で引っかかって歩きにくくなるため)。
-{
+function addPlayground(t, playSites) {
   const mk = (w, h, d, color) => new THREE.Mesh(
     new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color }));
   let n = 0;
@@ -1243,9 +1378,9 @@ for (const p of world.parks ?? []) {
       }
     }
     for (const o of g.children) o.castShadow = true;
-    scene.add(g); n++;
+    t.group.add(g); n++;
   }
-  if (n) console.log(`遊具 ${n}組`);
+  if (n) console.log(`[${t.key}] 遊具 ${n}組`);
 }
 
 // ---------------------------------------------------------------- 店舗の看板
@@ -1269,20 +1404,21 @@ const SHOP_CATS = [
   ['他', 0x9aa3a6, []],
 ];
 const shopSigns = [];
-{
+function addShopSigns(t) {
   const skip = new Set(['school', 'library', 'community_centre', 'townhall',
     'fire_station', 'parking', 'bicycle_rental', 'shelter', 'bench', 'toilets',
     'waste_basket', 'vending_machine', 'post_box', 'drinking_water',
     'kindergarten', 'social_facility', 'place_of_worship', 'train_station']);
   const catOf = (v) => SHOP_CATS.find((c) => c[2].includes(v)) ?? SHOP_CATS.at(-1);
 
-  for (const l of world.landmarks ?? []) {
+  let n = 0;
+  for (const l of t.data.landmarks ?? []) {
     const [key, val] = (l.kind || '').split('=');
     if (!['shop', 'amenity', 'office', 'craft', 'healthcare',
           'leisure'].includes(key)) continue;
     if (skip.has(val)) continue;
     const [mark, color] = catOf(val);
-    const x = l.x - HALF, z = l.z - HALF;
+    const x = t.X(l.x), z = t.Z(l.z);
 
     const cv = document.createElement('canvas');
     cv.width = 384; cv.height = 96;
@@ -1312,10 +1448,11 @@ const shopSigns = [];
     sp.scale.set(5.2, 1.3, 1);
     sp.position.set(x, supportY(x, z) + 2.4, z);
     sp.visible = false;
-    scene.add(sp);
+    t.group.add(sp);
     shopSigns.push(sp);
+    n++;
   }
-  console.log(`店舗 ${shopSigns.length}件`);
+  console.log(`[${t.key}] 店舗 ${n}件`);
 }
 
 // ---------------------------------------------------------------- 歩行者
@@ -1335,7 +1472,7 @@ const walkLines = [];
   for (const f of world.footways ?? []) {
     if (f.k !== 'sidewalk' && f.k !== 'path') continue;
     const pts = [];
-    for (let i = 0; i < f.f.length; i += 2) pts.push({ x: f.f[i] - HALF, z: f.f[i + 1] - HALF });
+    for (let i = 0; i < f.f.length; i += 2) pts.push({ x: wx(f.f[i]), z: wz(f.f[i + 1]) });
     if (pts.length < 2) continue;
     const cum = [0];
     let len = 0;
@@ -1439,69 +1576,76 @@ function respawnPed(p) {
 // 灯火は InstancedMesh の per-instance color を書き換えるだけなので描画は1回。
 const SIG_GREEN = 9, SIG_YELLOW = 2.5, SIG_RED_GAP = 1.5;   // 各相の秒数
 const SIG_CYCLE = (SIG_GREEN + SIG_YELLOW + SIG_RED_GAP) * 2;
-const signals = world.signals ?? [];
-const sigGroups = [...new Set(signals.map((s) => s.g))];
-let sigLamps = null, sigState = [];        // 交差点ごとの現在の相
+// 交差点の番号(s.g)はタイルごとの通し番号なので、そのまま使うと離れた
+// 交差点どうしが同じ位相で一斉に変わる。タイルごとに 1000 ずつずらして通し番号にする。
+const signals = [];                        // 全タイル分。座標はワールド系
+let sigGidBase = 0;
 
 const OFF = { r: 0x3a1416, y: 0x3a3216, g: 0x14321f };
 const ON = { r: 0xff3b30, y: 0xffcc00, g: 0x2fd158 };
 
-{
-  if (signals.length) {
-    const poleMat = new THREE.MeshLambertMaterial({ color: 0x6f7679 });
-    const caseMat = new THREE.MeshLambertMaterial({ color: 0x3c4448 });
-    const poles = new THREE.InstancedMesh(
-      new THREE.CylinderGeometry(0.075, 0.1, 1, 6), poleMat, signals.length);
-    const cases = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(1, 1, 0.22), caseMat, signals.length);
-    // 灯火は1基3つ(歩行者用は上2つだけ使う)
-    sigLamps = new THREE.InstancedMesh(
-      new THREE.CircleGeometry(0.15, 12),
-      new THREE.MeshBasicMaterial({ toneMapped: false }), signals.length * 3);
-    sigLamps.instanceColor = new THREE.InstancedBufferAttribute(
-      new Float32Array(signals.length * 3 * 3), 3);
+/** タイル t の信号機。灯火はタイルごとの InstancedMesh に持たせる。 */
+function addSignals(t) {
+  const list = t.data.signals ?? [];
+  if (!list.length) return;
+  const gidBase = sigGidBase;
+  sigGidBase += 1000;
 
-    const m = new THREE.Matrix4(), q = new THREE.Quaternion();
-    const pos = new THREE.Vector3(), scl = new THREE.Vector3();
-    const e = new THREE.Euler();
+  const poleMat = new THREE.MeshLambertMaterial({ color: 0x6f7679 });
+  const caseMat = new THREE.MeshLambertMaterial({ color: 0x3c4448 });
+  const poles = new THREE.InstancedMesh(
+    new THREE.CylinderGeometry(0.075, 0.1, 1, 6), poleMat, list.length);
+  const cases = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(1, 1, 0.22), caseMat, list.length);
+  // 灯火は1基3つ(歩行者用は上2つだけ使う)
+  const lamps = new THREE.InstancedMesh(
+    new THREE.CircleGeometry(0.15, 12),
+    new THREE.MeshBasicMaterial({ toneMapped: false }), list.length * 3);
+  lamps.instanceColor = new THREE.InstancedBufferAttribute(
+    new Float32Array(list.length * 3 * 3), 3);
 
-    signals.forEach((s, i) => {
-      const x = s.x - HALF, z = s.z - HALF;
-      const g = groundAt(x, z);
-      const car = s.k === 'car';
-      const h = car ? 5.0 : 3.1;            // 車両用は高く、歩行者用は低く
-      // 支柱
-      e.set(0, 0, 0); q.setFromEuler(e);
-      pos.set(x, g + h / 2, z); scl.set(1, h, 1);
-      m.compose(pos, q, scl); poles.setMatrixAt(i, m);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion();
+  const pos = new THREE.Vector3(), scl = new THREE.Vector3();
+  const e = new THREE.Euler();
 
-      // 灯器(交差点の中心を向く)
-      e.set(0, s.r, 0); q.setFromEuler(e);
-      const cw = car ? 1.15 : 0.5, ch = car ? 0.42 : 0.78;
-      pos.set(x, g + h - 0.35, z); scl.set(cw, ch, 1);
-      m.compose(pos, q, scl); cases.setMatrixAt(i, m);
+  list.forEach((s, i) => {
+    const x = t.X(s.x), z = t.Z(s.z);
+    const g = groundAt(x, z);
+    const car = s.k === 'car';
+    const h = car ? 5.0 : 3.1;            // 車両用は高く、歩行者用は低く
+    // 支柱
+    e.set(0, 0, 0); q.setFromEuler(e);
+    pos.set(x, g + h / 2, z); scl.set(1, h, 1);
+    m.compose(pos, q, scl); poles.setMatrixAt(i, m);
 
-      // 灯火を灯器の前面に並べる(車両用は横3つ、歩行者用は縦2つ)
-      const fx = Math.sin(s.r) * 0.13, fz = Math.cos(s.r) * 0.13;
-      for (let k = 0; k < 3; k++) {
-        const li = i * 3 + k;
-        let ox = 0, oy = 0;
-        if (car) ox = (k - 1) * 0.34; else oy = k === 2 ? 0 : (k === 0 ? 0.19 : -0.19);
-        const lx = x + Math.cos(s.r) * ox + fx;
-        const lz = z - Math.sin(s.r) * ox + fz;
-        pos.set(lx, g + h - 0.35 + oy, lz);
-        scl.set(car ? 1 : (k === 2 ? 0.001 : 1), 1, 1);   // 歩行者用は3つ目を消す
-        m.compose(pos, q, scl);
-        sigLamps.setMatrixAt(li, m);
-      }
-    });
-    poles.instanceMatrix.needsUpdate = true;
-    cases.instanceMatrix.needsUpdate = true;
-    sigLamps.instanceMatrix.needsUpdate = true;
-    poles.castShadow = cases.castShadow = true;
-    scene.add(poles, cases, sigLamps);
-    console.log(`信号 ${signals.length}基 / 交差点 ${sigGroups.length}箇所`);
-  }
+    // 灯器(交差点の中心を向く)
+    e.set(0, s.r, 0); q.setFromEuler(e);
+    const cw = car ? 1.15 : 0.5, ch = car ? 0.42 : 0.78;
+    pos.set(x, g + h - 0.35, z); scl.set(cw, ch, 1);
+    m.compose(pos, q, scl); cases.setMatrixAt(i, m);
+
+    // 灯火を灯器の前面に並べる(車両用は横3つ、歩行者用は縦2つ)
+    const fx = Math.sin(s.r) * 0.13, fz = Math.cos(s.r) * 0.13;
+    for (let k = 0; k < 3; k++) {
+      let ox = 0, oy = 0;
+      if (car) ox = (k - 1) * 0.34; else oy = k === 2 ? 0 : (k === 0 ? 0.19 : -0.19);
+      const lx = x + Math.cos(s.r) * ox + fx;
+      const lz = z - Math.sin(s.r) * ox + fz;
+      pos.set(lx, g + h - 0.35 + oy, lz);
+      scl.set(car ? 1 : (k === 2 ? 0.001 : 1), 1, 1);   // 歩行者用は3つ目を消す
+      m.compose(pos, q, scl);
+      lamps.setMatrixAt(i * 3 + k, m);
+    }
+    // 灯火の書き換え先(どのメッシュの何番目か)を持たせておく
+    signals.push({ x, z, r: s.r, k: s.k, a: s.a, g: gidBase + s.g, lamps, li: i * 3 });
+  });
+  poles.instanceMatrix.needsUpdate = true;
+  cases.instanceMatrix.needsUpdate = true;
+  lamps.instanceMatrix.needsUpdate = true;
+  poles.castShadow = cases.castShadow = true;
+  t.group.add(poles, cases, lamps);
+  console.log(`[${t.key}] 信号 ${list.length}基 / ` +
+    `交差点 ${new Set(list.map((s) => s.g)).size}箇所`);
 }
 
 /** 交差点 g の、系統 axis から見た現在の灯色を返す。 */
@@ -1516,9 +1660,10 @@ function sigPhase(g, axis, t) {
 }
 
 function updateSignals(t) {
-  if (!sigLamps) return;
+  if (!signals.length) return;
   const c = new THREE.Color();
-  signals.forEach((s, i) => {
+  const dirty = new Set();
+  for (const s of signals) {
     const ph = sigPhase(s.g, s.a, t);
     // 歩行者用は青と赤の2灯(黄は赤扱い)
     const lit = s.k === 'car' ? ph : (ph === 'g' ? 'g' : 'r');
@@ -1530,11 +1675,15 @@ function updateSignals(t) {
       : [lit === 'r' ? ON.r : OFF.r, lit === 'g' ? ON.g : OFF.g, OFF.r];
     for (let k = 0; k < 3; k++) {
       c.setHex(cols[k]);
-      sigLamps.setColorAt(i * 3 + k, c);
+      s.lamps.setColorAt(s.li + k, c);
     }
-  });
-  if (sigLamps.instanceColor) sigLamps.instanceColor.needsUpdate = true;
+    dirty.add(s.lamps);
+  }
+  for (const im of dirty) if (im.instanceColor) im.instanceColor.needsUpdate = true;
 }
+
+// タイルの付属物(バス停・信号・看板・公園)。バスは信号を見るのでその前に建てる
+for (const t of tiles.values()) buildTileProps(t);
 
 // ---------------------------------------------------------------- 走るバス
 // 経路は OSM のバス路線リレーション(那覇バスの実系統)。時刻表は持たないので
@@ -1544,7 +1693,7 @@ const buses = [];
   const LIVERY = [0xf2f0ea, 0xe8642f];   // 白地にオレンジ帯(那覇バスのイメージ)
   for (const [i, r] of (world.busRoutes ?? []).entries()) {
     const pts = [];
-    for (let k = 0; k < r.f.length; k += 2) pts.push([r.f[k] - HALF, r.f[k + 1] - HALF]);
+    for (let k = 0; k < r.f.length; k += 2) pts.push([wx(r.f[k]), wz(r.f[k + 1])]);
     if (pts.length < 2) continue;
     const path = { pts: pts.map(([x, z]) => ({ x, z })), cum: [0], len: 0 };
     for (let k = 1; k < pts.length; k++) {
@@ -1557,7 +1706,7 @@ const buses = [];
     for (let d = 0; d < path.len; d += 5) {
       const q = pathAt(path, d);
       for (const b of world.bus ?? []) {
-        if (Math.hypot(b.x - HALF - q.x, b.z - HALF - q.z) < 13) {
+        if (Math.hypot(wx(b.x) - q.x, wz(b.z) - q.z) < 13) {
           if (!stops.length || d - stops[stops.length - 1] > 45) stops.push(d);
           break;
         }
@@ -1590,7 +1739,7 @@ const buses = [];
       const q = pathAt(path, d);
       for (const s of signals) {
         if (s.k !== 'car') continue;
-        if (Math.hypot(s.x - HALF - q.x, s.z - HALF - q.z) > 11) continue;
+        if (Math.hypot(s.x - q.x, s.z - q.z) > 11) continue;
         if (sigs.length && Math.abs(d - sigs[sigs.length - 1].d) < 30) break;
         // 東西に進むなら axis 0、南北なら axis 1 の系統を見る
         const axis = Math.abs(Math.sin(q.yaw)) >= Math.abs(Math.cos(q.yaw)) ? 0 : 1;
@@ -1859,7 +2008,12 @@ if (TOUCH) {
 // ---------------------------------------------------------------- ミニマップ
 const map = $('map'), mctx = map.getContext('2d');
 const MS = map.width;
-const w2m = (v) => (v + HALF) / size * MS;
+// 読み込み済みタイル全体を収める正方形に載せる(タイルが増えても縮尺だけが変わる)
+const MB = worldBounds();
+const MSPAN = Math.max(MB.maxx - MB.minx, MB.maxz - MB.minz);
+const MCX = (MB.minx + MB.maxx) / 2, MCZ = (MB.minz + MB.maxz) / 2;
+const mx = (v) => (v - MCX + MSPAN / 2) / MSPAN * MS;
+const mz = (v) => (v - MCZ + MSPAN / 2) / MSPAN * MS;
 const base = document.createElement('canvas');
 base.width = base.height = MS;
 {
@@ -1867,7 +2021,7 @@ base.width = base.height = MS;
   b.fillStyle = '#16302f'; b.fillRect(0, 0, MS, MS);
   // 道路を先に敷く(街路の骨格が見えると現在地を掴みやすい)
   b.fillStyle = 'rgba(190,205,205,.30)';
-  roadPath(b, w2m, w2m);
+  roadPath(b, mx, mz);
   b.fill();
   // モノレール(街の骨格として道路より目立たせる)
   b.strokeStyle = 'rgba(120,190,235,.85)';
@@ -1875,20 +2029,20 @@ base.width = base.height = MS;
   b.lineCap = 'round';
   for (const p of railPaths) {
     b.beginPath();
-    p.pts.forEach((q, i) => (i ? b.lineTo(w2m(q.x), w2m(q.z)) : b.moveTo(w2m(q.x), w2m(q.z))));
+    p.pts.forEach((q, i) => (i ? b.lineTo(mx(q.x), mz(q.z)) : b.moveTo(mx(q.x), mz(q.z))));
     b.stroke();
   }
   // バス停
   b.fillStyle = 'rgba(120,200,235,.9)';
   const bs = Math.max(2, 2.2 * (MS / 188));
-  for (const s of world.bus ?? []) {
-    b.fillRect(w2m(s.x - HALF) - bs / 2, w2m(s.z - HALF) - bs / 2, bs, bs);
+  for (const s of busSigns) {
+    b.fillRect(mx(s.position.x) - bs / 2, mz(s.position.z) - bs / 2, bs, bs);
   }
   b.fillStyle = 'rgba(246,243,234,.42)';
   for (const bd of bstore) {
     b.beginPath();
-    b.moveTo(w2m(bd.ring[0].x), w2m(bd.ring[0].y));
-    for (let i = 1; i < bd.ring.length; i++) b.lineTo(w2m(bd.ring[i].x), w2m(bd.ring[i].y));
+    b.moveTo(mx(bd.ring[0].x), mz(bd.ring[0].y));
+    for (let i = 1; i < bd.ring.length; i++) b.lineTo(mx(bd.ring[i].x), mz(bd.ring[i].y));
     b.closePath(); b.fill();
   }
 }
@@ -1900,16 +2054,16 @@ function drawMap() {
   mctx.drawImage(base, 0, 0);
   // 城東小
   mctx.fillStyle = '#e8642f';
-  mctx.beginPath(); mctx.arc(w2m(0), w2m(0), 3.4 * MK, 0, 7); mctx.fill();
+  mctx.beginPath(); mctx.arc(mx(0), mz(0), 3.4 * MK, 0, 7); mctx.fill();
   // シーサー
   for (const s of seesaa) {
     if (s.userData.taken) continue;
     mctx.fillStyle = '#ffc27a';
-    mctx.beginPath(); mctx.arc(w2m(s.position.x), w2m(s.position.z), 2.6 * MK, 0, 7); mctx.fill();
+    mctx.beginPath(); mctx.arc(mx(s.position.x), mz(s.position.z), 2.6 * MK, 0, 7); mctx.fill();
   }
   // 市議会の言及(未読は塗り、既読は輪郭だけ)
   for (const g of councilPosts) {
-    const x = w2m(g.position.x), z = w2m(g.position.z), r = 3.2 * MK;
+    const x = mx(g.position.x), z = mz(g.position.z), r = 3.2 * MK;
     mctx.beginPath(); mctx.arc(x, z, r, 0, 7);
     if (g.userData.read) {
       mctx.strokeStyle = '#e8642f'; mctx.lineWidth = 1.6 * MK; mctx.stroke();
@@ -1920,7 +2074,7 @@ function drawMap() {
   }
 
   // 自分(視線方向つき)
-  const px = w2m(player.x), pz = w2m(player.z);
+  const px = mx(player.x), pz = mz(player.z);
   mctx.save(); mctx.translate(px, pz); mctx.rotate(-player.yaw);
   mctx.fillStyle = '#7fe0ff';
   mctx.beginPath();
@@ -2243,8 +2397,9 @@ function tick() {
       // 軸ごとに試して壁ずりを効かせる(天端より上なら素通りできる)
       if (!blocked(player.x + mx, player.z, RADIUS, feet)) player.x += mx;
       if (!blocked(player.x, player.z + mz, RADIUS, feet)) player.z += mz;
-      player.x = Math.max(-HALF + 2, Math.min(HALF - 2, player.x));
-      player.z = Math.max(-HALF + 2, Math.min(HALF - 2, player.z));
+      // 読み込み済みタイルの外へは出さない(地形が無く落ちるため)
+      player.x = Math.max(BOUNDS.minx + 2, Math.min(BOUNDS.maxx - 2, player.x));
+      player.z = Math.max(BOUNDS.minz + 2, Math.min(BOUNDS.maxz - 2, player.z));
     }
 
     // ジャンプの長押しで飛行を切り替える(押している間に1回だけ発火)
@@ -2442,6 +2597,8 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   world, renderer, degrade, quality: () => qLevel, setFly, railPaths, railAt,
   council, councilPosts, showCouncil, buses, trainRide, bstore, sigPhase, signals,
   rmap, bmap, hashInsert, hashRemove, distToBuilding,
+  // タイル関係(検証用)
+  tiles, tileOf, worldBounds, fetchTile, buildTileCore, buildTileProps, TILE, HALF,
   // 検証用: 列車を駅に着けて長く停める
   trainToStation: (sec = 60) => {
     if (trainStopD === null) return false;
@@ -2504,8 +2661,11 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
 $('go').disabled = false;
 $('go').textContent = TOUCH ? 'タップして歩きだす' : 'クリックして歩きだす';
 // 出典表示は #credit に常設してあるので、ここは規模の説明だけにする
+// bstore はホーム・階段・木の幹も含むので、棟数はタイルのデータから数える
+const nBuildings = [...tiles.values()].reduce((s, t) => s + t.data.buildings.length, 0);
 $('meta').textContent =
-  `建物 ${world.buildings.length.toLocaleString()} 棟 ／ 地形 ${n}×${n} (${cell}m格子) ／ ` +
-  `標高 ${world.meta.minZ}〜${world.meta.maxZ}m`;
+  `建物 ${nBuildings.toLocaleString()} 棟 ／ ` +
+  `地形 ${tile0.n}×${tile0.n} (${tile0.cell}m格子) × ${tiles.size}タイル ／ ` +
+  `標高 ${tile0.data.meta.minZ}〜${tile0.data.meta.maxZ}m`;
 drawMap();
 tick();
