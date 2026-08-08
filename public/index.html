@@ -65,11 +65,30 @@
     opacity:0; transition:opacity .28s; white-space:nowrap; }
   #toast.on { opacity:1; }
 
+  /* 読み込み画面は紅型(びんがた)。型紙は #bingata に手続きで描く。
+     琉球藍の地に朱と黄を重ね、隈取り(片側だけ濃く暈す)を入れるのが紅型らしさ。 */
   #overlay { position:fixed; inset:0; display:grid; place-items:center;
-    background:radial-gradient(120% 90% at 50% 30%, #1d5f7d 0%, #0d1b1e 78%);
-    pointer-events:auto; transition:opacity .35s; z-index:10; }
+    background:#123f52; pointer-events:auto; transition:opacity .35s; z-index:10;
+    overflow:hidden; }
   #overlay.hide { opacity:0; pointer-events:none; }
-  #card { max-width:520px; padding:38px 42px; text-align:center; }
+  #bingata { position:absolute; inset:0; width:100%; height:100%;
+    object-fit:cover; }
+  /* 文字の後ろだけ薄く落とす。落としすぎると型が沈んで紅型に見えない */
+  #overlay::after { content:''; position:absolute; inset:0; pointer-events:none;
+    background:radial-gradient(78% 62% at 50% 46%,
+      rgba(9,26,33,.86) 0%, rgba(9,26,33,.74) 44%, rgba(9,26,33,.22) 82%,
+      rgba(9,26,33,0) 100%); }
+  #card { position:relative; z-index:1;
+    max-width:520px; padding:38px 42px; text-align:center; }
+
+  /* おもろさうしの一節 */
+  #omoro { margin:22px auto 0; max-width:430px; }
+  #omoro .v { font-size:14.5px; line-height:2.15; letter-spacing:.06em;
+    color:#f2e6c8; text-shadow:0 1px 10px rgba(0,0,0,.6); }
+  #omoro .g { margin-top:9px; font-size:11.5px; line-height:1.9; opacity:.62; }
+  #omoro .r { margin-top:5px; font-size:10.5px; opacity:.45; letter-spacing:.1em; }
+  #omoro .rule { width:44px; height:1px; margin:16px auto 14px;
+    background:linear-gradient(90deg, transparent, rgba(232,205,140,.55), transparent); }
   #card h1 { margin:0 0 6px; font-size:31px; letter-spacing:.02em; }
   #card .sub { opacity:.62; font-size:13px; letter-spacing:.16em; margin-bottom:22px; }
   #card p { font-size:14px; line-height:2; opacity:.9; margin:0 0 26px; }
@@ -339,14 +358,15 @@
 </div>
 
 <div id="overlay">
+  <canvas id="bingata"></canvas>
   <div id="card">
     <h1>城東小あるき</h1>
     <div class="sub">NAHA · PLATEAU 3D CITY</div>
     <p>
-      那覇市 城東小学校のまわり <b>1km四方</b>。<br>
+      ゆいレール沿い、那覇空港から石嶺まで <b>那覇市ぜんぶ</b>。<br>
       国土交通省 PLATEAU の実測データから起こした<br>
       本物の地形と建物のなかを歩けます。<br>
-      街に散った <b>10体のシーサー</b> を迎えに行きましょう。
+      街に散った <b>30体のシーサー</b> を迎えに行きましょう。
     </p>
     <div class="ctl" id="ctl-key"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> で移動 ／ マウスで見回す</div>
     <div class="ctl" id="ctl-touch">
@@ -358,12 +378,21 @@
       <button class="go alt" id="logbtn">開発ログ</button>
     </div>
     <div class="meta" id="meta">建物データを準備しています</div>
+    <div id="omoro" hidden>
+      <div class="rule"></div>
+      <div class="v" id="omoro-v"></div>
+      <div class="g" id="omoro-g"></div>
+      <div class="r" id="omoro-r"></div>
+    </div>
     <div class="credit">
       建物・地形・道路・モノレール:
       <a href="https://www.mlit.go.jp/plateau/" target="_blank" rel="noopener">国土交通省 PLATEAU</a>
       を加工して作成（PDL1.0 ／ CC BY 4.0 互換）<br>
       バス停: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">©
       OpenStreetMap contributors</a>（ODbL 1.0）を加工して作成<br>
+      おもろさうし（首里王府編・1531〜1623）:
+      <a href="https://wikisource.org/wiki/おもろさうし" target="_blank" rel="noopener">Wikisource</a>
+      （パブリックドメイン）より歌の頭句を引用<br>
       3D描画: <a href="https://threejs.org/" target="_blank" rel="noopener">three.js</a>（MIT）
       ／ 本ページは国土交通省が作成したものではありません
     </div>

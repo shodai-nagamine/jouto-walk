@@ -4726,6 +4726,180 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   },
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
 
+// ---------------------------------------------------------------- 紅型と おもろ
+// 読み込み画面の地。紅型(びんがた)は琉球の型染めで、
+//  - 白地や黄地に **朱・藍・黄** をはっきり載せる(中間色で濁らせない)
+//  - 花鳥風月の型を **繰り返し** 並べる(型紙で染めるため)
+//  - **隈取り(くまどり)** = ひとつの形の片側だけを濃く暈す。これが無いと
+//    ただのフラットな図案になり、紅型に見えない
+// 画像は持たず、canvas に手続きで描く(この world の他と同じ方針)。
+function drawBingata(cv) {
+  const w = cv.width, h = cv.height;
+  const g = cv.getContext('2d');
+  // 種を固定。読み込むたびに柄が変わると落ち着かない
+  let sd = 20260809;
+  const r = () => ((sd = (sd * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+
+  const AI   = '#123f52';   // 琉球藍
+  const AI2  = '#0d2c3b';   // 濃藍
+  const AKA  = '#c8402c';   // 朱
+  const KI   = '#e8b53c';   // 黄
+  const MIDO = '#3f7a52';   // 緑
+  const SHIRO = '#f4ecd8';  // 白地
+
+  g.fillStyle = AI;
+  g.fillRect(0, 0, w, h);
+
+  /** 隈取り。形の中心から片側へ濃い色を落とす。 */
+  const kuma = (x, y, rad, col) => {
+    const grd = g.createRadialGradient(x - rad * 0.3, y - rad * 0.3, rad * 0.1,
+                                       x, y, rad);
+    grd.addColorStop(0, col + '00');
+    grd.addColorStop(1, col + 'aa');
+    g.fillStyle = grd;
+  };
+
+  /** 花(梅・桜の見立て)。5弁で、芯に黄。 */
+  const hana = (x, y, rad, petal, ring) => {
+    g.save(); g.translate(x, y);
+    for (let i = 0; i < 5; i++) {
+      g.save(); g.rotate(i / 5 * Math.PI * 2);
+      g.beginPath();
+      g.moveTo(0, 0);
+      g.quadraticCurveTo(rad * 0.62, -rad * 0.42, 0, -rad);
+      g.quadraticCurveTo(-rad * 0.62, -rad * 0.42, 0, 0);
+      g.closePath();
+      g.fillStyle = petal; g.fill();
+      g.strokeStyle = SHIRO; g.lineWidth = Math.max(1, rad * 0.075); g.stroke();
+      g.restore();
+    }
+    kuma(0, 0, rad, ring);
+    g.beginPath(); g.arc(0, 0, rad, 0, 7); g.fill();
+    g.beginPath(); g.arc(0, 0, rad * 0.2, 0, 7);
+    g.fillStyle = KI; g.fill();
+    g.restore();
+  };
+
+  /** 瑞雲。紅型の雲は「渦を巻いた団子」を横に連ねた形。 */
+  const kumo = (x, y, sc, col) => {
+    g.save(); g.translate(x, y); g.scale(sc, sc);
+    g.beginPath();
+    for (let i = 0; i < 4; i++) {
+      g.arc(-24 + i * 16, (i % 2 ? -4 : 2), 12 - i * 1.2, 0, 7);
+    }
+    g.fillStyle = col; g.fill();
+    g.strokeStyle = SHIRO; g.lineWidth = 2.2; g.stroke();
+    // 渦
+    g.beginPath();
+    g.arc(-24, 2, 5, 0.4, 5.2);
+    g.strokeStyle = SHIRO; g.lineWidth = 2; g.stroke();
+    g.restore();
+  };
+
+  /** 千鳥。紅型の鳥は思い切って単純な三角と丸で作る。 */
+  const tori = (x, y, sc, col, flip) => {
+    g.save(); g.translate(x, y); g.scale(flip ? -sc : sc, sc);
+    g.beginPath();
+    g.moveTo(0, 0);
+    g.quadraticCurveTo(14, -12, 30, -4);   // 背
+    g.quadraticCurveTo(16, 10, 0, 0);      // 腹
+    g.closePath();
+    g.fillStyle = col; g.fill();
+    g.strokeStyle = SHIRO; g.lineWidth = 2; g.stroke();
+    // 翼
+    g.beginPath();
+    g.moveTo(10, -3); g.quadraticCurveTo(18, -18, 26, -10);
+    g.quadraticCurveTo(18, -4, 10, -3);
+    g.closePath();
+    g.fillStyle = SHIRO; g.fill();
+    g.beginPath(); g.arc(28, -6, 1.8, 0, 7); g.fillStyle = AI2; g.fill();
+    g.restore();
+  };
+
+  /** 波。丸みのある弧を重ねる(青海波に近い形)。 */
+  const nami = (y, step, amp, col, lw) => {
+    g.strokeStyle = col; g.lineWidth = lw;
+    for (let k = 0; k < 3; k++) {
+      g.beginPath();
+      for (let x = -step; x < w + step; x += step) {
+        g.arc(x, y + k * amp * 0.55, step / 2 - k * 1.5, Math.PI, 0);
+      }
+      g.stroke();
+    }
+  };
+
+  // 地に濃藍の斜め暈し(型染めの地染めのむら)
+  const gr = g.createLinearGradient(0, 0, w, h);
+  gr.addColorStop(0, AI2); gr.addColorStop(0.5, AI); gr.addColorStop(1, AI2);
+  g.fillStyle = gr; g.fillRect(0, 0, w, h);
+
+  // 波を上下に
+  nami(h * 0.93, 82, 13, 'rgba(244,236,216,.38)', 2.6);
+  nami(h * 0.06, 82, 13, 'rgba(244,236,216,.30)', 2.4);
+
+  // 型を格子に並べる。少しずらして「型紙を送った」感じにする
+  const CW = 132, CH = 118;
+  for (let row = -1; row * CH < h + CH; row++) {
+    for (let col = -1; col * CW < w + CW; col++) {
+      const ox = col * CW + (row % 2 ? CW / 2 : 0);
+      const oy = row * CH;
+      const k = (row * 31 + col * 17) % 4;
+      if (k === 0) {
+        hana(ox + 34, oy + 36, 30, AKA, '#7d1f14');
+        hana(ox + 88, oy + 84, 21, KI, '#a06a12');
+      } else if (k === 1) {
+        kumo(ox + 66, oy + 44, 1.05, 'rgba(244,236,216,.92)');
+        hana(ox + 28, oy + 92, 24, MIDO, '#1d4a2c');
+      } else if (k === 2) {
+        tori(ox + 22, oy + 48, 1.25, KI, false);
+        hana(ox + 92, oy + 92, 26, SHIRO, '#8a7a52');
+      } else {
+        hana(ox + 52, oy + 38, 28, KI, '#a06a12');
+        tori(ox + 92, oy + 94, 1.1, AKA, true);
+      }
+      // 葉。型と型のあいだを埋める
+      g.save();
+      g.translate(ox + 106, oy + 18);
+      g.rotate(r() * Math.PI * 2);
+      g.beginPath();
+      g.moveTo(0, 0); g.quadraticCurveTo(11, -7, 22, 0);
+      g.quadraticCurveTo(11, 7, 0, 0);
+      g.closePath();
+      g.fillStyle = MIDO; g.fill();
+      g.strokeStyle = SHIRO; g.lineWidth = 1.6; g.stroke();
+      g.restore();
+    }
+  }
+}
+
+/** 画面の大きさに合わせて紅型を焼き直す。 */
+function layoutBingata() {
+  const cv = $('bingata');
+  if (!cv) return;
+  const w = Math.max(640, Math.ceil(innerWidth));
+  const h = Math.max(480, Math.ceil(innerHeight));
+  if (cv.width === w && cv.height === h) return;
+  cv.width = w; cv.height = h;
+  drawBingata(cv);
+}
+layoutBingata();
+addEventListener('resize', layoutBingata);
+
+// おもろさうしの一節を1つ出す。原文は Wikisource(パブリックドメイン)から、
+// 歌の頭句だけを引いている。大意は逐語訳ではない。
+fetch('./data/omoro.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .then((d) => {
+    const songs = d?.songs ?? [];
+    if (!songs.length) return;
+    const s = songs[(Math.random() * songs.length) | 0];
+    $('omoro-v').innerHTML = s.kanji.split('／').join('<br>');
+    $('omoro-g').textContent = s.gist;
+    $('omoro-r').textContent = `おもろさうし ${s.ref}`;
+    $('omoro').hidden = false;
+  })
+  .catch(() => {});
+
 // ---------------------------------------------------------------- 開発ログ
 // changelog.json は tools/build_changelog.py が git log から作る(手書きではない)
 {
@@ -4780,11 +4954,14 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
 $('go').disabled = false;
 $('go').textContent = TOUCH ? 'タップして歩きだす' : 'クリックして歩きだす';
 // 出典表示は #credit に常設してあるので、ここは規模の説明だけにする
-// bstore はホーム・階段・木の幹も含むので、棟数はタイルのデータから数える
-const nBuildings = [...tiles.values()].reduce((s, t) => s + t.data.buildings.length, 0);
+// 棟数は **世界ぜんぶ** を出す。読み込み済みタイルで数えると、起動直後は
+// 1〜5枚しか読んでいないので「1タイル」と出てしまう(実際に出ていた)。
+// 建物の数は index.json が持っている。
+const nBuildings = WORLD_TILES.reduce((s, t) => s + (t.n ?? 0), 0);
 $('meta').textContent =
   `建物 ${nBuildings.toLocaleString()} 棟 ／ ` +
-  `地形 ${tile0.n}×${tile0.n} (${tile0.cell}m格子) × ${tiles.size}タイル ／ ` +
-  `標高 ${tile0.data.meta.minZ}〜${tile0.data.meta.maxZ}m`;
+  `1km タイル ${WORLD_TILES.length} 枚（${(WORLD_B.maxx - WORLD_B.minx) / 1000}` +
+  `×${(WORLD_B.maxz - WORLD_B.minz) / 1000}km）／ ` +
+  `地形 ${tile0.n}×${tile0.n}（${tile0.cell}m格子）`;
 drawMap();
 tick();
