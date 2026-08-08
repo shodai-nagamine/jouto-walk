@@ -583,7 +583,13 @@ def main():
         lat_c - (half + pad_m) / m_lat, lat_c + (half + pad_m) / m_lat,
         lon_c - (half + pad_m) / m_lon, lon_c + (half + pad_m) / m_lon,
     )
-    terrain = None
+    # DEM は **点群を全ファイルぶん先に足してから** 1 回だけ穴埋めする。
+    # ファイルごとに穴埋めして np.maximum で重ねると、片方の外挿値が
+    # もう片方の実測値を上回った所で外挿が勝つ。2 次メッシュ 392725 の地形は
+    # 4 分割で配られていて、タイルはその境目をまたぐので必ず出る
+    # （実測でタイルの継ぎ目に 6.7m の段差。タイル内側の最大は 0.47m）。
+    acc = np.zeros((nn, nn))
+    cnt = np.zeros((nn, nn))
     for dem in args.dem:
         path = dem if os.path.isabs(dem) else os.path.join(NAHA, dem)
         pts = load_points(path, dem_bbox)
@@ -595,22 +601,21 @@ def main():
         gz = np.floor((-(pts[:, 0] - lat_c) * m_lat + half + pad_m) / args.cell).astype(int)
         ok = (gx >= 0) & (gx < nn) & (gz >= 0) & (gz < nn)
         gx, gz, zv = gx[ok], gz[ok], pts[ok, 2]
-        acc = np.zeros((nn, nn))
-        cnt = np.zeros((nn, nn))
         np.add.at(acc, (gx, gz), zv)
         np.add.at(cnt, (gx, gz), 1)
-        mask = cnt > 0
-        seed = np.zeros((nn, nn))
-        seed[mask] = acc[mask] / cnt[mask]
-        cov = mask.sum() / (nn * nn)
-        print(f"  {os.path.basename(path)}: {len(pts):,}点 被覆{cov:.1%}", file=sys.stderr)
-        # 余白ごと緩和してから、タイルぶんだけ切り出す
-        grid = fill_missing(seed, mask, relax=80)[DEM_PAD:DEM_PAD + n, DEM_PAD:DEM_PAD + n]
-        terrain = grid if terrain is None else np.maximum(terrain, grid)
+        print(f"  {os.path.basename(path)}: {len(pts):,}点", file=sys.stderr)
 
-    if terrain is None:
+    mask = cnt > 0
+    if not mask.any():
         print("地形DEMなし → 平坦(0m)にする", file=sys.stderr)
         terrain = np.zeros((n, n))
+    else:
+        seed = np.zeros((nn, nn))
+        seed[mask] = acc[mask] / cnt[mask]
+        print(f"  DEM 被覆 {mask.sum() / (nn * nn):.1%}", file=sys.stderr)
+        # 余白ごと緩和してから、タイルぶんだけ切り出す
+        terrain = fill_missing(seed, mask, relax=80)[DEM_PAD:DEM_PAD + n,
+                                                    DEM_PAD:DEM_PAD + n]
 
     # ---- 建物 -------------------------------------------------------------
     buildings = []

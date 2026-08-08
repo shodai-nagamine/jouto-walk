@@ -2,6 +2,4 @@
 __pycache__/
 *.pyc
 public/data/changelog.json
-# タイルは公開物に含める(GitHub Pages から配る)。ただし t_0_0.json だけは
-# --parks 以前の生成物で、タイル(0,0)には world.json を使っているので入れない。
-public/data/tiles/t_0_0.json
+# タイル(public/data/tiles/*.json)は公開物に含める(GitHub Pages から配る)。

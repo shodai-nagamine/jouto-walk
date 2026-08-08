@@ -9,7 +9,9 @@ const HOLD_MS = 320;       // ジャンプ長押しで飛行を切り替える�
 const FLY = 14, FLY_V = 9; // 飛行の水平・垂直速度(m/s)
 const FLY_CEIL = 480;      // 地表からの上限高度(m)
 const RADIUS = 0.55;       // プレイヤーの当たり半径(m)
-const N_SEESAA = 10;
+// シーサーは **全線で この数** を散らす。タイルごとに固定数にすると、
+// 37タイルで370体になって集めきれない。世界が広がっても分母は動かさない。
+const N_SEESAA = 30;
 const PICKUP = 4.0;        // 保護できる距離(m)
 const HASH = 24;           // 当たり判定用の空間ハッシュの升目(m)。建物・道路で共用
 const STEP = 0.55;         // 乗り越えられる段差(m)。階段・ホームの昇降に使う
@@ -40,10 +42,7 @@ const tiles = new Map();           // "tx,tz" -> タイル
 
 /** タイルの JSON の場所。 */
 function tileUrl(tx, tz) {
-  // tiles/t_0_0.json は --parks 以前の生成物なので、公園を持つ world.json を
-  // タイル(0,0)の中身として使う。41タイルを作り直したら差し替える。
-  return (tx === 0 && tz === 0)
-    ? './data/world.json' : `./data/tiles/t_${tx}_${tz}.json`;
+  return `./data/tiles/t_${tx}_${tz}.json`;
 }
 
 /** タイルを読んで登録簿に入れる(まだ何も建てない)。 */
@@ -136,6 +135,8 @@ const TILE_LIST = TILE_FIXED
 for (const [tx, tz] of TILE_LIST) await fetchTile(tx, tz);
 const tile0 = tiles.get('0,0') ?? tiles.values().next().value;
 // タイル(0,0)の生データ。描画には使わない(window.dbg から覗くためだけに残す)。
+// public/data/world.json は tools/link_council.py の入力として残してあるが、
+// ここでは読まない(t_0_0.json と中身は完全に同じ。地形の差 0.0000m を実測)。
 const world = tile0.data;
 
 // モノレール線形・駅・バス経路は corridor.json(全線ぶん)。
@@ -387,6 +388,7 @@ function roadPath(ctx, toX, toZ) {
  */
 function groundTexture(t) {
   const W = TOUCH ? 1024 : 2048;   // 生成は素のJSループなので端末に合わせる
+  const BAND = 64;                 // 一度に仕上げる行数(実測 約18ms/帯)
   const s = W / TILE;                       // px / m
   // ワールド座標 -> このタイルの canvas 画素。範囲外は canvas 側で切られる。
   const pxX = (x) => (x - t.offX + HALF) * s;
@@ -464,11 +466,6 @@ function groundTexture(t) {
     pg.closePath(); pg.fill();
   }
 
-  const A = lg.getImageData(0, 0, W, W), B = dg.getImageData(0, 0, W, W);
-  const R = rg.getImageData(0, 0, W, W), RS = rsg.getImageData(0, 0, W, W);
-  const WK = wg.getImageData(0, 0, W, W), PK = pg.getImageData(0, 0, W, W);
-  const a = A.data, b = B.data, rr = R.data, rs = RS.data, wv = WK.data;
-  const pv = PK.data;
   const PAVE = [154, 150, 142];             // 敷地(コンクリ)
   const ROAD = [110, 110, 114];             // 道路(アスファルト)
   const EDGE = [138, 134, 112];             // 路肩・未舗装
@@ -484,6 +481,17 @@ function groundTexture(t) {
   };
   const WALK = [176, 172, 163];             // 歩道(平板ブロック)
   const STEPS = [150, 146, 138];            // 階段
+
+  // ここから下(6枚の読み出しと420万画素のループ)が焼き上げの 76% を占める
+  // (実測 getImageData 519ms + ループ 744ms)。横帯に切ってフレームをまたぐ。
+  let y0 = 0;
+  const band = () => {
+  const h = Math.min(BAND, W - y0);
+  const A = lg.getImageData(0, y0, W, h), B = dg.getImageData(0, y0, W, h);
+  const R = rg.getImageData(0, y0, W, h), RS = rsg.getImageData(0, y0, W, h);
+  const WK = wg.getImageData(0, y0, W, h), PK = pg.getImageData(0, y0, W, h);
+  const a = A.data, b = B.data, rr = R.data, rs = RS.data, wv = WK.data;
+  const pv = PK.data;
   for (let i = 0; i < a.length; i += 4) {
     const solid = a[i], dens = b[i], rc = rr[i] / 255, rsv = rs[i] / 255;
     const w = wv[i];
@@ -509,7 +517,13 @@ function groundTexture(t) {
     const n = 0.88 + Math.random() * 0.24;                // ざらつき
     a[i] = c[0] * n; a[i + 1] = c[1] * n; a[i + 2] = c[2] * n;
   }
-  lg.putImageData(A, 0, 0);
+  lg.putImageData(A, 0, y0);
+  y0 += h;
+  return y0 >= W;
+  };
+
+  /** 全部の帯を焼き終えてから呼ぶ仕上げ。 */
+  const finish = () => {
 
   // 横断歩道は最後に白い縞として重ねる。縞は歩行者の進む向きと平行な帯を
   // 横に並べたものなので、way に沿う線を左右にずらして引く。
@@ -538,6 +552,22 @@ function groundTexture(t) {
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = MAXANISO;
   return tex;
+  };
+
+  return { band, finish };
+}
+
+// 焼き上げ待ちの行列。tick から時間を区切って進める。
+// 一気に焼くとタイル1枚の読み込みで 2.1 秒フリーズする(実測)。
+const bakes = [];
+
+/** 焼き上げを budget ミリ秒ぶんだけ進める。 */
+function stepBakes(budget = 10) {
+  const t0 = performance.now();
+  while (bakes.length && performance.now() - t0 < budget) {
+    const job = bakes[0];
+    if (job.band()) { bakes.shift(); job.done(); }
+  }
 }
 
 /** 1枚テクスチャは 0.5m/px しかないので、足元用に細かい明暗を別途重ねる。 */
@@ -884,10 +914,14 @@ function addTerrain(t) {
     for (let ix = 0; ix < n; ix++) pos.setY(iz * n + ix, t.terrain[ix * n + iz]);
   }
   geo.computeVertexNormals();
-  const gmat = new THREE.MeshLambertMaterial({ map: groundTexture(t) });
+  // 焼き上がるまでは平らな色で見せる(帯ごとに焼くので 1〜2 秒かかる)。
+  // 途中の canvas は建物が白抜きの白黒なので、貼らずに待つ
+  const gmat = new THREE.MeshLambertMaterial({ color: 0x8f9184 });
   // 近景がぼけないよう、地面のUVを何度も繰り返す細かいノイズを乗算する
   detailMap ??= detailTexture();
   gmat.onBeforeCompile = (sh) => {
+    // テクスチャが付く前は vMapUv が無いので、付いてからだけ差し込む
+    if (!gmat.map) return;
     sh.uniforms.detailMap = { value: detailMap };
     sh.fragmentShader = 'uniform sampler2D detailMap;\n' + sh.fragmentShader.replace(
       '#include <map_fragment>',
@@ -895,6 +929,13 @@ function addTerrain(t) {
        diffuseColor.rgb *= texture2D(detailMap, vMapUv * ${(TILE / 3).toFixed(1)}).rgb;`
     );
   };
+  const job = groundTexture(t);
+  bakes.push({ tile: t.key, band: job.band, done: () => {
+    gmat.map = job.finish();
+    gmat.color.setHex(0xffffff);
+    gmat.needsUpdate = true;                 // ここで onBeforeCompile が走り直す
+    console.log(`[${t.key}] 地面テクスチャ 焼き上がり`);
+  } });
   const ground = new THREE.Mesh(geo, gmat);
   // 地形の頂点Yは標高そのものなので、載せるのは水平位置だけ
   ground.position.set(t.offX, 0, t.offZ);
@@ -1127,7 +1168,14 @@ scene.add(seesaaGroup);
 // シーサーを置き終えたタイル。タイルは出し入れするが、シーサーは捨てないので、
 // この覚えが無いと同じタイルに戻るたびに10体ずつ増える(実際に増えた)。
 const seesaaDone = new Set();
-const SEESAA_TOTAL = N_SEESAA * WORLD_TILES.length;
+const SEESAA_TOTAL = N_SEESAA;
+// 何体目をどのタイルに置くかは最初に決めておく。均等に配ると、
+// 線に沿って歩くあいだ切れ目なく現れる(まとまって湧かない)。
+const SEESAA_QUOTA = new Map(WORLD_TILES.map((t, i) => [
+  `${t.tx},${t.tz}`,
+  Math.floor((i + 1) * SEESAA_TOTAL / WORLD_TILES.length)
+    - Math.floor(i * SEESAA_TOTAL / WORLD_TILES.length),
+]));
 
 /** タイル t の道路面から、互いに離れた設置点を選ぶ(道沿いなので必ず辿り着ける)。 */
 function roadSpots(t, want) {
@@ -1165,12 +1213,14 @@ function roadSpots(t, want) {
 function addSeesaa(t) {
   if (seesaaDone.has(t.key)) return;      // このタイルには置き済み
   seesaaDone.add(t.key);
-  const spots = roadSpots(t, N_SEESAA);
+  const want = SEESAA_QUOTA.get(t.key) ?? 0;
+  if (!want) return;                      // このタイルの持ち分は無し
+  const spots = roadSpots(t, want);
   let n = 0;
-  for (let i = 0; i < N_SEESAA; i++) {
+  for (let i = 0; i < want; i++) {
     let placed = spots[i] ?? null;
     if (!placed) {                                   // 道路が無い区画向けの保険
-      const ang = (i / N_SEESAA) * Math.PI * 2 + t.rnd() * 0.55;
+      const ang = (i / Math.max(1, want)) * Math.PI * 2 + t.rnd() * 0.55;
       for (let tries = 0; tries < 260 && !placed; tries++) {
         const rad = 55 + t.rnd() * 330;
         const x = t.offX + Math.cos(ang + (t.rnd() - 0.5) * 0.5) * rad;
@@ -3038,49 +3088,48 @@ if (TOUCH) {
 }
 
 // ---------------------------------------------------------------- ミニマップ
+// 世界が 10km × 7km まで広がるので、全体を1枚に収めると 53m/px になって
+// 街が潰れる(建物1棟が 0.28px)。**プレイヤーの周りだけを一定の縮尺で見せる**。
+// 下地はタイルごとに焼いておき、毎フレーム窓の位置に貼り直す。
 const map = $('map'), mctx = map.getContext('2d');
 const MS = map.width;
-// 世界ぜんぶを収める正方形に載せる。読み込み済みの範囲に合わせると、
-// 歩いてタイルが足し引きされるたびに縮尺が変わって現在地が掴めなくなる。
-const MB = WORLD_B;
-const MSPAN = Math.max(MB.maxx - MB.minx, MB.maxz - MB.minz);
-const MCX = (MB.minx + MB.maxx) / 2, MCZ = (MB.minz + MB.maxz) / 2;
-const mx = (v) => (v - MCX + MSPAN / 2) / MSPAN * MS;
-const mz = (v) => (v - MCZ + MSPAN / 2) / MSPAN * MS;
-const base = document.createElement('canvas');
-base.width = base.height = MS;
+const MAP_SPAN = 1200;        // 地図に写す一辺(m)。1タイルより少し広い
+const MAP_TILE_PX = 256;      // タイル1枚ぶんの下地の解像度(px) = 3.9m/px
 
-/** 下地(道路・モノレール・バス停・建物)を焼き直す。タイルの出し入れごとに呼ぶ。 */
-function bakeMap() {
-  const b = base.getContext('2d');
-  b.clearRect(0, 0, MS, MS);
-  b.fillStyle = '#16302f'; b.fillRect(0, 0, MS, MS);
+/** タイル t の下地(道路と建物)を小さな canvas に焼く。読み込んだときに1回だけ。 */
+function bakeTileMap(t) {
+  const c = document.createElement('canvas');
+  c.width = c.height = MAP_TILE_PX;
+  const b = c.getContext('2d');
+  const k = MAP_TILE_PX / TILE;
+  const X = (v) => (v - t.offX + HALF) * k;
+  const Z = (v) => (v - t.offZ + HALF) * k;
+  b.fillStyle = '#16302f';
+  b.fillRect(0, 0, MAP_TILE_PX, MAP_TILE_PX);
   // 道路を先に敷く(街路の骨格が見えると現在地を掴みやすい)
   b.fillStyle = 'rgba(190,205,205,.30)';
-  roadPath(b, mx, mz);
+  b.beginPath();
+  for (const r of rstore) {
+    if (r.tile !== t.key) continue;
+    b.moveTo(X(r.ring[0].x), Z(r.ring[0].y));
+    for (let i = 1; i < r.ring.length; i++) b.lineTo(X(r.ring[i].x), Z(r.ring[i].y));
+    b.closePath();
+  }
   b.fill();
-  // モノレール(街の骨格として道路より目立たせる)
-  b.strokeStyle = 'rgba(120,190,235,.85)';
-  b.lineWidth = Math.max(2, 3 * (MS / 188));
-  b.lineCap = 'round';
-  for (const p of railPaths) {
-    b.beginPath();
-    p.pts.forEach((q, i) => (i ? b.lineTo(mx(q.x), mz(q.z)) : b.moveTo(mx(q.x), mz(q.z))));
-    b.stroke();
-  }
-  // バス停
-  b.fillStyle = 'rgba(120,200,235,.9)';
-  const bs = Math.max(2, 2.2 * (MS / 188));
-  for (const s of busSigns) {
-    b.fillRect(mx(s.position.x) - bs / 2, mz(s.position.z) - bs / 2, bs, bs);
-  }
   b.fillStyle = 'rgba(246,243,234,.42)';
   for (const bd of bstore) {
+    if (bd.tile !== t.key) continue;
     b.beginPath();
-    b.moveTo(mx(bd.ring[0].x), mz(bd.ring[0].y));
-    for (let i = 1; i < bd.ring.length; i++) b.lineTo(mx(bd.ring[i].x), mz(bd.ring[i].y));
+    b.moveTo(X(bd.ring[0].x), Z(bd.ring[0].y));
+    for (let i = 1; i < bd.ring.length; i++) b.lineTo(X(bd.ring[i].x), Z(bd.ring[i].y));
     b.closePath(); b.fill();
   }
+  t.mapTile = c;
+}
+
+/** まだ下地の無いタイルを焼く。タイルを足し引きしたあとに呼ぶ。 */
+function bakeMap() {
+  for (const t of tiles.values()) if (!t.mapTile) bakeTileMap(t);
 }
 bakeMap();
 
@@ -3088,10 +3137,39 @@ bakeMap();
 const MK = MS / 188;
 
 function drawMap() {
-  mctx.drawImage(base, 0, 0);
-  // 城東小
-  mctx.fillStyle = '#e8642f';
-  mctx.beginPath(); mctx.arc(mx(0), mz(0), 3.4 * MK, 0, 7); mctx.fill();
+  // 窓はプレイヤー中心。店内に居るあいだは街での立ち位置で描く
+  const cx = hereX(), cz = hereZ();
+  const k = MS / MAP_SPAN;                     // px / m
+  const mx = (v) => (v - cx) * k + MS / 2;
+  const mz = (v) => (v - cz) * k + MS / 2;
+  mctx.fillStyle = '#0e1f1e';
+  mctx.fillRect(0, 0, MS, MS);
+  // 読み込み済みタイルの下地を窓の位置に貼る
+  const span = TILE * k;
+  for (const t of tiles.values()) {
+    if (!t.mapTile) continue;
+    mctx.drawImage(t.mapTile, mx(t.offX - HALF), mz(t.offZ - HALF), span, span);
+  }
+  // モノレール(街の骨格として道路より目立たせる)
+  mctx.strokeStyle = 'rgba(120,190,235,.85)';
+  mctx.lineWidth = Math.max(2, 3 * MK);
+  mctx.lineCap = 'round';
+  for (const p of railPaths) {
+    mctx.beginPath();
+    p.pts.forEach((q, i) => (i ? mctx.lineTo(mx(q.x), mz(q.z)) : mctx.moveTo(mx(q.x), mz(q.z))));
+    mctx.stroke();
+  }
+  // バス停
+  mctx.fillStyle = 'rgba(120,200,235,.9)';
+  const bs = Math.max(2, 2.2 * MK);
+  for (const s of busSigns) {
+    mctx.fillRect(mx(s.position.x) - bs / 2, mz(s.position.z) - bs / 2, bs, bs);
+  }
+  // 城東小(窓の外に出ることがあるので枠内のときだけ)
+  if (Math.abs(cx) < MAP_SPAN && Math.abs(cz) < MAP_SPAN) {
+    mctx.fillStyle = '#e8642f';
+    mctx.beginPath(); mctx.arc(mx(0), mz(0), 3.4 * MK, 0, 7); mctx.fill();
+  }
   // シーサー
   for (const s of seesaa) {
     if (s.userData.taken) continue;
@@ -3110,9 +3188,8 @@ function drawMap() {
     }
   }
 
-  // 自分(視線方向つき)
-  const px = mx(hereX()), pz = mz(hereZ());
-  mctx.save(); mctx.translate(px, pz); mctx.rotate(-player.yaw);
+  // 自分(視線方向つき)。窓の中心に固定
+  mctx.save(); mctx.translate(MS / 2, MS / 2); mctx.rotate(-player.yaw);
   mctx.fillStyle = '#7fe0ff';
   mctx.beginPath();
   mctx.moveTo(0, -6 * MK); mctx.lineTo(4 * MK, 4 * MK); mctx.lineTo(-4 * MK, 4 * MK);
@@ -3126,7 +3203,7 @@ function drawMap() {
   const toggle = (e) => {
     e.preventDefault(); e.stopPropagation();
     const big = radar.classList.toggle('big');
-    cap.textContent = big ? '城東小 周辺 1km ・ タップで戻す' : '城東小 周辺 1km ・ タップで拡大';
+    cap.textContent = big ? 'まわり 1.2km ・ タップで戻す' : 'まわり 1.2km ・ タップで拡大';
     drawMap();
   };
   radar.addEventListener('click', toggle);
@@ -3182,6 +3259,8 @@ function dropTile(t) {
     if (signals[i].tile === t.key) signals.splice(i, 1);
   }
   dropWalkLines(t.key);
+  // 焼きかけのテクスチャは捨てる(戻ってきたら最初から焼き直す)
+  for (let i = bakes.length - 1; i >= 0; i--) if (bakes[i].tile === t.key) bakes.splice(i, 1);
   // 消えた歩道の上に居た者を降ろす。シーサーはその場に立たせ(遠くに居るので
   // 乗せ直すとプレイヤーの目の前へ湧く)、歩行者は手前へ湧かし直させる
   for (const g of seesaa) if (g.userData.L?.tile === t.key) g.userData.L = null;
@@ -3651,6 +3730,7 @@ function tick() {
   // タイルの足し引き。毎フレームやる必要は無い(歩き 4.6m/s なので
   // 30フレーム=0.5秒で 2.3m しか進まない)し、fetch が絡むので間引く
   if ((frame & 31) === 0) syncTiles();
+  if (bakes.length) stepBakes();      // 地面テクスチャを少しずつ焼く
 
   // 市議会の言及。近づいた地点のパネルを出す
   {
@@ -3807,6 +3887,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   tileRange: () => ({ load: TILE_LOAD, drop: TILE_DROP }),
   setTileRange: (load, drop) => { TILE_LOAD = load; TILE_DROP = drop; },
   rebuildDerived, dropWalkLines, addWalkLines, bakeMap, buildApron, seesaaGroup,
+  bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN,
   SEESAA_TOTAL, busSigns, shopSigns,
   stationStops, trainStopDs: () => trainStopDs, trainPath: () => trainPath,
   // 列車(検証用)。tick を待たずに走らせられる
