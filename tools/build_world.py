@@ -536,6 +536,43 @@ def parse_walls(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=40.0):
     return out
 
 
+# 首里城で自前の造形に置き換える建物。PLATEAU の LOD1 は輪郭を押し出しただけの
+# 箱なので、これらを残すと自前の正殿の中に白い箱が刺さる。
+CASTLE_NAMES = ("正殿", "北殿", "南殿・番所", "南殿", "番所", "奉神門", "広福門")
+
+
+def parse_castle(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=40.0):
+    """首里城の名前付き建物を「面」として取り出す。
+
+    OSM の輪郭は付属部分まで含んだ広めの取り方で、公的資料の
+    桁行下層 28.749m × 梁間下層 21.257m より大きい（正殿で 50.4×24.0m / 831m2）。
+    **位置と向きはこちらで取り、建物そのものの寸法は復元設計の数字に合わせる。**
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = -margin, size + margin
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        name = t.get("name") or t.get("name:ja") or ""
+        if name not in CASTLE_NAMES:
+            continue
+        g = [p for p in (e.get("geometry") or []) if p]
+        if len(g) < 3:
+            continue
+        pts = [((p["lon"] - lon_c) * m_lon + half,
+                -(p["lat"] - lat_c) * m_lat + half) for p in g]
+        if pts[0] == pts[-1]:
+            pts.pop()
+        if len(pts) < 3:
+            continue
+        xs = [q[0] for q in pts]
+        zs = [q[1] for q in pts]
+        if max(xs) < lo or min(xs) > hi or max(zs) < lo or min(zs) > hi:
+            continue
+        out.append({"name": name, "f": [round(v, 2) for q in pts for v in q]})
+    return out
+
+
 def parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, margin):
     """OpenStreetMap(Overpass API)のバス停ノードをローカル座標にする。
 
@@ -820,6 +857,15 @@ def main():
         print(f"  {os.path.basename(path)}: 公園系 {len(parks)}面 {cnt} "
               f"(名前あり{nn}/無名{len(parks) - nn})", file=sys.stderr)
 
+    castle = []
+    if args.walls:
+        path = (args.walls if os.path.isabs(args.walls)
+                else os.path.join(NAHA, args.walls))
+        castle = parse_castle(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        if castle:
+            print(f"  {os.path.basename(path)}: 城内の建物 {len(castle)}棟 "
+                  f"({'、'.join(c['name'] for c in castle)})", file=sys.stderr)
+
     walls = []
     if args.walls:
         path = (args.walls if os.path.isabs(args.walls)
@@ -855,6 +901,7 @@ def main():
         "footways": footways,
         "parks": parks,
         "walls": walls,
+        "castle": castle,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:

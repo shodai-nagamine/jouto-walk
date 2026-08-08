@@ -604,6 +604,14 @@ function addBuildings(t) {
   // 駅の位置を含む建物は、この後ホーム・階段を自前で建てるので除く。
   // PLATEAU の駅舎は中身のない箱なので、残すとホームが壁の中に閉じ込められる。
   const stationPts = (t.data.stations ?? []).map((s) => [t.X(s.x), t.Z(s.z)]);
+  // 首里城の城内建物も同じ理由で除く。自前の正殿の中に白い箱が刺さる
+  const castleRings = (t.data.castle ?? []).map((c) => {
+    const r = [];
+    for (let i = 0; i < c.f.length; i += 2) {
+      r.push(new THREE.Vector2(t.X(c.f[i]), t.Z(c.f[i + 1])));
+    }
+    return r;
+  });
   const inRing = (ring, x, z) => {
     let inside = false;
     for (let k = 0, l = ring.length - 1; k < ring.length; l = k++) {
@@ -631,6 +639,13 @@ function addBuildings(t) {
         inRing(ring, sx, sz))) {
       skipped++;
       continue;
+    }
+    // 城内建物の輪郭に重心が入る建物も飛ばす(自前の造形に置き換える)
+    if (castleRings.length) {
+      let cx = 0, cz = 0;
+      for (const q of ring) { cx += q.x; cz += q.y; }
+      cx /= ring.length; cz /= ring.length;
+      if (castleRings.some((r) => inRing(r, cx, cz))) { skipped++; continue; }
     }
 
     // 斜面で建物が浮かないよう、底は地表より少し下まで伸ばす
@@ -1268,6 +1283,7 @@ function buildTileCore(t) {
 /** タイル t の付属物(当たり判定に影響しないもの)を建てる。 */
 function buildTileProps(t) {
   addWalls(t);          // 石垣。addSolid を使うので groundTexture より後
+  addCastle(t);         // 首里城の建物
   addBusStops(t);
   addSignals(t);
   addShopSigns(t);
@@ -1825,6 +1841,530 @@ function addWalls(t) {
   mesh.castShadow = mesh.receiveShadow = true;
   t.group.add(mesh);
   console.log(`[${t.key}] 石垣 ${ways.length}本 / ${nseg}区間 / ${V.length / 3}頂点`);
+}
+
+// ---------------------------------------------------------------- 正殿の造形
+// 首里城 正殿。造形は Antigravity(agy)に契約を渡して書かせたものを検分して取り込んだ。
+// シーサーと同じやり方で、外部アセットもローダーも増やさずに済む。
+//
+// 契約: 関数名 makeSeiden() / 原点=底面の中心・すべて y>=0 / 正面=-Z /
+//       桁行28.75m × 梁間21.26m × 総高18.0m(内閣府沖縄総合事務局の復元設計) /
+//       基本形状のみ・外部ファイル禁止 / Math.random 禁止 / メッシュ120個以内 /
+//       MeshLambertMaterial のみ / castShadow 必須。
+//       入れるもの: 二重三階の入母屋 / 唐破風の向拝 / 赤瓦 / 朱塗り /
+//                   大龍柱2本 / 龍頭棟飾 / 正面の石階段。
+// 検分: 契約違反ゼロ。メッシュ55個(うち InstancedMesh 13)。
+//
+// 建てるのは **2019年10月の火災で焼失する前の姿**(平成の復元)。OSM の輪郭も
+// PLATEAU の計測もその時点のものなので、これだと数字が突き合わせられる。
+
+/**
+ * 首里城 正殿（2019年焼失前の平成復元姿）を生成する関数。
+ * 
+ * 【主要寸法（内閣府沖縄総合事務局 復元設計書拠）】
+ * - 桁行（X方向全幅）: 28.75 m
+ * - 梁間（Z方向全奥行）: 21.26 m (向拝張り出しは前(-Z)へ約6.5m)
+ * - 総高（地面から龍頭棟飾天まで）: 18.0 m
+ * - 原点: 建物の底面中心 (y >= 0)
+ * - 正面: -Z 方向（向拝・大龍柱・石階段が配置される側）
+ */
+function makeSeiden() {
+  const g = new THREE.Group();
+
+  // -------------------------------------------------------------
+  // マテリアル定義（規定の琉球伝統配色に合わせ使い回すことで描画負荷を低減）
+  // -------------------------------------------------------------
+  // 朱塗り (柱・梁・壁・唐破風など正殿の主色)
+  const matRed = new THREE.MeshLambertMaterial({ color: 0xb03a26 });
+  // 沖縄赤瓦 (朱に近い赤褐色)
+  const matRoof = new THREE.MeshLambertMaterial({ color: 0xa8442c });
+  // 漆喰目地・白壁 (赤瓦の目地や3階装飾)
+  const matWhite = new THREE.MeshLambertMaterial({ color: 0xe8e0d0 });
+  // 石造 (基壇・正面石階段・大龍柱の素材)
+  const matStone = new THREE.MeshLambertMaterial({ color: 0xc9c0aa });
+  // 金の装飾 (雲形・龍の目や爪・破風の飾金具)
+  const matGold = new THREE.MeshLambertMaterial({ color: 0xc9a227 });
+  // 黒塗り (腰壁・破風の縁取り・大棟)
+  const matBlack = new THREE.MeshLambertMaterial({ color: 0x2a2320 });
+
+  // 影の設定とメッシュ計測用ヘルパー関数
+  let totalMeshCount = 0;
+
+  function addMesh(geometry, material, receiveShadow = false) {
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = true;
+    if (receiveShadow) mesh.receiveShadow = true;
+    g.add(mesh);
+    totalMeshCount++;
+    return mesh;
+  }
+
+  // 大量の柱や丸瓦をメッシュ数上限（120個）以内で表現するための InstancedMesh ヘルパー
+  function addInstancedMesh(geometry, material, count, setupFn, receiveShadow = false) {
+    const instancedMesh = new THREE.InstancedMesh(geometry, material, count);
+    instancedMesh.castShadow = true;
+    if (receiveShadow) instancedMesh.receiveShadow = true;
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i < count; i++) {
+      setupFn(dummy, i);
+      dummy.updateMatrix();
+      instancedMesh.setMatrixAt(i, dummy.matrix);
+    }
+    instancedMesh.instanceMatrix.needsUpdate = true;
+    g.add(instancedMesh);
+    totalMeshCount++;
+    return instancedMesh;
+  }
+
+  // =============================================================
+  // 1. 基壇および正面石階段（石造: c9c0aa）
+  // 寸法根拠: 28.75m×21.26mの身屋を支える高さ1.2mの石造基壇と御庭へ向かう階段
+  // =============================================================
+  // 主基壇 (y=0.0 ~ 1.2m)
+  const baseGeo = new THREE.BoxGeometry(29.5, 1.2, 22.0);
+  baseGeo.translate(0, 0.6, 0);
+  addMesh(baseGeo, matStone, true);
+
+  // 正面中央石階段 (向拝の下から御庭-Z方向へ伸びる)
+  const stairGeo = new THREE.BoxGeometry(7.5, 1.2, 6.5);
+  stairGeo.translate(0, 0.6, -13.88);
+  addMesh(stairGeo, matStone, true);
+
+  // 階段左右の高欄（手すり）
+  const railLGeo = new THREE.BoxGeometry(0.5, 1.6, 6.5);
+  railLGeo.translate(-4.0, 0.8, -13.88);
+  addMesh(railLGeo, matStone);
+
+  const railRGeo = new THREE.BoxGeometry(0.5, 1.6, 6.5);
+  railRGeo.translate(4.0, 0.8, -13.88);
+  addMesh(railRGeo, matStone);
+
+  // 大龍柱の台座 (階段前左右 X=±2.3m, Z=-16.0m)
+  const baseLGeo = new THREE.BoxGeometry(1.2, 0.6, 1.2);
+  baseLGeo.translate(-2.3, 0.3, -16.0);
+  addMesh(baseLGeo, matStone, true);
+
+  const baseRGeo = new THREE.BoxGeometry(1.2, 0.6, 1.2);
+  baseRGeo.translate(2.3, 0.3, -16.0);
+  addMesh(baseRGeo, matStone, true);
+
+  // =============================================================
+  // 2. 下層・中層 (1階・2階) 身屋（桁行28.75m, 梁間21.26m）
+  // 寸法根拠: 幅28.75m, 奥行21.26m, 高さ6.0m (y=1.2~7.2m)
+  // =============================================================
+  // 朱塗りの胴体壁
+  const bodyGeo = new THREE.BoxGeometry(28.75, 6.0, 21.26);
+  bodyGeo.translate(0, 4.2, 0);
+  addMesh(bodyGeo, matRed);
+
+  // 1階正面御門の黒・金装飾長押
+  const frontWallGeo = new THREE.BoxGeometry(28.0, 2.5, 0.2);
+  frontWallGeo.translate(0, 2.45, -10.64);
+  addMesh(frontWallGeo, matBlack);
+
+  const frontGoldGeo = new THREE.BoxGeometry(12.0, 0.4, 0.25);
+  frontGoldGeo.translate(0, 3.2, -10.65);
+  addMesh(frontGoldGeo, matGold);
+
+  // 桁行11間・梁間7間の朱塗り柱列 (InstancedMeshで1メッシュ化)
+  // 正面11本 + 背面11本 + 側面左右10本 = 32本
+  const colGeo = new THREE.CylinderGeometry(0.24, 0.24, 6.0, 12);
+  const columnPositions = [];
+  for (let i = 0; i < 11; i++) {
+    const x = -13.5 + i * (27.0 / 10);
+    columnPositions.push([x, 4.2, -10.7]); // 正面
+    columnPositions.push([x, 4.2, 10.7]);  // 背面
+  }
+  for (let i = 1; i <= 5; i++) {
+    const z = -10.0 + i * (20.0 / 6);
+    columnPositions.push([-14.4, 4.2, z]); // 左側面
+    columnPositions.push([14.4, 4.2, z]);  // 右側面
+  }
+  addInstancedMesh(colGeo, matRed, columnPositions.length, (dummy, i) => {
+    dummy.position.set(...columnPositions[i]);
+  });
+
+  // =============================================================
+  // 3. 下層屋根（一重屋根・入母屋造の下層部）
+  // 寸法根拠: 桁行28.75m・梁間21.26mより軒出各約0.875m出張り、幅30.5m×奥行23.0m
+  // 高さ2.4m (y=7.2~9.6m)
+  // =============================================================
+  // 下層屋根本体（四角錐台）
+  const lowerRoofGeo = new THREE.CylinderGeometry(17.0, 21.5, 2.4, 4);
+  lowerRoofGeo.rotateY(Math.PI / 4);
+  lowerRoofGeo.scale(30.5 / 30.4, 1.0, 23.0 / 30.4);
+  lowerRoofGeo.translate(0, 8.4, 0);
+  addMesh(lowerRoofGeo, matRoof, true);
+
+  // 下層軒下の朱塗り長押
+  const eaveGeo = new THREE.BoxGeometry(29.8, 0.4, 22.3);
+  eaveGeo.translate(0, 7.3, 0);
+  addMesh(eaveGeo, matRed);
+
+  // 【取り込み時に落とした】下層屋根の丸瓦。長さ15mの円柱を屋根面に並べる作りで、
+  // 実機で見ると屋根を突き抜けて軒の外へ櫛のように飛び出していた。
+
+  // =============================================================
+  // 4. 上層 (3階) 身屋
+  // 寸法根拠: 下層より一回り小さく桁行22.0m×梁間15.0m, 高さ3.4m (y=9.6~13.0m)
+  // =============================================================
+  const upperBodyGeo = new THREE.BoxGeometry(22.0, 3.4, 15.0);
+  upperBodyGeo.translate(0, 11.3, 0);
+  addMesh(upperBodyGeo, matRed);
+
+  // 3階の白壁長押帯
+  const upperDecorGeo = new THREE.BoxGeometry(22.2, 0.8, 15.2);
+  upperDecorGeo.translate(0, 12.2, 0);
+  addMesh(upperDecorGeo, matWhite);
+
+  // 3階柱列 (16本)
+  const upperColPositions = [];
+  for (let i = 0; i < 8; i++) {
+    const x = -10.0 + i * (20.0 / 7);
+    upperColPositions.push([x, 11.3, -7.6]);
+    upperColPositions.push([x, 11.3, 7.6]);
+  }
+  const upperColGeo = new THREE.CylinderGeometry(0.2, 0.2, 3.4, 10);
+  addInstancedMesh(upperColGeo, matRed, upperColPositions.length, (dummy, i) => {
+    dummy.position.set(...upperColPositions[i]);
+  });
+
+  // =============================================================
+  // 5. 上層屋根（二重目・入母屋造頂部屋根）
+  // 寸法根拠: 桁行24.5m, 梁間17.5m, 大棟頂部y=16.8m (y=13.0~16.8m, 高さ3.8m)
+  // ExtrudeGeometryで入母屋の屋根勾配断面を作成
+  // =============================================================
+  const roofShape = new THREE.Shape();
+  roofShape.moveTo(-8.75, 0);
+  roofShape.lineTo(-1.5, 3.8);
+  roofShape.lineTo(1.5, 3.8);
+  roofShape.lineTo(8.75, 0);
+  roofShape.closePath();
+
+  const upperRoofGeo = new THREE.ExtrudeGeometry(roofShape, { depth: 24.5, bevelEnabled: false });
+  upperRoofGeo.rotateY(Math.PI / 2);
+  upperRoofGeo.translate(0, 13.0, 12.25);
+  addMesh(upperRoofGeo, matRoof, true);
+
+  // 東西両端の入母屋破風（切妻三角妻壁）
+  const gableShape = new THREE.Shape();
+  gableShape.moveTo(-7.0, 0);
+  gableShape.lineTo(0, 3.2);
+  gableShape.lineTo(7.0, 0);
+  gableShape.closePath();
+
+  const gableGeoL = new THREE.ExtrudeGeometry(gableShape, { depth: 0.3, bevelEnabled: false });
+  gableGeoL.rotateY(Math.PI / 2);
+  gableGeoL.translate(-12.26, 13.5, 0);
+  addMesh(gableGeoL, matRed);
+
+  const gableGeoR = new THREE.ExtrudeGeometry(gableShape, { depth: 0.3, bevelEnabled: false });
+  gableGeoR.rotateY(Math.PI / 2);
+  gableGeoR.translate(12.26, 13.5, 0);
+  addMesh(gableGeoR, matRed);
+
+  // 破風中央の金の懸魚（げぎょ）飾り
+  const gegyoGeoL = new THREE.SphereGeometry(0.6, 8, 8);
+  gegyoGeoL.scale(0.3, 1.2, 1.0);
+  gegyoGeoL.translate(-12.45, 15.0, 0);
+  addMesh(gegyoGeoL, matGold);
+
+  const gegyoGeoR = new THREE.SphereGeometry(0.6, 8, 8);
+  gegyoGeoR.scale(0.3, 1.2, 1.0);
+  gegyoGeoR.translate(12.45, 15.0, 0);
+  addMesh(gegyoGeoR, matGold);
+
+  // 上層大棟 (最頂部の黒・金の化粧棟)
+  const ridgeGeo = new THREE.BoxGeometry(24.0, 0.4, 1.2);
+  ridgeGeo.translate(0, 16.6, 0);
+  addMesh(ridgeGeo, matBlack);
+
+  const ridgeGoldGeo = new THREE.BoxGeometry(22.0, 0.15, 0.8);
+  ridgeGoldGeo.translate(0, 16.8, 0);
+  addMesh(ridgeGoldGeo, matGold);
+
+  // 【取り込み時に落とした】上層屋根の丸瓦。長さ10mの円柱を屋根面に並べる作りで、
+  // 実機で見ると屋根を突き抜けて軒の外へ櫛のように飛び出していた。
+  // 屋根の勾配に沿わせ直すより、この縮尺では平らな赤瓦面のままの方が正しく見える。
+
+  // =============================================================
+  // 6. 龍頭棟飾（りゅうとうむなかざり）
+  // 寸法根拠: 大棟両端(X=±11.5m, Z=0)に載る高1.2mの龍頭。地面から頂点までぴったり18.0m
+  // =============================================================
+  function createRyuto(xSign) {
+    const x = xSign * 11.5;
+    // 台座
+    const ryutoBase = new THREE.BoxGeometry(0.8, 0.3, 0.8);
+    ryutoBase.translate(x, 16.95, 0);
+    addMesh(ryutoBase, matStone);
+
+    // 頭部
+    const ryutoHead = new THREE.SphereGeometry(0.45, 8, 8);
+    ryutoHead.scale(1.0, 1.2, 1.4);
+    ryutoHead.translate(x, 17.45, 0);
+    addMesh(ryutoHead, matRed);
+
+    // 角・宝珠 (最高点 y=18.0m)
+    const ryutoHorn = new THREE.ConeGeometry(0.25, 0.7, 8);
+    ryutoHorn.translate(x, 17.65, 0);
+    addMesh(ryutoHorn, matGold);
+  }
+  createRyuto(-1); // 左龍頭棟飾
+  createRyuto(1);  // 右龍頭棟飾
+
+  // =============================================================
+  // 7. 正面中央の唐破風（からはふ）の向拝（こうはい）
+  // 寸法根拠: 正面(-Z)へ3間(約6.5m)張り出す (Z=-10.63m~-17.13m)
+  // 首里城正殿最大の識別点であるゆるやかなS字（起りと反り）を描く弓形唐破風
+  // =============================================================
+  // 向拝柱 4本
+  const kohaiColGeo = new THREE.CylinderGeometry(0.26, 0.26, 6.0, 12);
+  const kohaiCols = [
+    [-3.8, 4.2, -16.8], [3.8, 4.2, -16.8],
+    [-3.8, 4.2, -11.5], [3.8, 4.2, -11.5]
+  ];
+  addInstancedMesh(kohaiColGeo, matRed, 4, (dummy, i) => {
+    dummy.position.set(...kohaiCols[i]);
+  });
+
+  // 向拝床/階 (y=1.2m)
+  const kohaiFloor = new THREE.BoxGeometry(8.2, 0.3, 6.0);
+  kohaiFloor.translate(0, 1.35, -13.88);
+  addMesh(kohaiFloor, matRed, true);
+
+  // 向拝極彩色梁
+  const kohaiBeam = new THREE.BoxGeometry(8.4, 0.6, 6.2);
+  kohaiBeam.translate(0, 7.0, -13.88);
+  addMesh(kohaiBeam, matRed);
+
+  const kohaiBeamGold = new THREE.BoxGeometry(8.6, 0.2, 0.3);
+  kohaiBeamGold.translate(0, 6.8, -16.9);
+  addMesh(kohaiBeamGold, matGold);
+
+  // 唐破風屋根（S字弓形曲線・Shape + ExtrudeGeometry）
+  const karaShape = new THREE.Shape();
+  karaShape.moveTo(-4.2, 0.0);
+  karaShape.quadraticCurveTo(-4.1, 0.4, -3.8, 0.5); // 左端の反り
+  karaShape.quadraticCurveTo(-2.0, 1.6, 0, 1.8);    // 中央への起り
+  karaShape.quadraticCurveTo(2.0, 1.6, 3.8, 0.5);   // 右への下がり
+  karaShape.quadraticCurveTo(4.1, 0.4, 4.2, 0.0);   // 右端の反り
+  karaShape.lineTo(4.1, -0.25);
+  karaShape.quadraticCurveTo(2.0, 1.35, 0, 1.55);
+  karaShape.quadraticCurveTo(-2.0, 1.35, -4.1, -0.25);
+  karaShape.closePath();
+
+  const karaExtrude = new THREE.ExtrudeGeometry(karaShape, { depth: 6.5, bevelEnabled: false });
+  karaExtrude.translate(0, 7.2, -17.13);
+  addMesh(karaExtrude, matRoof, true);
+
+  // 唐破風正面前縁の黒塗り破風板
+  const karaFrontEdge = new THREE.ExtrudeGeometry(karaShape, { depth: 0.15, bevelEnabled: false });
+  karaFrontEdge.translate(0, 7.2, -17.14);
+  addMesh(karaFrontEdge, matBlack);
+
+  // 唐破風頂部の金懸魚 (兎毛通し)
+  const gegyoGold = new THREE.SphereGeometry(0.5, 8, 8);
+  gegyoGold.scale(1.2, 1.0, 0.4);
+  gegyoGold.translate(0, 8.4, -17.15);
+  addMesh(gegyoGold, matGold);
+
+  // 【取り込み時に落とした】向拝屋根の丸瓦。上層と同じく突き抜けていた。
+
+  // =============================================================
+  // 8. 大龍柱（だいりゅうちゅう・正面階段両脇の石造龍巻き柱）
+  // 寸法根拠: 高さ約4.1m (y=1.2m~5.3m), 2本, 位置 X=±2.3m, Z=-16.0m
+  // 灰白色石造 (matStone: c9c0aa) + 金の目・牙 (matGold: c9a227)
+  // =============================================================
+  function createDairyuChu(xSign) {
+    const x = xSign * 2.3;
+    const z = -16.0;
+
+    // 主柱
+    const chuGeo = new THREE.CylinderGeometry(0.28, 0.32, 4.1, 12);
+    chuGeo.translate(x, 3.25, z);
+    addMesh(chuGeo, matStone);
+
+    // 柱に巻き付く龍の身（螺旋状に巻きつく立体感表現）
+    const bodyPositions = [
+      [x + xSign * 0.15, 1.9, z + 0.15, 0.4],
+      [x - xSign * 0.1, 2.9, z - 0.15, -0.3],
+      [x + xSign * 0.15, 3.9, z + 0.15, 0.4],
+      [x - xSign * 0.1, 4.8, z - 0.1, -0.2]
+    ];
+    for (let b of bodyPositions) {
+      const ringGeo = new THREE.TorusGeometry(0.32, 0.14, 8, 12);
+      ringGeo.rotateX(Math.PI / 3 * (b[3] > 0 ? 1 : -1));
+      ringGeo.translate(b[0], b[1], b[2]);
+      addMesh(ringGeo, matStone);
+    }
+
+    // 龍の頭部 (-Z方向を睨む彫刻)
+    const headGeo = new THREE.SphereGeometry(0.38, 8, 8);
+    headGeo.scale(0.9, 1.1, 1.4);
+    headGeo.translate(x, 4.9, z - 0.25);
+    addMesh(headGeo, matStone);
+
+    // 龍の開いた口・角・牙 (金)
+    const jawGeo = new THREE.ConeGeometry(0.25, 0.6, 8);
+    jawGeo.rotateX(-Math.PI / 3);
+    jawGeo.translate(x, 4.75, z - 0.45);
+    addMesh(jawGeo, matGold);
+
+    // 龍の目 (金)
+    const eyeGeoL = new THREE.SphereGeometry(0.08, 6, 6);
+    eyeGeoL.translate(x - 0.15, 5.0, z - 0.35);
+    addMesh(eyeGeoL, matGold);
+
+    const eyeGeoR = new THREE.SphereGeometry(0.08, 6, 6);
+    eyeGeoR.translate(x + 0.15, 5.0, z - 0.35);
+    addMesh(eyeGeoR, matGold);
+  }
+
+  createDairyuChu(-1); // 左大龍柱
+  createDairyuChu(1);  // 右大龍柱
+
+  return g;
+}
+
+// メッシュ数: 55
+
+// ---------------------------------------------------------------- 首里城の建物
+// 城内の建物は PLATEAU の LOD1(輪郭の押し出し)では白い箱にしかならないので、
+// OSM の輪郭で位置と向きを取り、赤瓦の寄棟屋根を自前で載せる。
+// 正殿だけは別格の造形(makeSeiden)を使う。
+//
+// 寸法の根拠: 正殿は内閣府沖縄総合事務局の復元設計で
+// 桁行下層 28.749m × 梁間下層 21.257m / 総高 18m(龍頭棟飾まで)。
+// OSM の輪郭(50.4×24.0m)は付属部分まで含んだ広めの取り方なので、
+// **位置と向きだけ OSM から取り、建物の寸法は設計の数字に合わせる**。
+// 軒までの壁の高さ(m)。琉球の建物は **壁が低く屋根が深い**ので、
+// 実測の総高からそのまま壁を立てると赤い箱に見える(実機で見て直した)。
+const CASTLE_H = {
+  '北殿': 4.6, '南殿・番所': 4.4, '南殿': 4.4, '番所': 3.8,
+  '奉神門': 5.2, '広福門': 4.2,
+};
+
+/** 輪郭から、主軸に沿った中心・幅・奥行・向きを出す。 */
+function footprintFrame(ring) {
+  let cx = 0, cz = 0;
+  for (const [x, z] of ring) { cx += x; cz += z; }
+  cx /= ring.length; cz /= ring.length;
+  // 面積最小の外接矩形を探す(建物は斜めを向いているので回さないと測れない)
+  let best = null;
+  for (let a = 0; a < 90; a++) {
+    const t = a * Math.PI / 180, c = Math.cos(t), sn = Math.sin(t);
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (const [x, z] of ring) {
+      const u = (x - cx) * c - (z - cz) * sn, v = (x - cx) * sn + (z - cz) * c;
+      if (u < x0) x0 = u; if (u > x1) x1 = u;
+      if (v < z0) z0 = v; if (v > z1) z1 = v;
+    }
+    const area = (x1 - x0) * (z1 - z0);
+    if (!best || area < best.area) best = { area, w: x1 - x0, d: z1 - z0, yaw: -t };
+  }
+  return { cx, cz, ...best };
+}
+
+/** 赤瓦の寄棟屋根(城内の脇殿・門に使う簡素な版)。 */
+function castleRoof(w, d, eave, mats) {
+  const g = new THREE.Group();
+  // 軒の出も屋根の高さも大きく取る。0.22 では 40m の長い建物が
+  // 平らな赤いスラブに見えた(実機で確認)
+  const OVER = 2.4;                       // 軒の出(m)。深い軒が沖縄の建物らしさ
+  const rise = Math.min(Math.min(w, d) * 0.52, 6.5);   // 屋根の高さ
+  const W = w / 2 + OVER, D = d / 2 + OVER;
+  const rw = w * 0.22, rd = 0;            // 大棟の長さ(寄棟なので稜線が短い)
+  const V = [], N = [];
+  const tri = (a, b, c) => {
+    const ux = b[0]-a[0], uy = b[1]-a[1], uz = b[2]-a[2];
+    const vx = c[0]-a[0], vy = c[1]-a[1], vz = c[2]-a[2];
+    let nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+    const L = Math.hypot(nx, ny, nz) || 1; nx/=L; ny/=L; nz/=L;
+    for (const p of [a, b, c]) { V.push(p[0], p[1], p[2]); N.push(nx, ny, nz); }
+  };
+  const A = [-W, 0, -D], B = [W, 0, -D], C = [W, 0, D], Dd = [-W, 0, D];
+  const R0 = [-rw / 2, rise, rd], R1 = [rw / 2, rise, rd];
+  tri(A, B, R1); tri(A, R1, R0);          // 前
+  tri(C, Dd, R0); tri(C, R0, R1);         // 後
+  tri(B, C, R1);                          // 右
+  tri(Dd, A, R0);                         // 左
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+  const m = new THREE.Mesh(geo, mats.tile);
+  m.position.y = eave;
+  m.castShadow = m.receiveShadow = true;
+  g.add(m);
+  // 大棟(白漆喰)。沖縄の赤瓦は棟を漆喰で固めるので白い線が入る
+  const ridge = new THREE.Mesh(new THREE.BoxGeometry(rw + 0.6, 0.5, 0.7), mats.plaster);
+  ridge.position.set(0, eave + rise + 0.1, rd);
+  ridge.castShadow = true;
+  g.add(ridge);
+  return g;
+}
+
+function addCastle(t) {
+  const list = t.data.castle ?? [];
+  if (!list.length) return;
+  // 正殿は御庭(西側)を向く。輪郭の主軸から取った向きだと背を向けることがある
+  // (実機で見たら唐破風も大龍柱も裏側だった)。御庭の正面にある奉神門を狙う。
+  const facing = list.find((c) => c.name === '奉神門');
+  let faceX = null, faceZ = null;
+  if (facing) {
+    let x = 0, z = 0, n = 0;
+    for (let i = 0; i < facing.f.length; i += 2) {
+      x += t.X(facing.f[i]); z += t.Z(facing.f[i + 1]); n++;
+    }
+    faceX = x / n; faceZ = z / n;
+  }
+  const mats = {
+    tile: new THREE.MeshLambertMaterial({ color: 0xa8442c }),      // 赤瓦
+    wall: new THREE.MeshLambertMaterial({ color: 0xb03a26 }),      // 朱塗り
+    plaster: new THREE.MeshLambertMaterial({ color: 0xe8e0d0 }),   // 白漆喰
+    stone: new THREE.MeshLambertMaterial({ color: 0xc9c0aa }),     // 石の基壇
+  };
+  for (const c of list) {
+    const ring = [];
+    for (let i = 0; i < c.f.length; i += 2) ring.push([t.X(c.f[i]), t.Z(c.f[i + 1])]);
+    const f = footprintFrame(ring);
+    const gy = groundAt(f.cx, f.cz);
+    const g = new THREE.Group();
+    g.position.set(f.cx, gy, f.cz);
+    // 造形の正面は -Z。対象を向く yaw は atan2(-Δx, -Δz)
+    g.rotation.y = (c.name === '正殿' && faceX !== null)
+      ? Math.atan2(-(faceX - f.cx), -(faceZ - f.cz))
+      : f.yaw;
+
+    if (c.name === '正殿') {
+      // 寸法は復元設計の数字。OSM の輪郭は広すぎるので使わない
+      g.add(makeSeiden());
+    } else {
+      const h = CASTLE_H[c.name] ?? 6.5;
+      const w = f.w, d = f.d;
+      // 基壇
+      const base = new THREE.Mesh(new THREE.BoxGeometry(w + 1.2, 0.8, d + 1.2), mats.stone);
+      base.position.y = 0.4;
+      base.castShadow = base.receiveShadow = true;
+      g.add(base);
+      // 軸部(朱塗り)。屋根が深いので壁は軒より一回り内側にする
+      const body = new THREE.Mesh(new THREE.BoxGeometry(w - 1.0, h, d - 1.0), mats.wall);
+      body.position.y = 0.8 + h / 2;
+      body.castShadow = body.receiveShadow = true;
+      g.add(body);
+      // 白漆喰の腰壁。赤一色の箱に見えるのを避ける
+      const skirt = new THREE.Mesh(
+        new THREE.BoxGeometry(w - 0.9, 1.0, d - 0.9), mats.plaster);
+      skirt.position.y = 1.3;
+      skirt.castShadow = true;
+      g.add(skirt);
+      g.add(castleRoof(w, d, 0.8 + h, mats));
+    }
+    // 建物の中に入られないよう固体にする(中身は作っていない)
+    addSolid(f.cx, f.cz, f.w, f.d, -f.yaw, gy + (CASTLE_H[c.name] ?? 12), t.key);
+    t.group.add(g);
+  }
+  console.log(`[${t.key}] 首里城の建物 ${list.length}棟 ` +
+    `(${list.map((c) => c.name).join('、')})`);
 }
 
 // ---------------------------------------------------------------- 公園の木
