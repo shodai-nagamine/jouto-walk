@@ -55,8 +55,16 @@ async function fetchTile(tx, tz) {
     return r.json();
   });
   const [offX, offZ] = data.meta.offset ?? [0, 0];
+  // タイルごとの擬似乱数。タイルは出し入れするので、全タイル共通の乱数を使うと
+  // 同じタイルに戻るたびに木や遊具の位置が変わる(実測で固体の数が 2630→2640→2639
+  // と揺れた)。鍵から種を作れば、何度捨てて読み直しても同じ街になる。
+  let seed = ((tx * 73856093) ^ (tz * 19349663) ^ 0x9e3779b9) >>> 0;
+  const trnd = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed / 0x7fffffff;
+  };
   const t = {
-    key, tx, tz, data, offX, offZ,
+    key, tx, tz, data, offX, offZ, rnd: trnd,
     n: data.meta.n, cell: data.meta.cell, terrain: data.terrain,
     group: new THREE.Group(),      // このタイルの描画物。破棄はここを畳めばよい
     X: (v) => v - HALF + offX,     // タイル内座標 -> ワールド座標
@@ -71,14 +79,19 @@ function tileOf(x, z) {
   return tiles.get(`${Math.round(x / TILE)},${Math.round(z / TILE)}`) ?? null;
 }
 
-/** 読み込み済みタイルが覆う範囲 {minx,maxx,minz,maxz}。移動の制限と地図に使う。 */
-function worldBounds() {
+/** タイルの並び {tx,tz} から、それが覆う範囲 {minx,maxx,minz,maxz} を出す。 */
+function boundsOf(list) {
   let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
-  for (const t of tiles.values()) {
-    minx = Math.min(minx, t.offX - HALF); maxx = Math.max(maxx, t.offX + HALF);
-    minz = Math.min(minz, t.offZ - HALF); maxz = Math.max(maxz, t.offZ + HALF);
+  for (const { tx, tz } of list) {
+    minx = Math.min(minx, tx * TILE - HALF); maxx = Math.max(maxx, tx * TILE + HALF);
+    minz = Math.min(minz, tz * TILE - HALF); maxz = Math.max(maxz, tz * TILE + HALF);
   }
   return { minx, maxx, minz, maxz };
+}
+
+/** 読み込み済みタイルが覆う範囲。受け皿(外周の帯)を張る位置に使う。 */
+function worldBounds() {
+  return boundsOf([...tiles.values()]);
 }
 
 /** 世界座標(x,z) の地表標高。そのタイルのグリッドを双一次補間する。 */
@@ -102,12 +115,24 @@ function groundAt(x, z) {
   return (a * (1 - sx) + b * sx) * (1 - sz) + (c * (1 - sx) + d * sx) * sz;
 }
 
-// いま読むタイル。既定は1枚(=従来と同じ1km四方)。
-// tiles/*.json は .gitignore してあり公開物には含まれないので、
-// 複数タイルは手元で `?tiles=0,0;-1,0` のように指定して試す。
-const TILE_LIST = (qs.get('tiles') || '0,0').split(';')
-  .map((s) => s.split(',').map(Number))
-  .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b));
+// この世界にどのタイルがあるか(tools/build_tile_index.py が作る)。
+// 「いま読み込んでいるタイル」とは別物で、こちらは歩き回っても変わらない。
+// 歩ける範囲と地図の縮尺はこちらで決める(読み込みに追従させると、
+// 歩くたびに地図の縮尺が変わって現在地が掴めなくなる)。
+const WORLD_TILES = await fetch('./data/tiles/index.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .then((j) => (j?.tiles ?? [[0, 0]]).map(([tx, tz]) => ({ tx, tz })))
+  .catch(() => [{ tx: 0, tz: 0 }]);
+const WORLD_KEYS = new Set(WORLD_TILES.map((t) => `${t.tx},${t.tz}`));
+const WORLD_B = boundsOf(WORLD_TILES);
+
+// 最初に読むタイル。既定はタイル(0,0)だけで、残りは歩くにつれて足す。
+// `?tiles=0,0;-1,0` で明示すると、その並びだけを読んで足し引きしない(検証用)。
+const TILE_FIXED = qs.has('tiles');
+const TILE_LIST = TILE_FIXED
+  ? qs.get('tiles').split(';').map((s) => s.split(',').map(Number))
+      .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b))
+  : [[0, 0]];
 for (const [tx, tz] of TILE_LIST) await fetchTile(tx, tz);
 const tile0 = tiles.get('0,0') ?? tiles.values().next().value;
 // タイル(0,0)の生データ。描画には使わない(window.dbg から覗くためだけに残す)。
@@ -643,6 +668,24 @@ const BEAM_T = 1.6;         // 桁の高さ(m)
 const PIER_EVERY = 26;      // 橋脚の間隔(m)
 const railPaths = [];       // 描画・車両走行に使う {pts:[{x,y,z}], len, cum[]}
 
+/**
+ * obj 以下のジオメトリとマテリアルを解放する。
+ * three は remove しても GPU 側を離さないので、タイルを出し入れすると溜まる。
+ * 素材(テクスチャ)は共有していることがあるので、map だけは持ち主が要るときに
+ * 各自で捨てる(ここでは触らない)。
+ */
+function disposeTree(obj) {
+  obj.traverse((o) => {
+    o.geometry?.dispose?.();
+    const m = o.material;
+    if (!m) return;
+    for (const one of Array.isArray(m) ? m : [m]) {
+      one.map?.dispose?.();
+      one.dispose?.();
+    }
+  });
+}
+
 function buildMonorail() {
   const group = new THREE.Group();
   const beamMat = new THREE.MeshLambertMaterial({ color: 0xd8d5cc });
@@ -867,8 +910,17 @@ function addTerrain(t) {
 // 歩道網の 41% がその高さより下で、シーサー 10 体中 4 体がその中を歩いていたので、
 // 「全部保護する」遊びそのものが壊れていた。
 // 外周に沿って高さを拾えば、どこに立っても頭上に板が来ない。
-{
+// タイルを足し引きすると縁が動くので、そのつど張り直す。
+let skirt = null;
+function buildApron() {
+  if (skirt) {
+    scene.remove(skirt);
+    skirt.geometry.dispose();
+    skirt.material.dispose();
+    skirt = null;
+  }
   const B = worldBounds();
+  if (!Number.isFinite(B.minx)) return;
   const OUT = 1500;            // 霧が 1250m で閉じるのでこれで足りる
   const STEP = 20;             // 外周を刻む間隔(m)
   const IN = 0.5;              // 端ちょうどはタイルの引き当てが不安定なので少し内側
@@ -907,11 +959,12 @@ function addTerrain(t) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
   geo.computeVertexNormals();
-  const skirt = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: 0x7d9159 }));
+  skirt = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: 0x7d9159 }));
   // 影は受けない。影カメラは ±105m しかないので、その外側が真っ黒に落ちる
   scene.add(skirt);
   console.log(`受け皿 外周${n}点 / 外へ${OUT}m`);
 }
+buildApron();
 
 // ---------------------------------------------------------------- 電柱
 // 垂直の目印が無いと街の奥行きが読めないので、道路際とおぼしき所に立てる
@@ -1066,6 +1119,15 @@ function addAura(g) {
 let seed = 20260805;
 const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
 const seesaa = [];
+// シーサーはタイルに属さない。タイルを捨てても消さないので、専用の入れ物に置く。
+// 分母は最初から世界ぜんぶで決まっている(タイルを読むたびに増えると
+// 「ぜんぶ保護する」の目標が動いてしまう)。
+const seesaaGroup = new THREE.Group();
+scene.add(seesaaGroup);
+// シーサーを置き終えたタイル。タイルは出し入れするが、シーサーは捨てないので、
+// この覚えが無いと同じタイルに戻るたびに10体ずつ増える(実際に増えた)。
+const seesaaDone = new Set();
+const SEESAA_TOTAL = N_SEESAA * WORLD_TILES.length;
 
 /** タイル t の道路面から、互いに離れた設置点を選ぶ(道沿いなので必ず辿り着ける)。 */
 function roadSpots(t, want) {
@@ -1083,7 +1145,7 @@ function roadSpots(t, want) {
     cand.push([cx, cz]);
   }
   for (let i = cand.length - 1; i > 0; i--) {        // 擬似乱数でシャッフル
-    const j = (rnd() * (i + 1)) | 0;
+    const j = (t.rnd() * (i + 1)) | 0;
     [cand[i], cand[j]] = [cand[j], cand[i]];
   }
   // まず十分離して選び、足りなければ間隔を詰めて補う
@@ -1101,29 +1163,38 @@ function roadSpots(t, want) {
 
 /** タイル t にシーサーを散らす。 */
 function addSeesaa(t) {
+  if (seesaaDone.has(t.key)) return;      // このタイルには置き済み
+  seesaaDone.add(t.key);
   const spots = roadSpots(t, N_SEESAA);
   let n = 0;
   for (let i = 0; i < N_SEESAA; i++) {
     let placed = spots[i] ?? null;
     if (!placed) {                                   // 道路が無い区画向けの保険
-      const ang = (i / N_SEESAA) * Math.PI * 2 + rnd() * 0.55;
+      const ang = (i / N_SEESAA) * Math.PI * 2 + t.rnd() * 0.55;
       for (let tries = 0; tries < 260 && !placed; tries++) {
-        const rad = 55 + rnd() * 330;
-        const x = t.offX + Math.cos(ang + (rnd() - 0.5) * 0.5) * rad;
-        const z = t.offZ + Math.sin(ang + (rnd() - 0.5) * 0.5) * rad;
+        const rad = 55 + t.rnd() * 330;
+        const x = t.offX + Math.cos(ang + (t.rnd() - 0.5) * 0.5) * rad;
+        const z = t.offZ + Math.sin(ang + (t.rnd() - 0.5) * 0.5) * rad;
         if (Math.abs(x - t.offX) > HALF - 30 || Math.abs(z - t.offZ) > HALF - 30) continue;
         if (!blocked(x, z, 2.4)) placed = [x, z];
       }
+      // それでも空きが無ければ重なりを許して置く。分母(SEESAA_TOTAL)を
+      // 満たせないと「ぜんぶ保護」に永久に到達しないため。
+      // どのみち seatSeesaa が歩道の上へ乗せ替える
+      if (!placed) {
+        const rad = 55 + t.rnd() * 330;
+        placed = [t.offX + Math.cos(ang) * rad, t.offZ + Math.sin(ang) * rad];
+      }
     }
-    if (!placed) continue;
     const [x, z] = placed;
     const g = makeSeesaa();
     addAura(g);
     g.position.set(x, groundAt(x, z), z);
-    g.rotation.y = rnd() * Math.PI * 2;
+    g.rotation.y = t.rnd() * Math.PI * 2;
     g.userData.taken = false;
+    g.userData.tile = t.key;
     // 歩道網に乗せ替えるのは walkLines が揃ってから(seatSeesaa)。ここは仮置き
-    t.group.add(g);
+    seesaaGroup.add(g);
     seesaa.push(g);
     n++;
   }
@@ -1158,7 +1229,9 @@ function buildTileProps(t) {
 // 縁の敷地色に効いて継ぎ目が目立たない。なので2周に分ける。
 for (const t of tiles.values()) { addRoads(t); addBuildings(t); }
 for (const t of tiles.values()) buildTileCore(t);
-const BOUNDS = worldBounds();
+// 歩ける範囲は「読み込み済み」ではなく **世界ぜんぶ**。まだ読んでいない方へ
+// 歩けないと、そもそもタイルを足す機会が来ない。
+const BOUNDS = WORLD_B;
 
 // ---------------------------------------------------------------- 城東小の目印
 {
@@ -1194,7 +1267,17 @@ const BOUNDS = worldBounds();
 }
 
 // ---------------------------------------------------------------- モノレール設置
-buildMonorail();
+let monorailGroup = buildMonorail();
+
+/** 桁と橋脚を今のタイルに合わせて張り直す。線形(railPaths)も作り直す。 */
+function rebuildMonorail() {
+  if (monorailGroup) {
+    scene.remove(monorailGroup);
+    disposeTree(monorailGroup);
+  }
+  railPaths.length = 0;
+  monorailGroup = buildMonorail();
+}
 
 /** 折れ線の距離 d の地点と進行方位を返す。 */
 function railAt(path, d) {
@@ -1319,35 +1402,48 @@ function buildPlatform(q, t) {
   console.log(`[${t.key}] ホーム: 床 ${floorY.toFixed(1)}m / 地上 ${gnd.toFixed(1)}m / 階段${steps}段`);
 }
 
-// 駅(ホーム＋屋根＋駅名)。線形上のいちばん近い点に合わせて向きを決める。
-// corridor.json は全16駅を持つので、読み込み済みタイルの上にあるものだけ建てる
-// (タイルの外は地形が縁で埋められた作り物なので、ホームの高さが出鱈目になる)。
-for (const st of corridor?.stations ?? []) {
-  const home = tileOf(st.x, st.z);
-  if (!home) continue;
-  const sx = st.x, sz = st.z;
-  let best = null;
-  for (const p of railPaths) {
-    for (let d = 0; d <= p.len; d += 4) {
-      const q = railAt(p, d);
-      const dist = Math.hypot(q.x - sx, q.z - sz);
-      if (!best || dist < best.dist) best = { dist, q, d, p };
+/**
+ * 駅(ホーム＋屋根＋駅名)を今のタイルに合わせて建て直す。
+ * 線形上のいちばん近い点に合わせて向きを決める。
+ *
+ * corridor.json は全16駅を持つので、読み込み済みタイルの上にあるものだけ建てる
+ * (タイルの外は地形が縁で埋められた作り物なので、ホームの高さが出鱈目になる)。
+ * ホームはタイルの群にぶら下げてあるので、タイルを捨てれば一緒に消える。
+ * ここでは「まだ建っていない駅」だけを建てる。
+ */
+function buildStations() {
+  // 線形を作り直すと railPaths の中身が別物になるので、駅も引き直す
+  stationStops.length = 0;
+  for (const st of corridor?.stations ?? []) {
+    const home = tileOf(st.x, st.z);
+    if (!home) continue;
+    const sx = st.x, sz = st.z;
+    let best = null;
+    for (const p of railPaths) {
+      for (let d = 0; d <= p.len; d += 4) {
+        const q = railAt(p, d);
+        const dist = Math.hypot(q.x - sx, q.z - sz);
+        if (!best || dist < best.dist) best = { dist, q, d, p };
+      }
     }
+    if (!best || best.dist > 90) continue;
+    const { q } = best;
+    stationStops.push({ name: st.name, q, d: best.d, p: best.p });
+    // ホームは桁の真下に建てるので、駅の点ではなく桁の点が乗るタイルに預ける
+    const t = tileOf(q.x, q.z) ?? home;
+    if (t.stations?.has(st.name)) continue;      // このタイルには建て済み
+    (t.stations ??= new Set()).add(st.name);
+    buildPlatform(q, t);
+    // 駅舎は PLATEAU の建物として既にある(石嶺駅=17x53m/高さ約16m)。
+    // 高架はその中をホーム高さで通り抜けるのが実際の姿なので、
+    // 駅舎は建てず、駅名だけを建物の上に出す。
+    const lab = makeLabel(`${st.name}駅`);
+    lab.position.set(q.x, supportY(q.x, q.z) + 5.5, q.z);
+    t.group.add(lab);
+    console.log(`[${t.key}] 駅名を設置: ${st.name} (${q.x.toFixed(0)}, ${q.z.toFixed(0)})`);
   }
-  if (!best || best.dist > 90) continue;
-  const { q } = best;
-  stationStops.push({ name: st.name, q, d: best.d, p: best.p });
-  // ホームは桁の真下に建てるので、駅の点ではなく桁の点が乗るタイルに預ける
-  const t = tileOf(q.x, q.z) ?? home;
-  buildPlatform(q, t);
-  // 駅舎は PLATEAU の建物として既にある(石嶺駅=17x53m/高さ約16m)。
-  // 高架はその中をホーム高さで通り抜けるのが実際の姿なので、
-  // 駅舎は建てず、駅名だけを建物の上に出す。
-  const lab = makeLabel(`${st.name}駅`);
-  lab.position.set(q.x, supportY(q.x, q.z) + 5.5, q.z);
-  t.group.add(lab);
-  console.log(`[${t.key}] 駅名を設置: ${st.name} (${q.x.toFixed(0)}, ${q.z.toFixed(0)})`);
 }
+buildStations();
 
 // ---------------------------------------------------------------- バス停
 // 出典は OpenStreetMap(ODbL)。国土数値情報のバス停(P11)は「非商用」区分で
@@ -1396,6 +1492,7 @@ function addBusStops(t) {
       }));
       sp.scale.set(3.9, 1.3, 1);
       sp.position.set(x, g + 3.1, z);
+      sp.userData.tile = t.key;
       t.group.add(sp);
       busSigns.push(sp);
     });
@@ -1514,8 +1611,8 @@ function addTrees(t, playSites) {
     // 90m2 に1本。小さな児童公園でも木が無いと寂しいので最低1本は試す
     const want = Math.max(1, Math.min(40, Math.round(Math.abs(a2) / 2 / 90)));
     for (let k = 0, guard = 0; k < want && guard < want * 40; guard++) {
-      const x = minx + Math.random() * (maxx - minx);
-      const z = minz + Math.random() * (maxz - minz);
+      const x = minx + t.rnd() * (maxx - minx);
+      const z = minz + t.rnd() * (maxz - minz);
       if (Math.abs(x - t.offX) > HALF - 5 || Math.abs(z - t.offZ) > HALF - 5) continue;
       if (!inside(x, z)) continue;
       if (blocked(x, z, 2.2)) continue;          // 建物際は避ける
@@ -1540,16 +1637,16 @@ function addTrees(t, playSites) {
     const col = new THREE.Color();
     spots.forEach(([x, z], i) => {
       const y = groundAt(x, z);
-      const h = 3.2 + Math.random() * 3.0;
-      const r = 1.4 + Math.random() * 1.2;
-      qt.setFromAxisAngle(up, Math.random() * Math.PI * 2);
+      const h = 3.2 + t.rnd() * 3.0;
+      const r = 1.4 + t.rnd() * 1.2;
+      qt.setFromAxisAngle(up, t.rnd() * Math.PI * 2);
       m4.compose(pv3.set(x, y, z), qt, sv3.set(1, h, 1));
       trunks.setMatrixAt(i, m4);
       m4.compose(pv3.set(x, y + h + r * 0.4, z), qt, sv3.set(r, r * 0.85, r));
       leaves.setMatrixAt(i, m4);
       // 亜熱帯の照葉樹。濃い緑から明るい黄緑まで振って単調さを消す
-      col.setHSL(0.25 + Math.random() * 0.06, 0.30 + Math.random() * 0.20,
-                 0.24 + Math.random() * 0.13);
+      col.setHSL(0.25 + t.rnd() * 0.06, 0.30 + t.rnd() * 0.20,
+                 0.24 + t.rnd() * 0.13);
       leaves.setColorAt(i, col);
       addSolid(x, z, 0.55, 0.55, 0, y + h, t.key);   // 幹だけ固体にする
     });
@@ -1570,7 +1667,7 @@ function addPlayground(t, playSites) {
   for (const [cx, cz] of playSites) {
     const g = new THREE.Group();
     g.position.set(cx, groundAt(cx, cz), cz);
-    g.rotation.y = Math.random() * Math.PI * 2;
+    g.rotation.y = t.rnd() * Math.PI * 2;
 
     // 滑り台: 踊り場・斜面・脚
     const deck = mk(1.1, 0.14, 1.1, 0xd8b13a); deck.position.set(-1.5, 1.45, 0);
@@ -1789,7 +1886,7 @@ function addShopSigns(t) {
     sp.visible = false;
     // 中に入れるようにするので、店の素性と入口を看板に持たせておく
     sp.userData = { name: l.name, mark, color, kind: s.val, oh: l.oh || '',
-                    x: s.x, z: s.z, door };
+                    x: s.x, z: s.z, door, tile: t.key };
     t.group.add(sp);
     shopSigns.push(sp);
     n++;
@@ -2053,26 +2150,41 @@ const PED_HIP = 0.86, PED_SHOULDER = 1.34, PED_HEAD = 1.60;
 const PED_ARM = 0.60, PED_LEG = PED_HIP;
 const walkLines = [];
 
-{
-  // 歩道は corridor.json ではなくタイルが持つ(OSM をタイルごとに切ってある)。
-  for (const t of tiles.values()) {
-    for (const f of t.data.footways ?? []) {
-      if (f.k !== 'sidewalk' && f.k !== 'path') continue;
-      const pts = [];
-      for (let i = 0; i < f.f.length; i += 2) {
-        pts.push({ x: t.X(f.f[i]), z: t.Z(f.f[i + 1]) });
-      }
-      if (pts.length < 2) continue;
-      const cum = [0];
-      let len = 0;
-      for (let i = 1; i < pts.length; i++) {
-        len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
-        cum.push(len);
-      }
-      if (len < 6) continue;               // 短すぎる断片は使わない
-      walkLines.push({ pts, cum, len });
+/**
+ * タイル t の歩道を歩道網に足す。歩道は corridor.json ではなくタイルが持つ
+ * (OSM をタイルごとに切ってある)ので、タイルの出し入れに合わせて足し引きする。
+ */
+function addWalkLines(t) {
+  let n = 0;
+  for (const f of t.data.footways ?? []) {
+    if (f.k !== 'sidewalk' && f.k !== 'path') continue;
+    const pts = [];
+    for (let i = 0; i < f.f.length; i += 2) {
+      pts.push({ x: t.X(f.f[i]), z: t.Z(f.f[i + 1]) });
     }
+    if (pts.length < 2) continue;
+    const cum = [0];
+    let len = 0;
+    for (let i = 1; i < pts.length; i++) {
+      len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
+      cum.push(len);
+    }
+    if (len < 6) continue;               // 短すぎる断片は使わない
+    walkLines.push({ pts, cum, len, tile: t.key });
+    n++;
   }
+  return n;
+}
+
+/** タイル key の歩道を歩道網から外す。乗っていた者は呼び出し側で乗せ替える。 */
+function dropWalkLines(key) {
+  for (let i = walkLines.length - 1; i >= 0; i--) {
+    if (walkLines[i].tile === key) walkLines.splice(i, 1);
+  }
+}
+
+{
+  for (const t of tiles.values()) addWalkLines(t);
 
   if (walkLines.length) {
     // 胴・頭・髪・四肢の4つの InstancedMesh に畳む(描画4回)。
@@ -2140,26 +2252,55 @@ const SEESAA_TROT = 1.45;      // 早足
 const SEESAA_NEAR = 16;        // この距離まで近づかれると早足になる(m)
 const SEESAA_PAUSE = 4.5;      // 立ち止まる秒数の上限
 
-/** シーサーを歩道網に乗せる。walkLines が揃ってから呼ぶこと。 */
+/**
+ * シーサーを歩道網に乗せる。walkLines が揃ってから呼ぶこと。
+ *
+ * 二通りある:
+ *  - 初めての個体は互いになるべく離れた歩道へ(固まって湧くと探す楽しみが無い)
+ *  - タイルを捨てられて足を止めていた個体(L === null)は、いま立っている場所の
+ *    いちばん近い歩道へ戻す。遠くの歩道へ乗せ直すと、離れて居たはずの1体が
+ *    プレイヤーの目の前へ湧いてしまう
+ */
 function seatSeesaa() {
   if (!walkLines.length) return;
+  const live = new Set(walkLines);
   const used = [];
+  let fresh = 0, back = 0;
   for (const g of seesaa) {
-    // 互いになるべく離れた歩道を選ぶ。固まって湧くと探す楽しみが無くなる
-    let best = null, bestSep = -1;
-    for (let k = 0; k < 60; k++) {
-      const L = walkLines[(rnd() * walkLines.length) | 0];
-      if (L.len < 12) continue;              // 短い断片では歩いているように見えない
-      const d = rnd() * L.len;
-      const q = walkAt(L, d);
-      const sep = used.length
-        ? Math.min(...used.map((u) => Math.hypot(u[0] - q.x, u[1] - q.z))) : 1e9;
-      if (sep > bestSep) { bestSep = sep; best = { L, d, q }; }
+    const u = g.userData;
+    if (u.L && live.has(u.L)) { used.push([g.position.x, g.position.z]); continue; }
+    if (!tiles.has(u.tile)) continue;        // 居場所のタイルが無い間はそのまま
+    let best = null;
+    if (u.L === null) {
+      // 足を止めていた個体を、自分のタイルのいちばん近い歩道へ戻す
+      let bd = Infinity;
+      for (const L of walkLines) {
+        if (L.tile !== u.tile || L.len < 12) continue;
+        for (let d = 0; d <= L.len; d += 4) {
+          const q = walkAt(L, d);
+          const e = Math.hypot(q.x - g.position.x, q.z - g.position.z);
+          if (e < bd) { bd = e; best = { L, d, q }; }
+        }
+      }
+      if (best) back++;
+    } else {
+      // 初めての個体。互いになるべく離れた歩道を選ぶ
+      let bestSep = -1;
+      for (let k = 0; k < 60; k++) {
+        const L = walkLines[(rnd() * walkLines.length) | 0];
+        if (L.len < 12) continue;            // 短い断片では歩いているように見えない
+        const d = rnd() * L.len;
+        const q = walkAt(L, d);
+        const sep = used.length
+          ? Math.min(...used.map((w) => Math.hypot(w[0] - q.x, w[1] - q.z))) : 1e9;
+        if (sep > bestSep) { bestSep = sep; best = { L, d, q }; }
+      }
+      if (best) fresh++;
     }
     if (!best) continue;
     used.push([best.q.x, best.q.z]);
-    Object.assign(g.userData, {
-      line: walkLines.indexOf(best.L), d: best.d,
+    Object.assign(u, {
+      L: best.L, d: best.d,
       dir: rnd() < 0.5 ? 1 : -1,
       phase: rnd() * Math.PI * 2,
       pause: rnd() * SEESAA_PAUSE,
@@ -2167,7 +2308,10 @@ function seatSeesaa() {
     });
     g.position.set(best.q.x, groundAt(best.q.x, best.q.z), best.q.z);
   }
-  console.log(`シーサー ${seesaa.length} 体を歩道に乗せた`);
+  if (fresh || back) {
+    console.log(`シーサー 新規${fresh}体 / 復帰${back}体 を歩道に乗せた` +
+                `（累計 ${seesaa.length}）`);
+  }
 }
 
 seatSeesaa();
@@ -2297,11 +2441,13 @@ function stepSeesaa(g, dist, dt, now) {
   u.trot += (want - u.trot) * Math.min(1, dt * 1.8);
   const speed = SEESAA_WALK + (SEESAA_TROT - SEESAA_WALK) * u.trot;
 
-  if (u.line !== undefined && walkLines.length) {
+  // 歩道は番号ではなく線そのもので持つ。タイルを捨てると walkLines の並びが
+  // 変わるので、番号だと別の歩道の上へ瞬間移動してしまう。
+  if (u.L && walkLines.length) {
     if (u.pause > 0 && u.trot < 0.25) {
       u.pause -= dt;                         // 追われている間は立ち止まらない
     } else {
-      const L = walkLines[u.line];
+      const L = u.L;
       u.d += u.dir * speed * dt;
       // 端で折り返す。歩道は途中で曲がるので、これだけで角を曲がって見える
       if (u.d > L.len) { u.d = L.len; u.dir = -1; u.pause = 1 + rnd() * SEESAA_PAUSE; }
@@ -2341,13 +2487,14 @@ function walkAt(L, d) {
 
 /** プレイヤーの手前の歩道へ湧かし直す。見つからなければ諦めて休ませる。 */
 function respawnPed(p) {
+  if (!walkLines.length) { p.alive = false; return; }
   for (let tries = 0; tries < 24; tries++) {
     const L = walkLines[(Math.random() * walkLines.length) | 0];
     const d = Math.random() * L.len;
     const q = walkAt(L, d);
     const dist = Math.hypot(q.x - player.x, q.z - player.z);
     if (dist < PED_NEAR[0] || dist > PED_NEAR[1]) continue;
-    p.line = walkLines.indexOf(L); p.d = d;
+    p.L = L; p.d = d;
     p.dir = Math.random() < 0.5 ? 1 : -1;
     p.alive = true;
     return;
@@ -2421,7 +2568,8 @@ function addSignals(t) {
       lamps.setMatrixAt(i * 3 + k, m);
     }
     // 灯火の書き換え先(どのメッシュの何番目か)を持たせておく
-    signals.push({ x, z, r: s.r, k: s.k, a: s.a, g: gidBase + s.g, lamps, li: i * 3 });
+    signals.push({ x, z, r: s.r, k: s.k, a: s.a, g: gidBase + s.g, lamps, li: i * 3,
+                  tile: t.key });
   });
   poles.instanceMatrix.needsUpdate = true;
   cases.instanceMatrix.needsUpdate = true;
@@ -2481,7 +2629,23 @@ const buses = [];
 function routeName(s) {
   return s.replace(/\s*[（(][^（(]*[)）]?\s*$/, '').trim() || s.trim();
 }
-{
+
+/**
+ * 走るバスを今のタイルに合わせて作り直す。
+ * 経路は全線ぶんあるので読み込み済みタイル+余白で切る。切り直すと経路の長さが
+ * 変わるので、走行位置は距離ではなく **世界座標** で引き継ぐ
+ * (距離のまま渡すと、経路が伸びた瞬間にバスが数百m飛ぶ)。
+ */
+function rebuildBuses() {
+  const was = new Map();
+  for (const b of buses) {
+    const q = pathAt(b.path, b.d);
+    was.set(b.ref, { x: q.x, z: q.z, dir: b.dir, wait: b.wait });
+    scene.remove(b.g);
+    disposeTree(b.g);
+  }
+  buses.length = 0;
+
   const LIVERY = [0xf2f0ea, 0xe8642f];   // 白地にオレンジ帯(那覇バスのイメージ)
   let n = 0;
   for (const r of corridor?.busRoutes ?? []) {
@@ -2553,9 +2717,23 @@ function routeName(s) {
       // 初期位置をばらす。系統が増えても経路の外へ出ないよう 1 で折り返す
       d: path.len * ((0.13 + 0.21 * i) % 1), dir: 1, wait: 0,
     });
+
+    // 作り直しなら、居た場所にいちばん近い地点へ戻す
+    const w = was.get(r.ref);
+    if (w) {
+      const bus = buses[buses.length - 1];
+      let bd = Infinity;
+      for (let d = 0; d <= path.len; d += 4) {
+        const q = pathAt(path, d);
+        const e = Math.hypot(q.x - w.x, q.z - w.z);
+        if (e < bd) { bd = e; bus.d = d; }
+      }
+      bus.dir = w.dir; bus.wait = w.wait;
+    }
   }
   console.log(`バス ${buses.length}台 / 経路 ` + buses.map((b) => b.ref).join('、'));
 }
+rebuildBuses();
 
 /** 折れ線の距離 d の地点と方位(バス用。高さは地形から取る)。 */
 function pathAt(path, d) {
@@ -2575,12 +2753,6 @@ function pathAt(path, d) {
 let train = null, trainPath = null, trainD = 0, trainDir = 1;
 let trainStopDs = [], trainWait = 0;
 if (railPaths.length) {
-  // 駅がいちばん多く乗っている線形を走らせる(同数なら長いほう)。
-  // 長さだけで選ぶと、駅が別の線形に乗っていて永久に停まらないことがある。
-  const nSt = new Map();
-  for (const s of stationStops) nSt.set(s.p, (nSt.get(s.p) ?? 0) + 1);
-  trainPath = railPaths.reduce((a, b) =>
-    ((nSt.get(b) ?? 0) - (nSt.get(a) ?? 0) || b.len - a.len) > 0 ? b : a);
   train = new THREE.Group();
   for (const cz of [-7.2, 7.2]) {
     const car = new THREE.Group();
@@ -2601,7 +2773,33 @@ if (railPaths.length) {
   }
   train.position.y = -9999;                   // 初回 tick で正しい位置に移す
   scene.add(train);
-  trainD = trainPath.len * 0.25;
+  retargetTrain();
+  trainD = trainPath.len * 0.25;              // 駅と駅の間から始める
+}
+
+/**
+ * 線形を作り直したあとに、走らせる線形と停車位置を選び直す。
+ * 走行位置は距離ではなく **世界座標** で引き継ぐ(線形が伸びると距離の意味が
+ * 変わるので、そのまま渡すと列車が数百m飛ぶ)。
+ */
+function retargetTrain(keep = null) {
+  if (!railPaths.length) { trainPath = null; trainStopDs = []; return; }
+  // 駅がいちばん多く乗っている線形を走らせる(同数なら長いほう)。
+  // 長さだけで選ぶと、駅が別の線形に乗っていて永久に停まらないことがある。
+  const nSt = new Map();
+  for (const s of stationStops) nSt.set(s.p, (nSt.get(s.p) ?? 0) + 1);
+  trainPath = railPaths.reduce((a, b) =>
+    ((nSt.get(b) ?? 0) - (nSt.get(a) ?? 0) || b.len - a.len) > 0 ? b : a);
+
+  if (keep) {
+    let bd = Infinity;
+    for (let d = 0; d <= trainPath.len; d += 4) {
+      const q = railAt(trainPath, d);
+      const e = Math.hypot(q.x - keep.x, q.z - keep.z);
+      if (e < bd) { bd = e; trainD = d; }
+    }
+  }
+  trainD = Math.max(0, Math.min(trainPath.len, trainD));
 
   // 駅での停車位置(線形上の距離)。この線形に乗った駅ぜんぶに停まる
   trainStopDs = stationStops.filter((s) => s.p === trainPath)
@@ -2714,7 +2912,7 @@ function pause() {
   stick = null; look = null; stickShow(false);   // 触っていた指の状態も捨てる
   overlay.classList.remove('hide');
   $('go').textContent = '再開する';
-  $('meta').textContent = `シーサー ${taken} / ${seesaa.length} 体を保護ずみ`;
+  $('meta').textContent = `シーサー ${taken} / ${SEESAA_TOTAL} 体を保護ずみ`;
   if (locked()) document.exitPointerLock();
 }
 renderer.domElement.addEventListener('click', () => { if (!started) start(); });
@@ -2842,16 +3040,20 @@ if (TOUCH) {
 // ---------------------------------------------------------------- ミニマップ
 const map = $('map'), mctx = map.getContext('2d');
 const MS = map.width;
-// 読み込み済みタイル全体を収める正方形に載せる(タイルが増えても縮尺だけが変わる)
-const MB = worldBounds();
+// 世界ぜんぶを収める正方形に載せる。読み込み済みの範囲に合わせると、
+// 歩いてタイルが足し引きされるたびに縮尺が変わって現在地が掴めなくなる。
+const MB = WORLD_B;
 const MSPAN = Math.max(MB.maxx - MB.minx, MB.maxz - MB.minz);
 const MCX = (MB.minx + MB.maxx) / 2, MCZ = (MB.minz + MB.maxz) / 2;
 const mx = (v) => (v - MCX + MSPAN / 2) / MSPAN * MS;
 const mz = (v) => (v - MCZ + MSPAN / 2) / MSPAN * MS;
 const base = document.createElement('canvas');
 base.width = base.height = MS;
-{
+
+/** 下地(道路・モノレール・バス停・建物)を焼き直す。タイルの出し入れごとに呼ぶ。 */
+function bakeMap() {
   const b = base.getContext('2d');
+  b.clearRect(0, 0, MS, MS);
   b.fillStyle = '#16302f'; b.fillRect(0, 0, MS, MS);
   // 道路を先に敷く(街路の骨格が見えると現在地を掴みやすい)
   b.fillStyle = 'rgba(190,205,205,.30)';
@@ -2880,6 +3082,7 @@ base.width = base.height = MS;
     b.closePath(); b.fill();
   }
 }
+bakeMap();
 
 // マーカーは 188px 表示を基準に描いていたので、実解像度に合わせて拡大する
 const MK = MS / 188;
@@ -2939,6 +3142,94 @@ const tape = $('tape');
     html += `<span style="display:inline-block;width:40px;text-align:center;opacity:${lbl ? 1 : .4}">${lbl ?? '·'}</span>`;
   }
   tape.innerHTML = html;
+}
+
+// ------------------------------------------------ タイルの読み込み／破棄
+// 世界は 1km タイルの集まりで、プレイヤーの近くだけを持つ。
+// 読むしきい値と捨てるしきい値を離してあるのは、境目で立ち止まったときに
+// 読む・捨てるを繰り返さないため(ヒステリシス)。
+// 700 で読むと、タイルの真ん中に立ったとき四方の隣(距離500)が入り、
+// 斜めの隣(距離707)は入らない。1100 で捨てると持つのは最大 3×3=9枚
+// (約6MB・2万棟)に収まる。差の 400m は歩き 4.6m/s で 87秒ぶんあるので、
+// 境目で行ったり来たりしても読み直しにはならない。
+let TILE_LOAD = 700;      // タイルの縁までこの距離に入ったら読む(m)
+let TILE_DROP = 1100;     // 縁からこれより遠のいたら捨てる(m)
+let syncing = false;
+
+/** (x,z) からタイル(tx,tz)の四角までの距離。中に居れば 0。 */
+function tileDist(tx, tz, x, z) {
+  return Math.hypot(Math.max(Math.abs(x - tx * TILE) - HALF, 0),
+                    Math.max(Math.abs(z - tz * TILE) - HALF, 0));
+}
+
+/** タイル t を捨てる。描画物も当たり判定も登録簿も、まとめて外す。 */
+function dropTile(t) {
+  scene.remove(t.group);
+  disposeTree(t.group);
+  // 当たり判定。空間ハッシュと総当たり用の配列は必ず両方から外す
+  hashRemove(bmap, (r) => r.tile === t.key);
+  hashRemove(rmap, (r) => r.tile === t.key);
+  for (const arr of [bstore, rstore]) {
+    for (let i = arr.length - 1; i >= 0; i--) if (arr[i].tile === t.key) arr.splice(i, 1);
+  }
+  // 付属物の登録簿(バス停はバスの停車位置、信号はバスの停止線に使われる)
+  for (const arr of [busSigns, shopSigns]) {
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i].userData.tile === t.key) arr.splice(i, 1);
+    }
+  }
+  for (let i = signals.length - 1; i >= 0; i--) {
+    if (signals[i].tile === t.key) signals.splice(i, 1);
+  }
+  dropWalkLines(t.key);
+  // 消えた歩道の上に居た者を降ろす。シーサーはその場に立たせ(遠くに居るので
+  // 乗せ直すとプレイヤーの目の前へ湧く)、歩行者は手前へ湧かし直させる
+  for (const g of seesaa) if (g.userData.L?.tile === t.key) g.userData.L = null;
+  for (const q of peds) if (q.L?.tile === t.key) q.alive = false;
+  tiles.delete(t.key);
+  console.log(`[${t.key}] 破棄`);
+}
+
+/** タイルを足し引きしたあとに、タイルをまたぐもの(線形・駅・バス・地図)を組み直す。 */
+function rebuildDerived() {
+  // 列車の居場所は距離ではなく世界座標で覚える(線形が伸び縮みするため)
+  const keep = train && trainPath ? railAt(trainPath, trainD) : null;
+  buildApron();
+  rebuildMonorail();
+  buildStations();
+  retargetTrain(keep);
+  rebuildBuses();      // 停車位置は busSigns、停止線は signals を見るので駅の後
+  seatSeesaa();        // 新しいタイルで生まれた個体だけを歩道に乗せる
+  bakeMap();
+}
+
+/** プレイヤーの位置に合わせてタイルを足し引きする。tick から間引いて呼ぶ。 */
+async function syncTiles() {
+  if (TILE_FIXED || syncing) return;
+  const x = hereX(), z = hereZ();          // 店内に居るときは街での立ち位置
+  const add = WORLD_TILES.filter((t) =>
+    !tiles.has(`${t.tx},${t.tz}`) && tileDist(t.tx, t.tz, x, z) <= TILE_LOAD);
+  const drop = [...tiles.values()].filter((t) =>
+    tileDist(t.tx, t.tz, x, z) > TILE_DROP);
+  if (!add.length && !drop.length) return;
+  syncing = true;
+  try {
+    for (const { tx, tz } of add) {
+      const t = await fetchTile(tx, tz);
+      // 道路と建物を先に登録してから地形を焼く。隣のタイルの建物が縁の敷地色に
+      // 効いて継ぎ目が目立たなくなる(README の順序をタイル1枚ぶんで守る)
+      addRoads(t); addBuildings(t);
+      buildTileCore(t);
+      buildTileProps(t);
+      addWalkLines(t);
+    }
+    for (const t of drop) dropTile(t);
+    rebuildDerived();
+  } catch (e) {
+    console.error('タイルの読み込みに失敗:', e);
+  } finally {
+    syncing = false;
+  }
 }
 
 // ---------------------------------------------------------------- バスに乗る
@@ -3357,6 +3648,10 @@ function tick() {
 
   stepTrain(dt);
 
+  // タイルの足し引き。毎フレームやる必要は無い(歩き 4.6m/s なので
+  // 30フレーム=0.5秒で 2.3m しか進まない)し、fetch が絡むので間引く
+  if ((frame & 31) === 0) syncTiles();
+
   // 市議会の言及。近づいた地点のパネルを出す
   {
     let near = null, nd = Infinity;
@@ -3402,7 +3697,7 @@ function tick() {
         for (let k = 0; k < 4; k++) pedLimb.setMatrixAt(i * 4 + k, away);
         return;
       }
-      const L = walkLines[p.line];
+      const L = p.L;
       p.d += p.dir * p.speed * dt;
       if (p.d > L.len) { p.d = L.len; p.dir = -1; }
       if (p.d < 0) { p.d = 0; p.dir = 1; }
@@ -3454,6 +3749,9 @@ function tick() {
   let nearest = Infinity;
   for (const s of seesaa) {
     if (s.userData.taken) continue;
+    // タイルを捨てた先に取り残された個体は隠す。地形が無くなっているので、
+    // 出したままだと受け皿(平らな緑地)の上に立って見える
+    if (!finale) s.visible = tiles.has(s.userData.tile);
     // 店内に居るあいだは入る前の位置で測る(街から離れた舞台に居るため)
     const d = Math.hypot(s.position.x - hereX(), s.position.z - hereZ());
     if (d < nearest) nearest = d;
@@ -3467,16 +3765,16 @@ function tick() {
       s.userData.taken = true;
       s.visible = false;
       taken++;
-      if (taken >= seesaa.length) startFinale();
-      else say(`シーサーを保護した（${taken}/${seesaa.length}）`);
+      if (taken >= SEESAA_TOTAL) startFinale();
+      else say(`シーサーを保護した（${taken}/${SEESAA_TOTAL}）`);
     }
   }
   if (finale) stepFinale(dt, now);
 
   // HUD
   elapsed = running ? (now - t0) / 1000 : elapsed;
-  $('found').textContent = `${taken} / ${seesaa.length}`;
-  $('dist').textContent = taken >= seesaa.length ? 'ぜんぶ発見' :
+  $('found').textContent = `${taken} / ${SEESAA_TOTAL}`;
+  $('dist').textContent = taken >= SEESAA_TOTAL ? 'ぜんぶ発見' :
     (nearest === Infinity ? '—' : `${nearest.toFixed(0)} m`);
   // 店内の舞台は街の外にあるので、標高は入る前の値のまま見せる
   $('alt').textContent = `${((inShop ? shopReturn.y : player.y) - EYE).toFixed(1)} m`;
@@ -3504,6 +3802,12 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   tiles, tileOf, worldBounds, fetchTile, buildTileCore, buildTileProps, TILE, HALF,
   // 全線データ(検証用)。切り出しの効きを直接見られる
   corridor, clipToLoaded, nearLoaded, polyLen, CORRIDOR_PAD,
+  // タイルの読み込み／破棄(検証用)。tick を待たずに足し引きできる
+  WORLD_TILES, WORLD_B, tileDist, syncTiles, dropTile,
+  tileRange: () => ({ load: TILE_LOAD, drop: TILE_DROP }),
+  setTileRange: (load, drop) => { TILE_LOAD = load; TILE_DROP = drop; },
+  rebuildDerived, dropWalkLines, addWalkLines, bakeMap, buildApron, seesaaGroup,
+  SEESAA_TOTAL, busSigns, shopSigns,
   stationStops, trainStopDs: () => trainStopDs, trainPath: () => trainPath,
   // 列車(検証用)。tick を待たずに走らせられる
   stepTrain, trainState: () => ({ d: +trainD.toFixed(1), dir: trainDir, wait: +trainWait.toFixed(1) }),
