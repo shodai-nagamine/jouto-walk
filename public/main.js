@@ -1566,8 +1566,11 @@ const councilPosts = [];
   const poleMat = new THREE.MeshLambertMaterial({ color: 0x6b625c });
   for (const p of council.places ?? []) {
     const g = new THREE.Group();
-    const y = groundAt(p.x, p.z);
-    g.position.set(p.x, y, p.z);
+    // 高さはタイルが読み込まれてから決める(settleCouncil)。ここで決めると、
+    // 起動時に読んでいないタイルの地点は縁の標高で埋められて宙に浮く
+    // (実測で -6.0m 〜 +26.9m ずれた)
+    g.position.set(p.x, 0, p.z);
+    g.visible = false;
 
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.09, 2.2, 6), poleMat);
     pole.position.y = 1.1; pole.castShadow = true; g.add(pole);
@@ -1591,12 +1594,30 @@ const councilPosts = [];
     lab.position.y = 4.3;
     g.add(lab);
 
-    g.userData = { place: p, board, ring, read: false };
+    g.userData = { place: p, board, ring, read: false, placed: false };
     scene.add(g);
     councilPosts.push(g);
   }
   console.log(`市議会の言及 ${councilPosts.length}地点 / ` +
     `${(council.places ?? []).reduce((n, p) => n + p.speeches.length, 0)}発言`);
+}
+
+/**
+ * 議会マーカーを地表に落とす。タイルが読み込まれた地点だけを一度だけ据える。
+ * 据えていない地点は隠す(受け皿の上に光柱が立って見えるため)。
+ */
+function settleCouncil() {
+  let n = 0;
+  for (const g of councilPosts) {
+    const on = !!tileOf(g.position.x, g.position.z);
+    if (on && !g.userData.placed) {
+      g.position.y = groundAt(g.position.x, g.position.z);
+      g.userData.placed = true;
+      n++;
+    }
+    g.visible = g.userData.placed && on;
+  }
+  return n;
 }
 
 // ---------------------------------------------------------------- 遊具の位置
@@ -3132,6 +3153,7 @@ function bakeMap() {
   for (const t of tiles.values()) if (!t.mapTile) bakeTileMap(t);
 }
 bakeMap();
+settleCouncil();
 
 // マーカーは 188px 表示を基準に描いていたので、実解像度に合わせて拡大する
 const MK = MS / 188;
@@ -3279,6 +3301,7 @@ function rebuildDerived() {
   retargetTrain(keep);
   rebuildBuses();      // 停車位置は busSigns、停止線は signals を見るので駅の後
   seatSeesaa();        // 新しいタイルで生まれた個体だけを歩道に乗せる
+  settleCouncil();     // 読み込んだタイルの議会マーカーを地表に落とす
   bakeMap();
 }
 
@@ -3449,6 +3472,8 @@ function showCouncil(g) {
   if (!g || councilClosed) { cvEl.classList.remove('on'); return; }
   const p = g.userData.place;
   const s = p.speeches[councilIdx % p.speeches.length];
+  // 収録は那覇市議会と沖縄県議会の両方。発言ごとにどちらかを名乗る
+  $('cv-body').textContent = `${s.body || '議会'}で言及`;
   $('cv-place').textContent = p.label;
   $('cv-speaker').textContent = s.speaker || '(発言者不明)';
   $('cv-date').textContent = `${s.date}　${s.meeting}`;
@@ -3887,7 +3912,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   tileRange: () => ({ load: TILE_LOAD, drop: TILE_DROP }),
   setTileRange: (load, drop) => { TILE_LOAD = load; TILE_DROP = drop; },
   rebuildDerived, dropWalkLines, addWalkLines, bakeMap, buildApron, seesaaGroup,
-  bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN,
+  bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil,
   SEESAA_TOTAL, busSigns, shopSigns,
   stationStops, trainStopDs: () => trainStopDs, trainPath: () => trainPath,
   // 列車(検証用)。tick を待たずに走らせられる

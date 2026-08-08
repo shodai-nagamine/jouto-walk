@@ -5,12 +5,16 @@ world.json の施設名(建物 gml:name)・バス停名・駅名から検索語�
 okinawa-civic-api の Postgres(speeches) を全文検索して、
 「どの場所が、誰に、いつ、どう言及されたか」を council.json に落とす。
 
-実行例:
+実行例(全タイルぶん):
   python3 tools/link_council.py \
-      --world public/data/world.json --out public/data/council.json
+      --world public/data/tiles/t_*.json --out public/data/council.json
+
+タイルの JSON は座標がタイル内なので meta.offset でワールド座標に直す。
+描画側(main.js)は council.json をそのままワールド座標として読む。
 
 前提: okinawa-civic-api の DB が立っていること(既定 okinawa_civic)。
       収録は那覇市議会 令和8年2月定例会 本会議13日分 + 沖縄県議会。
+      どちらの議会かは各発言の body に入れる。
 """
 import argparse
 import json
@@ -19,8 +23,15 @@ import re
 import subprocess
 import sys
 
-# 地名として弱すぎる語(市全体の話に付いてしまう)
-STOP_TERMS = {"那覇", "沖縄", "首里", "石嶺", "小学校", "中学校", "公園", "郵便局"}
+# 地名として弱すぎる語(市全体の話に付いてしまう)。
+# 施設の「種類」の名前は、OSM に固有名の無い地物として登録されていることがあり、
+# 拾うと関係ない場所の発言が刺さる。例: 漫湖公園のテニスコートの話が、
+# たまたま「テニスコート」という名で登録された奥武山の地物に付いた(実際に出た)。
+STOP_TERMS = {
+    "那覇", "沖縄", "首里", "石嶺", "小学校", "中学校", "公園", "郵便局",
+    "テニスコート", "運動場", "体育館", "駐車場", "グラウンド", "広場",
+    "プール", "球場", "陸上競技場", "多目的広場", "駐輪場", "バス停",
+}
 
 # 議会が議題にするのは公共施設・道路。店舗名を入れると無関係な発言を拾う
 # (例: 「ほっともっと」が金芽米の話に、「コープ」が労働者協同組合ワーカーズコープに当たった)
@@ -90,13 +101,11 @@ def excerpt_around(text, term):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--world", required=True)
+    ap.add_argument("--world", nargs="+", required=True,
+                    help="タイルの JSON(複数可)。glob を展開して全部渡してよい")
     ap.add_argument("--out", required=True)
     ap.add_argument("--db", default=os.environ.get("CIVIC_DB", "okinawa_civic"))
     args = ap.parse_args()
-
-    w = json.load(open(args.world, encoding="utf-8"))
-    half = w["meta"]["size"] / 2
 
     # 検索語 → 座標。建物(施設名)を優先し、無ければバス停・駅を使う
     places = {}
@@ -111,15 +120,24 @@ def main():
         if cur and cur["prio"] <= prio:
             return
         places[term] = {"term": term, "label": name, "kind": kind,
-                        "x": round(x - half, 2), "z": round(z - half, 2), "prio": prio}
+                        "x": round(x, 2), "z": round(z, 2), "prio": prio}
 
-    for l in w.get("landmarks", []):
-        add(l["name"], l["x"], l["z"], "施設", 0, l.get("kind", ""))
-    for s in w.get("stations", []):
-        add(s["name"] + "駅", s["x"], s["z"], "駅", 1, "building=train_station")
-    for b in w.get("bus", []):
-        if b.get("name"):
-            add(b["name"], b["x"], b["z"], "バス停", 2, "highway=bus_stop")
+    # タイルの JSON は座標がタイル内(0〜size)なので、meta.offset を足して
+    # ワールド座標に直す。council.json は最初からワールド座標で持つ。
+    for path in args.world:
+        w = json.load(open(path, encoding="utf-8"))
+        half = w["meta"]["size"] / 2
+        ox, oz = w["meta"].get("offset", [0, 0])
+        X = lambda v: v - half + ox
+        Z = lambda v: v - half + oz
+        for l in w.get("landmarks", []):
+            add(l["name"], X(l["x"]), Z(l["z"]), "施設", 0, l.get("kind", ""))
+        for st in w.get("stations", []):
+            add(st["name"] + "駅", X(st["x"]), Z(st["z"]), "駅", 1,
+                "building=train_station")
+        for b in w.get("bus", []):
+            if b.get("name"):
+                add(b["name"], X(b["x"]), Z(b["z"]), "バス停", 2, "highway=bus_stop")
 
     print(f"検索語 {len(places)}件: {'、'.join(sorted(places))}", file=sys.stderr)
 
@@ -141,8 +159,14 @@ def main():
                      coalesce(m.date::text,'') as date,
                      coalesce(m.title,'') as meeting,
                      coalesce(m.source_url,'') as url,
+                     -- 収録は那覇市議会と沖縄県議会の両方。どちらの発言かを
+                     -- 持たせないと、表示側が一律「市議会」と名乗ってしまう
+                     case when mu.name = '沖縄県' then '沖縄県議会'
+                          else mu.name || '議会' end as body,
                      s.text as text
-              from speeches s join meetings m on m.id = s.meeting_id
+              from speeches s
+                   join meetings m on m.id = s.meeting_id
+                   join municipalities mu on mu.id = m.municipality_id
               where s.text like '%{esc(term)}%'
               -- 発言者不明(32件ある)と議長の議事進行を後ろへ回し、
               -- 議員の質疑と執行部の答弁を先に出す
@@ -161,6 +185,7 @@ def main():
             "speeches": [{
                 "speaker": r["speaker"], "title": r["title"], "kind": r["kind"],
                 "date": r["date"], "meeting": r["meeting"], "url": r["url"],
+                "body": r["body"],
                 "excerpt": excerpt_around(r["text"], term),
             } for r in rows],
         })
@@ -168,7 +193,7 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     json.dump({
-        "source": "那覇市議会 会議録(okinawa-civic-api)",
+        "source": "那覇市議会・沖縄県議会 会議録(okinawa-civic-api)",
         "places": results,
     }, open(args.out, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     total = sum(len(r["speeches"]) for r in results)
