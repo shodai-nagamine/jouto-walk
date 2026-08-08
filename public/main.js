@@ -1296,6 +1296,7 @@ function buildTileCore(t) {
 function buildTileProps(t) {
   addWalls(t);          // 石垣。addSolid を使うので groundTexture より後
   addCastle(t);         // 首里城の建物
+  addHistoric(t);       // 史跡・碑・墓・拝所
   addBusStops(t);
   addSignals(t);
   addShopSigns(t);
@@ -1647,6 +1648,44 @@ function settleCouncil() {
     g.visible = g.userData.placed && on;
   }
   return n;
+}
+
+// ---------------------------------------------------------------- 史跡
+// OSM の historic。沖縄は **亀甲墓(tomb)と拝所(うがんじゅ / wayside_shrine)** が
+// 街のなかに数多く残っていて、これが土地の性格をよく表すので落とさない。
+// 議会の言及は朱の光柱、史跡は白木の標柱で見分ける(色も形も変える)。
+const historicPosts = [];
+function addHistoric(t) {
+  const list = t.data.historic ?? [];
+  if (!list.length) return;
+  const wood = new THREE.MeshLambertMaterial({ color: 0xd8cba8 });   // 白木
+  const cap = new THREE.MeshLambertMaterial({ color: 0x4a6b5a });    // 緑青
+  for (const h of list) {
+    const x = t.X(h.x), z = t.Z(h.z);
+    const g = new THREE.Group();
+    g.position.set(x, groundAt(x, z), z);
+    // 標柱。角柱に笠を載せた、史跡標識のかたち
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.16, 1.9, 0.16), wood);
+    post.position.y = 0.95; post.castShadow = true; g.add(post);
+    const hat = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.1, 0.3), cap);
+    hat.position.y = 1.95; hat.castShadow = true; g.add(hat);
+    // 名前のあるものは大きく、無名の亀甲墓・拝所は小さく控えめに出す
+    const lab = makeLabel(h.anon ? h.name : `⛩ ${h.name}`,
+                          h.anon ? 3.6 : 7.0, h.anon ? 1.2 : 1.75);
+    lab.position.y = h.anon ? 2.4 : 3.0;
+    g.add(lab);
+    g.userData = { site: h, label: lab, tile: t.key };
+    t.group.add(g);
+    historicPosts.push(g);
+  }
+  console.log(`[${t.key}] 史跡 ${list.length}件`);
+}
+
+/** 捨てたタイルの史跡を登録簿から外す。 */
+function dropHistoric(key) {
+  for (let i = historicPosts.length - 1; i >= 0; i--) {
+    if (historicPosts[i].userData.tile === key) historicPosts.splice(i, 1);
+  }
 }
 
 // ---------------------------------------------------------------- 遊具の位置
@@ -4054,6 +4093,7 @@ function dropTile(t) {
     if (signals[i].tile === t.key) signals.splice(i, 1);
   }
   dropWalkLines(t.key);
+  dropHistoric(t.key);
   // 焼きかけのテクスチャは捨てる(戻ってきたら最初から焼き直す)
   for (let i = bakes.length - 1; i >= 0; i--) if (bakes[i].tile === t.key) bakes.splice(i, 1);
   // 消えた歩道の上に居た者を降ろす。シーサーはその場に立たせ(遠くに居るので
@@ -4660,6 +4700,13 @@ function tick() {
     s.visible = Math.hypot(s.position.x - player.x, s.position.z - player.z) < 135;
   }
 
+  // 史跡の名札も近くだけ。市域で400件を超えるので常時出すと画面が埋まる。
+  // 無名の亀甲墓・拝所はさらに近づかないと出さない
+  for (const g of historicPosts) {
+    const d2 = Math.hypot(g.position.x - player.x, g.position.z - player.z);
+    g.userData.label.visible = d2 < (g.userData.site.anon ? 26 : 55);
+  }
+
   // シーサーの回収
   let nearest = Infinity;
   for (const s of seesaa) {
@@ -4722,7 +4769,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   tileRange: () => ({ load: TILE_LOAD, drop: TILE_DROP }),
   setTileRange: (load, drop) => { TILE_LOAD = load; TILE_DROP = drop; },
   rebuildDerived, dropWalkLines, addWalkLines, bakeMap, buildApron, seesaaGroup,
-  bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil,
+  bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   SEESAA_TOTAL, busSigns, shopSigns,
   stationStops, trainStopDs: () => trainStopDs, trainPath: () => trainPath,
   // 列車(検証用)。tick を待たずに走らせられる

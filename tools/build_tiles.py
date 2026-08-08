@@ -47,6 +47,7 @@ OSM = {
     "--footways": "naha_footways_osm.json",
     "--parks": "naha_parks_osm.json",
     "--walls": "naha_shurijo_osm.json",
+    "--historic": "naha_historic_osm.json",
 }
 # 2 次メッシュ 392725 の地形は 4 分割で配られている。**4 枚とも渡すこと**。
 # _50/_55 だけだと那覇空港・小禄の側で「範囲内に点なし」となり、

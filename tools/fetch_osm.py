@@ -69,6 +69,14 @@ QUERIES = {
         'way["building"]["name"]{bbox};',
         'way["name"~"御庭"]{bbox};',
     ], "out geom tags;"),
+    # --historic。史跡・碑・墓・拝所・城跡。沖縄は亀甲墓や拝所(うがんじゅ)が
+    # 街のなかに数多く残っていて、これが土地の性格をよく表す。
+    "historic": (180, [
+        'node["historic"]{bbox};',
+        'way["historic"]{bbox};',
+        'node["heritage"]{bbox};',
+        'way["heritage"]{bbox};',
+    ], "out center tags;"),
     # --parks。["name"] で絞らないのが要点(那覇の街区公園と校庭は半数以上が無名で、
     # 名前で絞ると見た目に一番効く大きなグラウンドが軒並み落ちる)
     "parks": (300, [

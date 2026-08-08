@@ -504,6 +504,66 @@ def parse_parks(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=60.0):
     return out
 
 
+# 史跡の種別。OSM の historic の値を日本語の見出しにする。
+# 沖縄は亀甲墓(tomb)と拝所(wayside_shrine)が街のなかに数多く残っていて、
+# これが土地の性格をよく表すので、墓と拝所も落とさずに拾う。
+HISTORIC_LABEL = {
+    "tomb": "墓", "memorial": "碑", "wayside_shrine": "拝所",
+    "archaeological_site": "遺跡", "castle": "城跡", "monument": "記念物",
+    "ruins": "跡", "city_gate": "城門", "statue": "像", "bridge": "橋",
+    "manor": "屋敷", "church": "教会", "locomotive": "車両", "yes": "史跡",
+}
+
+# 無名のものに与える呼び名。沖縄の言い方に寄せる
+HISTORIC_ANON = {
+    "tomb": "亀甲墓", "wayside_shrine": "拝所", "memorial": "碑",
+    "archaeological_site": "遺跡", "ruins": "跡",
+}
+
+
+def parse_historic(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=30.0):
+    """OSM の史跡・碑・墓・拝所・城跡を点として取り出す。
+
+    **名前で絞ってはいけない。** 沖縄の亀甲墓(tomb)と拝所(うがんじゅ /
+    wayside_shrine)はほとんどが無名で、名前のあるものだけ拾うと
+    墓 132→7 件・拝所 32→9 件まで落ちる（実測）。街のなかに墓と拝所が
+    数多く残っているのが那覇の姿なので、無名のものは種別を名として立てる。
+
+    way は out center で重心が付いているので node と同じように扱える。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = -margin, size + margin
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        kind = t.get("historic") or ("史跡" if t.get("heritage") else "")
+        if not kind:
+            continue
+        label = HISTORIC_LABEL.get(kind, "史跡")
+        # 無名のものは種別を名にする（亀甲墓・拝所はほとんど無名）
+        name = t.get("name") or t.get("name:ja") or HISTORIC_ANON.get(kind, label)
+        lat = e.get("lat") or (e.get("center") or {}).get("lat")
+        lon = e.get("lon") or (e.get("center") or {}).get("lon")
+        if lat is None or lon is None:
+            continue
+        x = (lon - lon_c) * m_lon + half
+        z = -(lat - lat_c) * m_lat + half
+        if not (lo <= x <= hi and lo <= z <= hi):
+            continue
+        rec = {"name": name, "k": label, "x": round(x, 2), "z": round(z, 2)}
+        if not (t.get("name") or t.get("name:ja")):
+            rec["anon"] = 1          # 無名。描画側は名札を控えめにする
+        # 由緒への入口。あるものだけ
+        for key, out_key in (("inscription", "text"), ("description", "text"),
+                             ("wikipedia", "wp"), ("heritage", "hz"),
+                             ("start_date", "date")):
+            v = t.get(key)
+            if v and out_key not in rec:
+                rec[out_key] = v[:300] if out_key == "text" else v
+        out.append(rec)
+    return out
+
+
 def parse_walls(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=40.0):
     """首里城の石垣を「線」として取り出す(OSM barrier=wall / historic=citywalls)。
 
@@ -620,6 +680,7 @@ def main():
     ap.add_argument("--footways", default="", help="歩道・横断歩道・階段 (OSM Overpass JSON)")
     ap.add_argument("--parks", default="", help="公園・広場・グラウンド (OSM Overpass JSON)")
     ap.add_argument("--walls", default="", help="首里城の石垣 (OSM Overpass JSON)")
+    ap.add_argument("--historic", default="", help="史跡・碑・墓・拝所 (OSM Overpass JSON)")
     ap.add_argument("--max-routes", type=int, default=4, help="走らせる路線数")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -857,6 +918,18 @@ def main():
         print(f"  {os.path.basename(path)}: 公園系 {len(parks)}面 {cnt} "
               f"(名前あり{nn}/無名{len(parks) - nn})", file=sys.stderr)
 
+    historic = []
+    if args.historic:
+        path = (args.historic if os.path.isabs(args.historic)
+                else os.path.join(NAHA, args.historic))
+        historic = parse_historic(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        if historic:
+            cnt = {}
+            for hh in historic:
+                cnt[hh["k"]] = cnt.get(hh["k"], 0) + 1
+            print(f"  {os.path.basename(path)}: 史跡 {len(historic)}件 {cnt}",
+                  file=sys.stderr)
+
     castle = []
     if args.walls:
         path = (args.walls if os.path.isabs(args.walls)
@@ -902,6 +975,7 @@ def main():
         "parks": parks,
         "walls": walls,
         "castle": castle,
+        "historic": historic,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
