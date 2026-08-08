@@ -118,10 +118,12 @@ function groundAt(x, z) {
 // 「いま読み込んでいるタイル」とは別物で、こちらは歩き回っても変わらない。
 // 歩ける範囲と地図の縮尺はこちらで決める(読み込みに追従させると、
 // 歩くたびに地図の縮尺が変わって現在地が掴めなくなる)。
+// index.json のタイルは [tx, tz, 建物の数]。建物の数はシーサーの配分に使う。
 const WORLD_TILES = await fetch('./data/tiles/index.json')
   .then((r) => (r.ok ? r.json() : null))
-  .then((j) => (j?.tiles ?? [[0, 0]]).map(([tx, tz]) => ({ tx, tz })))
-  .catch(() => [{ tx: 0, tz: 0 }]);
+  .then((j) => (j?.tiles ?? [[0, 0, 1]])
+    .map(([tx, tz, n]) => ({ tx, tz, n: n ?? 1 })))
+  .catch(() => [{ tx: 0, tz: 0, n: 1 }]);
 const WORLD_KEYS = new Set(WORLD_TILES.map((t) => `${t.tx},${t.tz}`));
 const WORLD_B = boundsOf(WORLD_TILES);
 
@@ -1184,13 +1186,23 @@ scene.add(seesaaGroup);
 // この覚えが無いと同じタイルに戻るたびに10体ずつ増える(実際に増えた)。
 const seesaaDone = new Set();
 const SEESAA_TOTAL = N_SEESAA;
-// 何体目をどのタイルに置くかは最初に決めておく。均等に配ると、
-// 線に沿って歩くあいだ切れ目なく現れる(まとまって湧かない)。
-const SEESAA_QUOTA = new Map(WORLD_TILES.map((t, i) => [
-  `${t.tx},${t.tz}`,
-  Math.floor((i + 1) * SEESAA_TOTAL / WORLD_TILES.length)
-    - Math.floor(i * SEESAA_TOTAL / WORLD_TILES.length),
-]));
+// 何体目をどのタイルに置くかは最初に決めておく。
+// **タイルに均等ではなく、建物の数で重み付けする**。市域ぜんぶ(84タイル)を
+// 均等に配ると6割以上のタイルが空になり、港や埋立地を何分歩いても出会わない。
+// 建物の数に比例させると、人が歩く街なかに寄る。
+const SEESAA_QUOTA = (() => {
+  const tot = WORLD_TILES.reduce((a, t) => a + Math.max(1, t.n), 0);
+  const q = new Map();
+  let acc = 0, given = 0;
+  WORLD_TILES.forEach((t, i) => {
+    acc += Math.max(1, t.n);
+    // 累積で切ると端数が偏らず、合計がちょうど SEESAA_TOTAL になる
+    const upto = Math.floor(acc * SEESAA_TOTAL / tot);
+    q.set(`${t.tx},${t.tz}`, upto - given);
+    given = upto;
+  });
+  return q;
+})();
 
 /** タイル t の道路面から、互いに離れた設置点を選ぶ(道沿いなので必ず辿り着ける)。 */
 function roadSpots(t, want) {

@@ -170,18 +170,24 @@ python3 tools/link_council.py --world public/data/world.json --out public/data/c
 - **建物・道路の GML はタイルより広く渡してよい**。パーサが bbox で切るので、
   重なる 3 次メッシュを全部並べておけば取りこぼさない
 
-### タイルの作り方（全線 37 枚）
+### タイルの作り方
 
 素材（PLATEAU の CityGML）を取ってから、まとめて回す:
 
 ```bash
-python3 tools/fetch_citygml.py     # 不足している建物・交通モデルを落とす
-python3 tools/build_tiles.py       # corridor 全体を 1km タイルに切って生成
-python3 tools/build_tile_index.py  # index.json を作り直す
+python3 tools/fetch_citygml.py --mode city     # 不足している建物・交通モデル
+python3 tools/build_tiles.py   --mode city     # 1km タイルに切って生成
+python3 tools/build_tile_index.py              # index.json を作り直す
 ```
 
-那覇空港〜石嶺を路線±600m で覆うと **37 タイル・19MB**（生成 75 秒）。
-公開物に含めてある（GitHub Pages のソフトリミット 1GB に対して十分小さい）。
+`--mode` は 2 つ。`corridor` はゆいレール沿い（路線±600m で 37 タイル）、
+`city` は**那覇市域ぜんぶ**（84 タイル）。既定は corridor。
+
+- **海のタイルは自動で落ちる**。市域の輪郭は持ち込まず、
+  「そのタイルを覆う建物 GML が手元に 1 枚も無ければ飛ばす」で済ませている
+  （PLATEAU は海域のメッシュを作っていない）。市域の外接 143 候補 → 84 枚
+- `--only` で tx が負のタイルを指定するときは **`--only=-1,1` の `=` 形式**で渡す。
+  `--only -1,1` は argparse がフラグと解釈して落ちる
 
 - **CityGML の実ダウンロードは 49MB**（建物 34 枚 + 交通 41 枚、gzip 後）。
   手元の展開済みファイル 1 枚 22MB から外挿すると 880MB に見えるが、

@@ -31,6 +31,11 @@ M_LAT = 111320.0
 TILE, HALF = 1000.0, 500.0
 MESH_PAD = 150.0        # メッシュを拾うときの余白(m)。多めに渡して取りこぼさない
 
+# 那覇市域を覆う外接矩形(lat0, lon0, lat1, lon1)。海と隣接市町村も入るが、
+# **建物 GML が手元に1枚も無いタイルは飛ばす**ので勝手に落ちる
+# （PLATEAU は海域のメッシュを作っていない）。
+CITY_BBOX = (26.176, 127.646, 26.268, 127.760)
+
 # 全タイル共通で渡すもの（corridor 全体を 1 回のクエリで取ってある）
 OSM = {
     "--rail": "naha_railway.geojson",
@@ -86,8 +91,21 @@ def corridor_tiles(corridor, buf):
     return sorted(out, key=lambda t: t[0] ** 2 + t[1] ** 2)
 
 
+def city_tiles(olat, olon, m_lon):
+    """那覇市域の外接矩形を覆う 1km タイル。"""
+    lat0, lon0, lat1, lon1 = CITY_BBOX
+    tx0 = int(round((lon0 - olon) * m_lon / TILE))
+    tx1 = int(round((lon1 - olon) * m_lon / TILE))
+    tz0 = int(round(-(lat1 - olat) * M_LAT / TILE))
+    tz1 = int(round(-(lat0 - olat) * M_LAT / TILE))
+    out = [(tx, tz) for tx in range(tx0, tx1 + 1) for tz in range(tz0, tz1 + 1)]
+    return sorted(out, key=lambda t: t[0] ** 2 + t[1] ** 2)
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("corridor", "city"), default="corridor",
+                    help="corridor=ゆいレール沿い / city=那覇市域ぜんぶ")
     ap.add_argument("--corridor", default="public/data/corridor.json")
     ap.add_argument("--out-dir", default="public/data/tiles")
     ap.add_argument("--buffer", type=float, default=600.0)
@@ -103,12 +121,13 @@ def main():
     out_dir = ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tiles = corridor_tiles(corridor, args.buffer)
+    tiles = (city_tiles(olat, olon, m_lon) if args.mode == "city"
+             else corridor_tiles(corridor, args.buffer))
     if args.only:
         want = {tuple(int(v) for v in s.split(",")) for s in args.only}
         tiles = [t for t in tiles if t in want]
 
-    ok, skipped, failed = 0, 0, []
+    ok, skipped, failed, skipped_sea = 0, 0, [], 0
     t_start = time.time()
     for i, (tx, tz) in enumerate(tiles, 1):
         out = out_dir / f"t_{tx}_{tz}.json"
@@ -128,8 +147,11 @@ def main():
         gml = sorted(f"{m}.gml" for m in ms if (DATA / f"{m}.gml").exists())
         tran = sorted(f"{m}_tran.gml" for m in ms if (DATA / f"{m}_tran.gml").exists())
         if not gml:
-            print(f"[{tx},{tz}] 建物 GML が 1 枚も無い（メッシュ {sorted(ms)}）— 飛ばす")
-            failed.append((tx, tz, "建物GMLなし"))
+            # 海域など。PLATEAU がメッシュを作っていないので、ここは世界に含めない
+            if args.mode != "city":
+                print(f"[{tx},{tz}] 建物 GML が 1 枚も無い（メッシュ {sorted(ms)}）— 飛ばす")
+                failed.append((tx, tz, "建物GMLなし"))
+            skipped_sea += 1
             continue
 
         cmd = [PY, str(HERE / "build_world.py"),
@@ -164,7 +186,7 @@ def main():
     if args.dry_run:
         return
     total = sum(p.stat().st_size for p in out_dir.glob("t_*.json")) / 1e6
-    print(f"\n生成 {ok} / 既存 {skipped} / 失敗 {len(failed)} "
+    print(f"\n生成 {ok} / 既存 {skipped} / 海など {skipped_sea} / 失敗 {len(failed)} "
           f"（{time.time()-t_start:.0f}s）")
     print(f"tiles 合計 {total:.0f}MB")
     for tx, tz, why in failed:

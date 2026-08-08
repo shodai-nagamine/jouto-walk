@@ -28,6 +28,10 @@ DATA = pathlib.Path.home() / "dev/tools/blender-mcp/data/naha"
 M_LAT = 111320.0
 TILE, HALF = 1000.0, 500.0
 
+# 那覇市域を覆う外接矩形(lat0, lon0, lat1, lon1)。海と隣接市町村も入るが、
+# 実在しないメッシュは 404 になるので勝手に落ちる。
+CITY_BBOX = (26.176, 127.646, 26.268, 127.760)
+
 
 def mesh3(lat, lon):
     """緯度経度 -> 3 次メッシュコード（JIS 標準地域メッシュ）。"""
@@ -104,8 +108,22 @@ def grab(kind, m, out):
     return out.stat().st_size
 
 
+def city_meshes(bbox):
+    """矩形を覆う 3 次メッシュの候補。実在しないものは HEAD で落ちる。"""
+    lat0, lon0, lat1, lon1 = bbox
+    out = set()
+    n = 40
+    for i in range(n + 1):
+        for j in range(n + 1):
+            out.add(mesh3(lat0 + (lat1 - lat0) * i / n,
+                          lon0 + (lon1 - lon0) * j / n))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("corridor", "city"), default="corridor",
+                    help="corridor=ゆいレール沿い / city=那覇市域ぜんぶ")
     ap.add_argument("--corridor", default="public/data/corridor.json")
     ap.add_argument("--buffer", type=float, default=600.0,
                     help="線路からこの距離までを覆う(m)")
@@ -118,12 +136,17 @@ def main():
     olon = corridor["meta"]["originLon"]
     m_lon = M_LAT * math.cos(math.radians(olat))
 
-    tiles = corridor_tiles(corridor, args.buffer)
-    need = set()
-    for tx, tz in tiles:
-        need |= tile_meshes(tx, tz, olat, olon, m_lon)
-    need = sorted(need)
-    print(f"タイル {len(tiles)} 枚 / 3 次メッシュ {len(need)} 枚")
+    if args.mode == "city":
+        need = sorted(city_meshes(CITY_BBOX))
+        print(f"那覇市域 / 3 次メッシュの候補 {len(need)} 枚"
+              f"（海や隣接市町村のぶんは 404 で落ちる）")
+    else:
+        tiles = corridor_tiles(corridor, args.buffer)
+        need = set()
+        for tx, tz in tiles:
+            need |= tile_meshes(tx, tz, olat, olon, m_lon)
+        need = sorted(need)
+        print(f"タイル {len(tiles)} 枚 / 3 次メッシュ {len(need)} 枚")
 
     plan = []
     for kind, suffix in (("bldg", ".gml"), ("tran", "_tran.gml")):
