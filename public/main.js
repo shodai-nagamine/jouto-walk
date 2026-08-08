@@ -1026,8 +1026,11 @@ function makeLabel(text, w = 9, h = 2.4) {
 // STEP(0.55m)以内の段差は登れるので、階段は箱を積むだけで昇れる。
 let stationStop = null;
 
-/** 中心(cx,cz)・向きyawの長方形を、天端topの固体として登録する。 */
-function addSolid(cx, cz, w, d, yaw, top) {
+/**
+ * 中心(cx,cz)・向きyawの長方形を、天端topの固体として登録する。
+ * tag は当たり判定から外すときの目印(hashRemove の述語で使う)。
+ */
+function addSolid(cx, cz, w, d, yaw, top, tag) {
   const cos = Math.cos(yaw), sin = Math.sin(yaw);
   const ring = [];
   for (const [ox, oz] of [[-w / 2, -d / 2], [w / 2, -d / 2], [w / 2, d / 2], [-w / 2, d / 2]]) {
@@ -1038,7 +1041,7 @@ function addSolid(cx, cz, w, d, yaw, top) {
     if (p.x < minx) minx = p.x; if (p.x > maxx) maxx = p.x;
     if (p.y < minz) minz = p.y; if (p.y > maxz) maxz = p.y;
   }
-  const rec = { ring, minx, maxx, minz, maxz, top };
+  const rec = { ring, minx, maxx, minz, maxz, top, tile: tag };
   bstore.push(rec);
   hashInsert(bmap, rec);
 }
@@ -1448,11 +1451,232 @@ function addShopSigns(t) {
     sp.scale.set(5.2, 1.3, 1);
     sp.position.set(x, supportY(x, z) + 2.4, z);
     sp.visible = false;
+    // 中に入れるようにするので、店の素性を看板に持たせておく
+    sp.userData = { name: l.name, mark, color, kind: val, oh: l.oh || '', x, z };
     t.group.add(sp);
     shopSigns.push(sp);
     n++;
   }
   console.log(`[${t.key}] 店舗 ${n}件`);
+}
+
+// ---------------------------------------------------------------- 店の中
+// PLATEAU の建物は LOD1(足元の輪郭を高さぶん押し出しただけの箱)で、床も内部も
+// 1階の店舗区画も持たない。実測データから店内を起こすことは原理的にできないので、
+// 外は本物・中は作り物と割り切って、分類ごとの部屋を手続き的に建てる。
+//
+// 部屋は街から遠く離した「舞台」に建てて、そこへ移動する。街の真上に建てないのは
+// supportY が「footprint に入っていれば天端に立たせる」仕組みなので、上空に床を
+// 置くと、その真下の路上まで床の高さに持ち上がってしまうため(実際に踏んだ)。
+const STAGE = { x: 8000, z: 8000, y: 400 };   // タイルの外。当たり判定が街と混ざらない
+const ROOM = { w: 8.4, d: 6.4, h: 3.0 };      // 間口・奥行き・天井高(m)
+const ENTER_R = 6.0;                          // 看板にこの距離まで近づくと入れる(m)
+const SOLID_SHOP = 'shop';                    // 店内の固体につける目印
+
+let shopRoom = null;          // 建っている部屋 { group, sign }
+
+/**
+ * 壁に掛ける板。makeLabel(スプライト)と違って奥行きを見るので、
+ * 什器の後ろに回れば隠れる。店内では手前に抜けないことのほうが大事。
+ */
+function makePlate(text, w, h, bg = '#0d1b1e', fg = '#f6f3ea') {
+  const cv = document.createElement('canvas');
+  cv.width = 512; cv.height = 128;
+  const c = cv.getContext('2d');
+  c.fillStyle = bg; c.fillRect(0, 0, 512, 128);
+  c.fillStyle = fg;
+  c.font = 'bold 62px "Hiragino Sans", sans-serif';
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.fillText(text, 256, 66, 480);            // はみ出す長い名前は詰めて収める
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, toneMapped: false }));
+}
+
+/** 店内を建てる。看板のスプライト sp が持つ素性から中身を決める。 */
+function buildRoom(sp) {
+  const g = new THREE.Group();
+  const { w, d, h } = ROOM;
+  const P = sp.userData;
+  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
+
+  // 舞台の中心を原点として置く。ox は右(+X)、oz は奥(-Z)が正
+  const box = (bw, bh, bd, ox, oy, oz, color) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(bw, bh, bd), mat(color));
+    m.position.set(STAGE.x + ox, STAGE.y + oy, STAGE.z + oz);
+    m.castShadow = m.receiveShadow = true;
+    g.add(m);
+    return m;
+  };
+
+  const FLOOR = 0xb8ae9c, WALL = 0xe6e1d5, CEIL = 0xf2eee4;
+  const WOOD = 0x9a7550, METAL = 0xa8adb0;
+  const accent = P.color;
+
+  // 床・天井・4枚の壁。密閉した箱にする(外は見えないので背景を気にしなくてよい)
+  box(w, 0.2, d, 0, -0.1, 0, FLOOR);
+  box(w, 0.12, d, 0, h + 0.06, 0, CEIL);
+  box(w, h, 0.2, 0, h / 2, -d / 2, WALL);          // 奥
+  box(w, h, 0.2, 0, h / 2, d / 2, WALL);           // 手前(入口側)
+  box(0.2, h, d, -w / 2, h / 2, 0, WALL);          // 左
+  box(0.2, h, d, w / 2, h / 2, 0, WALL);           // 右
+  // 当たり判定。床は天端=舞台の高さ、壁は天井まで(段差許容で越えられない高さ)
+  addSolid(STAGE.x, STAGE.z, w, d, 0, STAGE.y, SOLID_SHOP);
+  for (const [cx, cz, sw, sd] of [
+    [0, -d / 2, w, 0.2], [0, d / 2, w, 0.2],
+    [-w / 2, 0, 0.2, d], [w / 2, 0, 0.2, d],
+  ]) addSolid(STAGE.x + cx, STAGE.z + cz, sw, sd, 0, STAGE.y + h, SOLID_SHOP);
+
+  // 入口(手前の壁)。開かないので見た目だけ。出口の案内を添える
+  box(1.5, 2.1, 0.06, 0, 1.05, d / 2 - 0.14, 0x6f7d84);
+  box(0.09, 0.09, 0.06, 0.55, 1.05, d / 2 - 0.2, METAL);
+  const exit = makePlate('でぐち', 1.3, 0.34);
+  exit.position.set(STAGE.x, STAGE.y + 2.42, STAGE.z + d / 2 - 0.13);
+  exit.rotation.y = Math.PI;                 // 手前の壁は室内側が -Z を向く
+  g.add(exit);
+
+  // 店名(奥の壁に掛ける)
+  const nameTag = makePlate(`${P.mark}　${P.name}`, 3.4, 0.85);
+  nameTag.position.set(STAGE.x, STAGE.y + 2.42, STAGE.z - d / 2 + 0.12);
+  g.add(nameTag);
+
+  // 照明。密閉した箱なので太陽は届かない。天井の面光源に見えるよう板と点光源を置く
+  const panel = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.06, 0.5),
+    new THREE.MeshBasicMaterial({ color: 0xfff6e0 }));
+  panel.position.set(STAGE.x, STAGE.y + h - 0.12, STAGE.z - 0.6);
+  g.add(panel);
+  const lamp = new THREE.PointLight(0xffe9c4, 16, 16, 2);
+  lamp.position.set(STAGE.x, STAGE.y + h - 0.35, STAGE.z - 0.4);
+  g.add(lamp);
+  const fill = new THREE.PointLight(0xdfe8ee, 7, 14, 2);
+  fill.position.set(STAGE.x, STAGE.y + h - 0.5, STAGE.z + d / 2 - 1.2);
+  g.add(fill);
+
+  // ---- 分類ごとの什器 -------------------------------------------------
+  // 商品棚。壁と同系色だと白く飛んで一枚の板に見えるので、本体は暗めにして
+  // 段を切り、商品を段ごとに並べる(のっぺりした塊に見えないように)
+  const shelf = (ox, oz, len) => {
+    const dep = 0.55;
+    box(len, 1.45, 0.07, ox, 0.72, oz - dep / 2 + 0.035, 0x8f887a);   // 背板
+    for (const sx of [-len / 2 + 0.04, len / 2 - 0.04]) {
+      box(0.08, 1.45, dep, ox + sx, 0.72, oz, 0x8f887a);              // 側板
+    }
+    box(len, 0.06, dep, ox, 1.45, oz, 0x6d675c);                      // 天板
+    for (const oy of [0.42, 0.87, 1.32]) {
+      box(len, 0.05, dep, ox, oy, oz, 0x6d675c);                      // 棚板
+      const cols = Math.max(2, Math.round(len / 0.42));
+      for (let i = 0; i < cols; i++) {
+        const c = new THREE.Color().setHSL(((i * 0.19) + oy) % 1, 0.5, 0.42);
+        box(0.3, 0.3, 0.32, ox - len / 2 + 0.3 + i * (len - 0.6) / (cols - 1),
+            oy + 0.18, oz, c.getHex());
+      }
+    }
+  };
+  const counter = (ox, oz, len, dep = 0.7) => {
+    box(len, 1.05, dep, ox, 0.52, oz, WOOD);
+    box(len + 0.1, 0.06, dep + 0.1, ox, 1.08, oz, 0x6f5a41);
+  };
+  const chair = (ox, oz) => {
+    box(0.42, 0.08, 0.42, ox, 0.45, oz, WOOD);
+    box(0.42, 0.5, 0.07, ox, 0.72, oz - 0.18, WOOD);
+    for (const sx of [-0.16, 0.16]) for (const sz of [-0.16, 0.16]) {
+      box(0.05, 0.45, 0.05, ox + sx, 0.22, oz + sz, METAL);
+    }
+  };
+  const bench = (ox, oz, len) => {
+    box(len, 0.08, 0.42, ox, 0.44, oz, WOOD);
+    box(len, 0.42, 0.07, ox, 0.68, oz - 0.18, WOOD);
+    for (const sx of [-len / 2 + 0.2, len / 2 - 0.2]) {
+      box(0.07, 0.42, 0.38, ox + sx, 0.21, oz, METAL);
+    }
+  };
+
+  // 入口(oz = +2.1)に立って店の奥を向くので、oz > 1.2 の帯は空けておく。
+  // ここを埋めると、入った瞬間に什器の中に立つことになる(実際にそうなった)。
+  if (P.mark === '食') {
+    for (const [tx, tz] of [[-2.4, -1.9], [-2.4, 0.3], [0.4, -1.9], [0.4, 0.3]]) {
+      box(1.0, 0.07, 0.9, tx, 0.74, tz, WOOD);          // 天板
+      box(0.1, 0.72, 0.1, tx, 0.36, tz, METAL);         // 脚
+      box(0.55, 0.05, 0.55, tx, 0.03, tz, METAL);
+      chair(tx, tz + 0.72); chair(tx, tz - 0.72);
+    }
+    counter(3.0, -1.0, 3.4, 0.75);                      // 厨房カウンター
+    box(0.9, 1.5, 0.55, 3.3, 0.75, -2.5, METAL);        // 冷蔵庫
+    box(1.8, 0.44, 0.12, 1.6, 1.62, -2.98, accent);     // 品書き
+  } else if (P.mark === '買') {
+    shelf(-0.5, -2.3, 5.6);                             // 陳列棚(奥から2列)
+    shelf(-0.5, -0.9, 5.6);
+    shelf(-3.4, 0.7, 1.4);                              // 左手前
+    counter(2.9, 0.5, 2.6);                             // レジ
+    box(0.42, 0.3, 0.34, 3.2, 1.25, 0.5, 0x2f3338);
+  } else if (P.mark === '医') {
+    counter(0, -2.2, 4.4, 0.8);                         // 受付
+    box(1.4, 0.5, 0.12, 0, 1.7, -2.98, accent);         // 受付表示
+    bench(-2.6, 0.8, 2.8);
+    bench(2.6, 0.8, 2.8);
+    box(0.08, 1.7, 2.2, 2.7, 0.85, -0.9, 0xdfe7ea);     // 間仕切り
+    box(0.5, 0.9, 0.4, -3.5, 0.45, -1.2, 0xd8d3c6);     // 観葉鉢
+  } else if (P.mark === '金') {
+    counter(0, -2.2, 5.2, 0.8);
+    for (const ox of [-1.7, 0, 1.7]) {                  // 窓口の仕切り
+      box(0.06, 0.9, 0.75, ox, 1.55, -2.2, 0xdfe7ea);
+    }
+    for (const ox of [-3.2, -1.9]) {                    // ATM
+      box(0.85, 1.9, 0.7, ox, 0.95, 0.6, 0xcdd3d6);
+      box(0.5, 0.35, 0.06, ox, 1.45, 0.22, 0x22303a);
+      box(0.6, 0.12, 0.06, ox, 1.02, 0.22, accent);
+    }
+    box(2.0, 0.45, 0.75, 2.6, 0.4, 0.4, 0x59636b);      // 長椅子
+    box(2.0, 0.5, 0.12, 2.6, 0.85, 0.7, 0x59636b);
+  } else if (P.mark === '学') {
+    for (const row of [0, 1]) for (const col of [-1, 0, 1]) {
+      const tx = col * 1.7, tz = -1.5 + row * 1.5;
+      box(1.15, 0.06, 0.55, tx, 0.72, tz, WOOD);
+      for (const sx of [-0.5, 0.5]) box(0.06, 0.7, 0.06, tx + sx, 0.35, tz, METAL);
+      chair(tx, tz + 0.6);
+    }
+    // 白板は店名の板(oy 2.42)に掛からない高さに収める
+    box(4.6, 1.3, 0.08, 0, 1.32, -d / 2 + 0.2, 0xf6f5ef);
+    box(4.6, 0.1, 0.16, 0, 0.64, -d / 2 + 0.26, WOOD);
+    box(0.95, 0.06, 0.9, 3.3, 0.9, -2.2, WOOD);             // 教卓
+    for (const sx of [-0.4, 0.4]) box(0.07, 0.87, 0.07, 3.3 + sx, 0.44, -2.2, METAL);
+  } else if (P.mark === '公') {
+    // 公園・運動施設は「管理棟」に見立てる(屋外そのものには入れない)
+    counter(0, -2.2, 3.0, 0.75);
+    bench(-2.8, 0.4, 2.4);
+    bench(2.8, 0.4, 2.4);
+    box(2.6, 1.5, 0.1, 0, 1.6, -d / 2 + 0.2, 0x3d4a3a);     // 掲示板
+    box(2.3, 1.2, 0.03, 0, 1.6, -d / 2 + 0.27, 0xe8e4d6);
+    for (const ox of [3.3, 3.9]) box(0.5, 1.8, 0.5, ox, 0.9, -1.9, METAL);  // ロッカー
+  } else {
+    counter(0, -2.2, 3.4);
+    shelf(-2.9, 0.3, 2.2);
+    shelf(2.9, 0.3, 2.2);
+  }
+
+  scene.add(g);
+  shopRoom = { group: g, sign: sp };
+  return shopRoom;
+}
+
+/** 店内を畳む。描画物も当たり判定も残さない。 */
+function disposeRoom() {
+  if (!shopRoom) return;
+  shopRoom.group.traverse((o) => {
+    o.geometry?.dispose();
+    // テクスチャはマテリアルを捨てる前に外す(捨てた後では辿れない)
+    for (const m of [o.material].flat().filter(Boolean)) {
+      m.map?.dispose();
+      m.dispose();
+    }
+  });
+  scene.remove(shopRoom.group);
+  hashRemove(bmap, (r) => r.tile === SOLID_SHOP);
+  for (let i = bstore.length - 1; i >= 0; i--) {
+    if (bstore[i].tile === SOLID_SHOP) bstore.splice(i, 1);
+  }
+  shopRoom = null;
 }
 
 // ---------------------------------------------------------------- 歩行者
@@ -2074,7 +2298,7 @@ function drawMap() {
   }
 
   // 自分(視線方向つき)
-  const px = mx(player.x), pz = mz(player.z);
+  const px = mx(hereX()), pz = mz(hereZ());
   mctx.save(); mctx.translate(px, pz); mctx.rotate(-player.yaw);
   mctx.fillStyle = '#7fe0ff';
   mctx.beginPath();
@@ -2116,20 +2340,67 @@ const seatOf = (v) => v.seat ?? SEAT;
 let riding = null, boardable = null;
 const rideEl = $('ride');
 
+// 店の出入り。乗り物と同じ「近づく → 入る → 出る」なので UI も共用する
+let inShop = null, enterable = null, shopReturn = null;
+
+/** 地図やHUDで使う街での現在地。店内に居るあいだは入る前の位置を指す。 */
+const hereX = () => (inShop ? shopReturn.x : player.x);
+const hereZ = () => (inShop ? shopReturn.z : player.z);
+
 function updateRideUI() {
-  if (riding) {
-    $('rd-route').textContent = `${riding.ref}　${riding.name}`;
-    $('rd-msg').textContent = '乗車中 — 景色をどうぞ';
-    $('rd-btn').textContent = TOUCH ? '降りる' : '降りる [E]';
+  const set = (t, m, b) => {
+    $('rd-route').textContent = t;
+    $('rd-msg').textContent = m;
+    $('rd-btn').textContent = TOUCH ? b : `${b} [E]`;
     rideEl.classList.add('on');
+  };
+  if (inShop) {
+    set(`${inShop.userData.mark}　${inShop.userData.name}`,
+        inShop.userData.oh || '店内', '出る');
+  } else if (riding) {
+    set(`${riding.ref}　${riding.name}`, '乗車中 — 景色をどうぞ', '降りる');
   } else if (boardable) {
-    $('rd-route').textContent = `${boardable.ref}　${boardable.name}`;
-    $('rd-msg').textContent = boardable.isTrain ? 'が到着しています' : 'が停まっています';
-    $('rd-btn').textContent = TOUCH ? '乗る' : '乗る [E]';
-    rideEl.classList.add('on');
+    set(`${boardable.ref}　${boardable.name}`,
+        boardable.isTrain ? 'が到着しています' : 'が停まっています', '乗る');
+  } else if (enterable) {
+    set(`${enterable.userData.mark}　${enterable.userData.name}`,
+        enterable.userData.oh || '入れます', '入る');
   } else {
     rideEl.classList.remove('on');
   }
+}
+
+function enterShop() {
+  if (inShop || riding || !enterable) return;
+  const sp = enterable;
+  shopReturn = { x: player.x, z: player.z, y: player.y, yaw: player.yaw, pitch: player.pitch };
+  setFly(false);
+  buildRoom(sp);
+  inShop = sp;
+  enterable = null;
+  stick = null; stickShow(false);
+  // 入口(手前の壁)の内側に立って店の奥を向く。yaw=0 の前方は -Z
+  player.x = STAGE.x;
+  player.z = STAGE.z + ROOM.d / 2 - 1.1;
+  player.y = STAGE.y + EYE;
+  player.yaw = 0; player.pitch = 0;
+  player.vy = 0; player.onGround = true;
+  say(`${sp.userData.name} に入った`);
+  updateRideUI();
+}
+
+function exitShop() {
+  if (!inShop) return;
+  const name = inShop.userData.name;
+  const back = shopReturn;
+  inShop = null; shopReturn = null;
+  disposeRoom();
+  player.x = back.x; player.z = back.z;
+  player.y = supportY(back.x, back.z) + EYE;
+  player.yaw = back.yaw; player.pitch = back.pitch;
+  player.vy = 0; player.onGround = true;
+  say(`${name} を出た`);
+  updateRideUI();
 }
 
 function board() {
@@ -2170,14 +2441,22 @@ function alight() {
   updateRideUI();
 }
 
-$('rd-btn').addEventListener('click', () => (riding ? alight() : board()));
+/** [E] とボタンの共通処理。出入りは1つのボタンで賄う。 */
+function rideAction() {
+  if (inShop) exitShop();
+  else if (riding) alight();
+  else if (boardable) board();
+  else if (enterable) enterShop();
+}
+
+$('rd-btn').addEventListener('click', rideAction);
 $('rd-btn').addEventListener('touchstart', (e) => {
   e.preventDefault();
-  if (riding) alight(); else board();
+  rideAction();
 }, { passive: false });
 addEventListener('keydown', (e) => {
   if (e.code !== 'KeyE' || !started) return;
-  if (riding) alight(); else if (boardable) board();
+  rideAction();
 });
 
 // ---------------------------------------------------------------- 議会パネル
@@ -2359,6 +2638,20 @@ function tick() {
     if (prev !== boardable) updateRideUI();
   }
 
+  // 入れる店を探す(乗り物が優先。バス停の前の店で取り合いにならないように)
+  {
+    const prev = enterable;
+    enterable = null;
+    if (active && !riding && !inShop && !boardable) {
+      let best = Infinity;
+      for (const s of shopSigns) {
+        const d = Math.hypot(s.userData.x - player.x, s.userData.z - player.z);
+        if (d < ENTER_R && d < best) { best = d; enterable = s; }
+      }
+    }
+    if (prev !== enterable) updateRideUI();
+  }
+
   if (active && !riding) {
     // 入力を「前後(fb)・左右(lr)」にまとめてから向きに乗せる
     let fb = 0, lr = 0, throttle = 1, run = keys.has('ShiftLeft') || keys.has('ShiftRight');
@@ -2397,15 +2690,19 @@ function tick() {
       // 軸ごとに試して壁ずりを効かせる(天端より上なら素通りできる)
       if (!blocked(player.x + mx, player.z, RADIUS, feet)) player.x += mx;
       if (!blocked(player.x, player.z + mz, RADIUS, feet)) player.z += mz;
-      // 読み込み済みタイルの外へは出さない(地形が無く落ちるため)
-      player.x = Math.max(BOUNDS.minx + 2, Math.min(BOUNDS.maxx - 2, player.x));
-      player.z = Math.max(BOUNDS.minz + 2, Math.min(BOUNDS.maxz - 2, player.z));
+      // 読み込み済みタイルの外へは出さない(地形が無く落ちるため)。
+      // 店内は街の外に建てた舞台なので、この制限をかけない
+      if (!inShop) {
+        player.x = Math.max(BOUNDS.minx + 2, Math.min(BOUNDS.maxx - 2, player.x));
+        player.z = Math.max(BOUNDS.minz + 2, Math.min(BOUNDS.maxz - 2, player.z));
+      }
     }
 
     // ジャンプの長押しで飛行を切り替える(押している間に1回だけ発火)
+    // 店内では飛べない(天井を抜けて舞台の外へ出てしまうため)
     if (jumpHeld && !holdUsed && now - jumpSince > HOLD_MS) {
       holdUsed = true;
-      setFly(!flying);
+      if (!inShop) setFly(!flying);
     }
 
     // 上下。屋根の上にも立てるので接地面は supportY で取る
@@ -2558,7 +2855,8 @@ function tick() {
   let nearest = Infinity;
   for (const s of seesaa) {
     if (s.userData.taken) continue;
-    const d = Math.hypot(s.position.x - player.x, s.position.z - player.z);
+    // 店内に居るあいだは入る前の位置で測る(街から離れた舞台に居るため)
+    const d = Math.hypot(s.position.x - hereX(), s.position.z - hereZ());
     if (d < nearest) nearest = d;
     s.rotation.y += dt * 0.42;                    // 台座ごとゆっくり回す
     s.userData.ring.rotation.z += dt * 1.1;
@@ -2576,7 +2874,8 @@ function tick() {
   $('found').textContent = `${taken} / ${seesaa.length}`;
   $('dist').textContent = taken >= seesaa.length ? 'ぜんぶ発見' :
     (nearest === Infinity ? '—' : `${nearest.toFixed(0)} m`);
-  $('alt').textContent = `${(player.y - EYE).toFixed(1)} m`;
+  // 店内の舞台は街の外にあるので、標高は入る前の値のまま見せる
+  $('alt').textContent = `${((inShop ? shopReturn.y : player.y) - EYE).toFixed(1)} m`;
   const mm = (elapsed / 60) | 0, ss = (elapsed % 60) | 0;
   $('time').textContent = `${mm}:${String(ss).padStart(2, '0')}`;
   // コンパス: yaw=0 が北(-Z)。yaw増加=反時計回りなので方位は 360-yaw。
@@ -2599,6 +2898,20 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   rmap, bmap, hashInsert, hashRemove, distToBuilding,
   // タイル関係(検証用)
   tiles, tileOf, worldBounds, fetchTile, buildTileCore, buildTileProps, TILE, HALF,
+  // 店の中(検証用)。看板の前まで歩かずに寄れる
+  shopSigns, shopState: () => ({ inShop: inShop?.userData ?? null,
+    enterable: enterable?.userData ?? null, solids: bstore.filter((r) => r.tile === 'shop').length }),
+  gotoShop: (i) => {
+    const s = shopSigns[i];
+    if (!s) return null;
+    player.x = s.userData.x; player.z = s.userData.z + 2;
+    player.y = supportY(player.x, player.z) + EYE;
+    player.yaw = Math.PI; player.pitch = 0;
+    return s.userData;
+  },
+  // tick を待たずに出入りする(ペインが隠れていると rAF が止まって検証できないため)
+  visitShop: (i) => { enterable = shopSigns[i] ?? null; enterShop(); },
+  leaveShop: () => exitShop(),
   // 検証用: 列車を駅に着けて長く停める
   trainToStation: (sec = 60) => {
     if (trainStopD === null) return false;
