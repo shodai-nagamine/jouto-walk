@@ -504,6 +504,38 @@ def parse_parks(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=60.0):
     return out
 
 
+def parse_walls(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=40.0):
+    """首里城の石垣を「線」として取り出す(OSM barrier=wall / historic=citywalls)。
+
+    OSM の石垣は **高さを持たない**（実測で height / ele のタグは 1 件も無い）。
+    描画側が地形から起こすので、ここでは線形だけを渡す。
+
+    範囲は fetch_osm.py の BBOX_OVERRIDE で首里城まわりに絞ってある。
+    barrier=wall を市中で取ると、ブロック塀を何千本も拾ってしまう。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = -margin, size + margin
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        if t.get("barrier") != "wall" and t.get("historic") != "citywalls":
+            continue
+        g = [p for p in (e.get("geometry") or []) if p]
+        if len(g) < 2:
+            continue
+        pts = [((p["lon"] - lon_c) * m_lon + half,
+                -(p["lat"] - lat_c) * m_lat + half) for p in g]
+        xs = [p[0] for p in pts]
+        zs = [p[1] for p in pts]
+        if max(xs) < lo or min(xs) > hi or max(zs) < lo or min(zs) > hi:
+            continue
+        pts = simplify(pts, tol=0.5)
+        if len(pts) < 2:
+            continue
+        out.append({"f": [round(v, 2) for q in pts for v in q]})
+    return out
+
+
 def parse_bus(path, lat_c, lon_c, m_lat, m_lon, half, margin):
     """OpenStreetMap(Overpass API)のバス停ノードをローカル座標にする。
 
@@ -550,6 +582,7 @@ def main():
     ap.add_argument("--signals", default="", help="信号 (OSM Overpass JSON)")
     ap.add_argument("--footways", default="", help="歩道・横断歩道・階段 (OSM Overpass JSON)")
     ap.add_argument("--parks", default="", help="公園・広場・グラウンド (OSM Overpass JSON)")
+    ap.add_argument("--walls", default="", help="首里城の石垣 (OSM Overpass JSON)")
     ap.add_argument("--max-routes", type=int, default=4, help="走らせる路線数")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -787,6 +820,16 @@ def main():
         print(f"  {os.path.basename(path)}: 公園系 {len(parks)}面 {cnt} "
               f"(名前あり{nn}/無名{len(parks) - nn})", file=sys.stderr)
 
+    walls = []
+    if args.walls:
+        path = (args.walls if os.path.isabs(args.walls)
+                else os.path.join(NAHA, args.walls))
+        walls = parse_walls(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        seg = sum(len(w["f"]) // 2 - 1 for w in walls)
+        if walls:
+            print(f"  {os.path.basename(path)}: 石垣 {len(walls)}本 / {seg}区間",
+                  file=sys.stderr)
+
     # 中心の地表高さ(スポーン基準)
     ci = n // 2
     world = {
@@ -811,6 +854,7 @@ def main():
         "signals": signals,
         "footways": footways,
         "parks": parks,
+        "walls": walls,
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:

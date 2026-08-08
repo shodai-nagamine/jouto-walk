@@ -29,6 +29,13 @@ ENDPOINT = "https://overpass-api.de/api/interpreter"
 # bbox で切るので、広いぶんには害がない。
 BBOX = (26.182, 127.638, 26.246, 127.742)
 
+# 一部の抽出だけ範囲を狭める。barrier=wall を回廊全体で取ると、市中の
+# ブロック塀を何千本も拾ってしまう。首里城の石垣はランドマークとして
+# 城の範囲だけを取る。
+BBOX_OVERRIDE = {
+    "shurijo": (26.2130, 127.7130, 26.2230, 127.7260),
+}
+
 # 名前は build_world.py の引数に対応する。timeout は Overpass 側の秒数。
 QUERIES = {
     # --bus
@@ -52,6 +59,16 @@ QUERIES = {
         'node["name"]{bbox};',
         'way["name"]{bbox};',
     ], "out center tags;"),
+    # --shurijo。首里城の石垣と、名前のある城内の建物・広場。
+    # 石垣は高さを持たないので、描画側で地形から起こす。
+    # 焼失前(2019年10月まで)の姿を建てる方針なので、OSM の輪郭がそのまま使える。
+    "shurijo": (90, [
+        'way["barrier"="wall"]{bbox};',
+        'way["historic"="citywalls"]{bbox};',
+        'way["historic"="gate"]{bbox};',
+        'way["building"]["name"]{bbox};',
+        'way["name"~"御庭"]{bbox};',
+    ], "out geom tags;"),
     # --parks。["name"] で絞らないのが要点(那覇の街区公園と校庭は半数以上が無名で、
     # 名前で絞ると見た目に一番効く大きなグラウンドが軒並み落ちる)
     "parks": (300, [
@@ -61,6 +78,10 @@ QUERIES = {
         'way["leisure"="pitch"]{bbox};',
     ], "out geom tags;"),
 }
+
+
+def bbox_for(name):
+    return BBOX_OVERRIDE.get(name, BBOX)
 
 
 def build_query(name, bbox):
@@ -136,11 +157,15 @@ def main():
 
     print(f"範囲 lat {BBOX[0]}〜{BBOX[2]} / lon {BBOX[1]}〜{BBOX[3]}", file=sys.stderr)
     for name in names:
+        bb = bbox_for(name)
+        if bb is not BBOX:
+            print(f"  {name} は範囲を狭める: lat {bb[0]}〜{bb[2]} / lon {bb[1]}〜{bb[3]}",
+                  file=sys.stderr)
         path = os.path.join(args.out_dir, f"naha_{name}_osm.json")
         qpath = os.path.join(args.out_dir, f"naha_{name}_osm.query.txt")
         # 実際に投げたのは分割後のクエリだが、記録は「本来の 1 発ぶん」を残す。
         # 分割は取得の都合なので、範囲の記録としてはこちらが正しい。
-        query = build_query(name, BBOX)
+        query = build_query(name, bb)
         with open(qpath, "w") as f:
             f.write(query)
         if args.dry_run:
@@ -149,7 +174,7 @@ def main():
 
         print(f"  {name} …", file=sys.stderr)
         t0 = time.time()
-        elements, k = fetch(name, BBOX)
+        elements, k = fetch(name, bb)
         # 既存を .bak に退避してから置き換える(取り直しに失敗しても戻せる)
         if os.path.exists(path):
             os.replace(path, path + ".bak")

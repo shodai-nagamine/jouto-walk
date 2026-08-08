@@ -7,7 +7,9 @@
 1km 四方のタイルはたいてい 4 枚にまたがる。
 
   ~/dev/tools/blender-mcp/.venv/bin/python tools/build_tiles.py
-  ~/dev/tools/blender-mcp/.venv/bin/python tools/build_tiles.py --only 0,0 -1,0
+  ~/dev/tools/blender-mcp/.venv/bin/python tools/build_tiles.py --only=-1,1 --force
+      ※ tx が負のタイルは **--only=-1,1 の = 形式**で渡すこと。
+        --only -1,1 と書くと argparse がフラグと解釈して落ちる。
   ~/dev/tools/blender-mcp/.venv/bin/python tools/build_tiles.py --dry-run
 
 素材が足りないものは tools/fetch_citygml.py で取る。
@@ -39,6 +41,7 @@ OSM = {
     "--signals": "naha_signals_osm.json",
     "--footways": "naha_footways_osm.json",
     "--parks": "naha_parks_osm.json",
+    "--walls": "naha_shurijo_osm.json",
 }
 # 2 次メッシュ 392725 の地形は 4 分割で配られている。**4 枚とも渡すこと**。
 # _50/_55 だけだと那覇空港・小禄の側で「範囲内に点なし」となり、

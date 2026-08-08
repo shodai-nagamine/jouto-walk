@@ -1267,6 +1267,7 @@ function buildTileCore(t) {
 
 /** タイル t の付属物(当たり判定に影響しないもの)を建てる。 */
 function buildTileProps(t) {
+  addWalls(t);          // 石垣。addSolid を使うので groundTexture より後
   addBusStops(t);
   addSignals(t);
   addShopSigns(t);
@@ -1649,6 +1650,181 @@ function playSitesOf(t) {
     out.push([cx, cz]);
   }
   return out;
+}
+
+// ---------------------------------------------------------------- 首里城の石垣
+// 首里城の姿を決めているのは正殿より石垣(城郭)。OSM に線形が入っているが
+// **高さのタグは 1 件も無い**ので、地形から起こす。
+//
+// 石垣は「高い側の地面を、低い側から支える」擁壁なので、**線の左右を直交方向に
+// 測って段差を取る**。天端 = 高い側 + 立ち上がり、足元 = 低い側。
+//
+// 線に沿った半径で最大値を取る方式も試したが、最大 5.6m にしかならなかった。
+// PLATEAU の DEM は 5m 格子なので擁壁の段差が 2〜3 セルに均されてしまい、
+// 線上をいくら探しても本来の高さが出ない。左右 9m を見ると最大 9.8m・
+// 中央 1.8m になり、実際の首里城の高石垣(10〜14m)と釣り合う。
+const WALL_T = 1.9;          // 石垣の厚み(m)
+const WALL_PROBE = 9;        // 左右に測る距離(m)。大きいほど斜面を石垣に見立てる
+const WALL_LIP = 1.2;        // 天端の立ち上がり(m)。平らな所でもこれだけは立つ
+const WALL_MAX = 14;         // 見せる高さの上限(m)。DEM の外れ値で塔にしない
+const WALL_BATTER = 0.16;    // 上に行くほど痩せる割合(石垣の勾配)
+
+// 相方積み(あいかたづみ)の質感。琉球石灰岩を多角形に加工して隙間なく噛ませる
+// 積み方で、日本本土の布積み(水平の目地が通る)とは見た目が違う。
+// 目地が通らないよう、格子を大きく揺らした多角形で敷く。
+let wallMap = null;
+function wallTexture() {
+  const W = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = W;
+  const g = c.getContext('2d');
+  g.fillStyle = '#6d6455';                 // 目地(影)
+  g.fillRect(0, 0, W, W);
+  // 種を固定して毎回同じ石にする(タイルを出し入れしても変わらない)
+  let sd = 8675309;
+  const r = () => ((sd = (sd * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  // 格子が細かく揃うと本土の布積み(水平の目地が通る)に見える。
+  // 目が粗いほど、大きな石を噛ませた相方積みに近づく
+  const NX = 4, NY = 4, cw = W / NX, ch = W / NY;
+  // 格子点を揺らし、その四隅を結んだ多角形を石にする。上下左右で繋がるよう
+  // 端の揺らぎは反対側と共有する
+  const jx = [], jy = [];
+  for (let i = 0; i <= NX; i++) {
+    jx.push([]); jy.push([]);
+    for (let j = 0; j <= NY; j++) {
+      const ex = (i === 0 || i === NX), ey = (j === 0 || j === NY);
+      // 0.7 より大きくすると多角形が反転して石が裏返る
+      jx[i].push(ex ? 0 : (r() - 0.5) * cw * 0.70);
+      jy[i].push(ey ? 0 : (r() - 0.5) * ch * 0.70);
+    }
+  }
+  for (let i = 0; i < NX; i++) {
+    for (let j = 0; j < NY; j++) {
+      const P = (a, b) => [a * cw + jx[a][b], b * ch + jy[a][b]];
+      const pts = [P(i, j), P(i + 1, j), P(i + 1, j + 1), P(i, j + 1)];
+      // 石ごとに明るさを振る。日に焼けた白茶〜灰白
+      const l = 0.60 + r() * 0.30;
+      g.fillStyle = `hsl(${38 + r() * 14}, ${9 + r() * 10}%, ${(l * 100) | 0}%)`;
+      g.beginPath();
+      pts.forEach(([x, y], k) => (k ? g.lineTo(x, y) : g.moveTo(x, y)));
+      g.closePath();
+      g.fill();
+      // 面のざらつき
+      for (let k = 0; k < 26; k++) {
+        g.fillStyle = `rgba(0,0,0,${r() * 0.07})`;
+        const [x, y] = pts[0];
+        g.fillRect(x + r() * cw * 0.8, y + r() * ch * 0.8, 2, 2);
+      }
+    }
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = MAXANISO;
+  return tex;
+}
+
+function addWalls(t) {
+  const ways = t.data.walls ?? [];
+  if (!ways.length) return;
+  const V = [], N = [], UV = [];
+  // UV は u=石垣に沿った距離 / v=高さ。石ひとつが約 1.2m になるよう 3m で1周
+  const UVS = 1 / 4.4;
+  const push = (p, n, u, v) => {
+    V.push(p[0], p[1], p[2]); N.push(n[0], n[1], n[2]); UV.push(u, v);
+  };
+  const quad = (a, b, c, d, n, ua, ub, va0, va1, vb0, vb1) => {
+    push(a, n, ua, va0); push(b, n, ub, vb0); push(c, n, ub, vb1);
+    push(a, n, ua, va0); push(c, n, ub, vb1); push(d, n, ua, va1);
+  };
+  let nseg = 0, run = 0;
+
+  for (const w of ways) {
+    // 2m 間隔に打ち直す(地形の起伏を拾うため)
+    const raw = [];
+    for (let i = 0; i < w.f.length; i += 2) raw.push([t.X(w.f[i]), t.Z(w.f[i + 1])]);
+    const pts = [];
+    for (let i = 0; i < raw.length - 1; i++) {
+      const [ax, az] = raw[i], [bx, bz] = raw[i + 1];
+      const d = Math.hypot(bx - ax, bz - az);
+      const steps = Math.max(1, Math.round(d / 2));
+      for (let k = 0; k < steps; k++) {
+        const u = k / steps;
+        pts.push([ax + (bx - ax) * u, az + (bz - az) * u]);
+      }
+    }
+    pts.push(raw[raw.length - 1]);
+    if (pts.length < 2) continue;
+
+    // 各点で線に直交する向きへ WALL_PROBE だけ離れた地形を左右とも見る。
+    // 高い側が石垣が支えている地面、低い側が石垣の面が現れる側。
+    const g = [], hi = [];
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)];
+      let dx = b[0] - a[0], dz = b[1] - a[1];
+      const L = Math.hypot(dx, dz) || 1;
+      dx /= L; dz /= L;
+      const [x, z] = pts[i];
+      const gl = groundAt(x + dz * WALL_PROBE, z - dx * WALL_PROBE);
+      const gr = groundAt(x - dz * WALL_PROBE, z + dx * WALL_PROBE);
+      g.push(Math.min(gl, gr, groundAt(x, z)));
+      hi.push(Math.max(gl, gr) + WALL_LIP);
+    }
+    // 天端は移動平均でならす。石垣の天端は水平に近く、ならさないと段々になる
+    const top = hi.map((_, i) => {
+      let sum = 0, c = 0;
+      for (let k = Math.max(0, i - 6); k <= Math.min(hi.length - 1, i + 6); k++) {
+        sum += hi[k]; c++;
+      }
+      return sum / c;
+    });
+
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [ax, az] = pts[i], [bx, bz] = pts[i + 1];
+      let dx = bx - ax, dz = bz - az;
+      const L = Math.hypot(dx, dz) || 1;
+      dx /= L; dz /= L;
+      const px = dz, pz = -dx;                       // 線形に直交
+      // 足元は地形。天端との差が上限を超えたら足元を持ち上げて切る
+      const ay0 = Math.max(g[i], top[i] - WALL_MAX);
+      const by0 = Math.max(g[i + 1], top[i + 1] - WALL_MAX);
+      const ay1 = top[i], by1 = top[i + 1];
+      if (ay1 - ay0 < 0.2 && by1 - by0 < 0.2) continue;
+      const hw = WALL_T / 2;
+      const hwT = hw * (1 - WALL_BATTER);            // 天端は少し痩せる
+      const P = (x, z, y, o) => [x + px * o, y, z + pz * o];
+      const u0 = run * UVS, u1 = (run + L) * UVS;
+      // 高さ方向の UV は「足元を 0」にする。天端を 0 にすると、地面の起伏で
+      // 石の目地が波打って積んだように見えない
+      const va0 = 0, va1 = (ay1 - ay0) * UVS;
+      const vb0 = 0, vb1 = (by1 - by0) * UVS;
+      // 左右の面
+      quad(P(ax, az, ay0, hw), P(bx, bz, by0, hw), P(bx, bz, by1, hwT), P(ax, az, ay1, hwT),
+           [px, 0, pz], u0, u1, va0, va1, vb0, vb1);
+      quad(P(ax, az, ay1, -hwT), P(bx, bz, by1, -hwT), P(bx, bz, by0, -hw), P(ax, az, ay0, -hw),
+           [-px, 0, -pz], u0, u1, va1, va0, vb1, vb0);
+      // 天端
+      quad(P(ax, az, ay1, -hwT), P(bx, bz, by1, -hwT), P(bx, bz, by1, hwT), P(ax, az, ay1, hwT),
+           [0, 1, 0], u0, u1, 0, WALL_T * UVS, 0, WALL_T * UVS);
+      run += L;
+      // 当たり判定。天端に乗れる(石垣の上は歩けないが、抜けられては困る)
+      addSolid((ax + bx) / 2, (az + bz) / 2, WALL_T, L + 0.4,
+               Math.atan2(dx, dz), (ay1 + by1) / 2, t.key);
+      nseg++;
+    }
+  }
+  if (!V.length) return;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(UV, 2));
+  // 琉球石灰岩。日に焼けた白茶
+  wallMap ??= wallTexture();
+  const mesh = new THREE.Mesh(geo,
+    new THREE.MeshLambertMaterial({ map: wallMap, color: 0xd8cdb2 }));
+  mesh.castShadow = mesh.receiveShadow = true;
+  t.group.add(mesh);
+  console.log(`[${t.key}] 石垣 ${ways.length}本 / ${nseg}区間 / ${V.length / 3}頂点`);
 }
 
 // ---------------------------------------------------------------- 公園の木
