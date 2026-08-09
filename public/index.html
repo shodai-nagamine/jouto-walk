@@ -60,9 +60,13 @@
     margin:-2.5px 0 0 -2.5px; border-radius:50%; background:rgba(246,243,234,.75);
     box-shadow:0 0 0 1.5px rgba(13,27,30,.4); }
 
+  /* nowrap では収まらない文が出てきた(釣った魚の説明は初回だけ長い。
+     実測で 375px の画面に 726px はみ出した)。折り返して画面の幅で切る */
   #toast { position:absolute; left:50%; top:56%; transform:translateX(-50%);
     font-size:22px; font-weight:700; color:var(--accent); text-shadow:0 2px 12px rgba(0,0,0,.6);
-    opacity:0; transition:opacity .28s; white-space:nowrap; }
+    opacity:0; transition:opacity .28s; text-align:center; line-height:1.35;
+    /* width:auto だと縮んで 188px の細い柱になる。上限まで広げてから折り返す */
+    width:max-content; max-width:min(680px, calc(100vw - 32px)); }
   #toast.on { opacity:1; }
 
   /* 読み込み画面は紅型(びんがた)。型紙は #bingata に手続きで描く。
@@ -167,26 +171,33 @@
   #card .credit:hover { opacity:.62; }
   #card .credit a { color:var(--paper); }
 
-  /* ---- バスの乗降 ---- */
-  #ride { display:none; left:50%; transform:translateX(-50%); bottom:22px;
+  /* ---- バスの乗降・釣り ---- */
+  /* 同じ形の帯。乗降(#ride)は青、釣り(#fish)は緑青。バス停の前が水辺だと
+     両方いっぺんに出るので、釣りのほうを一段上に置く */
+  #ride, #fish { display:none; left:50%; transform:translateX(-50%); bottom:22px;
     pointer-events:none; align-items:center; gap:11px;
     border-color:rgba(47,143,196,.5); padding:9px 13px; }
-  #ride.on { display:flex; }
-  #ride .rt { font-size:13px; font-weight:700; color:#8fd0f0; white-space:nowrap; }
-  #ride .msg { font-size:11.5px; opacity:.8; white-space:nowrap; }
-  #ride .rb { pointer-events:auto; font-family:inherit; cursor:pointer;
+  #fish { bottom:74px; border-color:rgba(79,180,140,.5); }
+  #ride.on, #fish.on { display:flex; }
+  #ride .rt, #fish .rt { font-size:13px; font-weight:700; color:#8fd0f0; white-space:nowrap; }
+  #fish .rt { color:#8fe0c0; }
+  #ride .msg, #fish .msg { font-size:11.5px; opacity:.8; white-space:nowrap; }
+  #ride .rb, #fish .rb { pointer-events:auto; font-family:inherit; cursor:pointer;
     background:var(--sea); color:#eaf6fb; border:1px solid rgba(143,208,240,.6);
     border-radius:999px; padding:6px 16px; font-size:12px; font-weight:700;
     white-space:nowrap; }
+  #fish .rb { background:#2f7f66; border-color:rgba(143,224,192,.6); }
   #ride .rb:hover, #ride .rb:active { background:#8fd0f0; color:#0d1b1e; }
+  #fish .rb:hover, #fish .rb:active { background:#8fe0c0; color:#0d1b1e; }
   @media (max-width:820px), (max-height:560px) {
     /* 上はコンパスとステータスで埋まっているので左下に置く */
-    #ride { left:calc(10px + env(safe-area-inset-left)); transform:none;
+    #ride, #fish { left:calc(10px + env(safe-area-inset-left)); transform:none;
       bottom:calc(10px + env(safe-area-inset-bottom));
       padding:7px 9px; gap:7px; max-width:calc(100vw - 150px); }
-    #ride .rt { font-size:11px; overflow:hidden; text-overflow:ellipsis; }
-    #ride .msg { display:none; }
-    #ride .rb { padding:7px 13px; font-size:11.5px; }
+    #fish { bottom:calc(58px + env(safe-area-inset-bottom)); }
+    #ride .rt, #fish .rt { font-size:11px; overflow:hidden; text-overflow:ellipsis; }
+    #ride .msg, #fish .msg { display:none; }
+    #ride .rb, #fish .rb { padding:7px 13px; font-size:11.5px; }
   }
   /* 乗車中は移動スティックを出さない */
   body.riding #stick { display:none !important; }
@@ -354,6 +365,8 @@
     <div class="row"><span class="k">最寄りまで</span><span class="v" id="dist">—</span></div>
     <div class="row"><span class="k">標高</span><span class="v" id="alt">—</span></div>
     <div class="row"><span class="k">この一帯</span><span class="v" id="pop">—</span></div>
+    <div class="row"><span class="k">釣った魚</span><span class="v" id="fishcount">0 匹 / 0 種</span></div>
+    <div class="row" id="purse-row" style="display:none"><span class="k">財布</span><span class="v" id="purse">0 円</span></div>
     <div class="row"><span class="k">経過</span><span class="v" id="time">0:00</span></div>
   </div>
 
@@ -368,7 +381,7 @@
     <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 移動 ／ <kbd>Shift</kbd> 走る ／ <kbd>Space</kbd> ジャンプ<br>
     <kbd>Space</kbd> <b>長押しで飛行</b>（<kbd>Space</kbd> 上昇 ／ <kbd>Shift</kbd> 下降 ／ <b>見上げ・見下ろした方へ進む</b>）<br>
     マウス（効かなければドラッグ）で見回す ／ <kbd>Esc</kbd> でポーズ<br>
-    <b>光の柱</b>に近づくとシーサーを保護できる
+    <b>光の柱</b>に近づくとシーサーを保護できる ／ 水辺で <kbd>F</kbd> <b>釣り</b>
   </div>
 
   <div id="reticle"></div>
@@ -379,6 +392,13 @@
     <span class="rt" id="rd-route"></span>
     <span class="msg" id="rd-msg"></span>
     <button class="rb" id="rd-btn"></button>
+  </div>
+
+  <!-- 釣り。乗降と同じ形で、色だけ分ける -->
+  <div id="fish" class="panel">
+    <span class="rt" id="fs-title"></span>
+    <span class="msg" id="fs-msg"></span>
+    <button class="rb" id="fs-btn"></button>
   </div>
 
   <!-- 議会の言及パネル(近づくと出る) -->

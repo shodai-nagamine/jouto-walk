@@ -4732,7 +4732,11 @@ function addWater(t) {
       if (x < minx) minx = x; if (x > maxx) maxx = x;
       if (z < minz) minz = z; if (z > maxz) maxz = z;
     }
-    const rec = { ring, minx, maxx, minz, maxz, y: w.y, k: w.k, tile: t.key };
+    // name は釣りの見出しに使う(「龍潭に糸をたらした」)。
+    // **魚の種類は名前では変えない**。個々の池に何が居るかは手元のデータに
+    // 無いので、言えるのは水域の種別までにとどめる
+    const rec = { ring, minx, maxx, minz, maxz, y: w.y, k: w.k,
+                  name: w.name || '', tile: t.key };
     waters.push(rec);
     hashInsert(wmap, rec);
 
@@ -6157,6 +6161,298 @@ function exitShop() {
   updateRideUI();
 }
 
+// ---------------------------------------------------------------- 財布と持ち物
+// この世界には**何かを持つ器が無かった**。シーサーは `taken` という裸の
+// カウンタで、localStorage に入れているのは出発駅の選択だけ。釣り・買い物・
+// 工事はどれも「何かを得る」遊びなので、器を先に置く。
+//
+// 財布は**今は入り口が無い**(釣りで魚は増えるが金は増えない)。無理に
+// 釣りを換金にすると、市議会の発言や史跡の解説と並ぶこの街の調子から外れる。
+// 買い物か工事の日当を作るときに繋ぐので、0円のあいだは HUD に出さない。
+const PURSE_KEY = 'jouto-walk.purse.v1';
+let coins = 0;                    // 円
+const bag = new Map();            // 品名 -> 個数
+const seenFish = new Set();       // 一度でも釣った魚(図鑑)
+
+function loadPurse() {
+  try {
+    const j = JSON.parse(localStorage.getItem(PURSE_KEY) || '{}');
+    coins = Number(j.coins) || 0;
+    for (const [k, v] of Object.entries(j.bag || {})) bag.set(k, Number(v) || 0);
+    for (const k of j.seenFish || []) seenFish.add(k);
+  } catch { /* 壊れていたら空で始める。持ち物は失っても遊びは続く */ }
+}
+
+function savePurse() {
+  try {
+    localStorage.setItem(PURSE_KEY, JSON.stringify({
+      coins, bag: Object.fromEntries(bag), seenFish: [...seenFish],
+    }));
+  } catch { /* プライベートモードなどで書けないことがある。落とさない */ }
+}
+
+/** 持ち物に n 個足す。 */
+function addItem(name, n = 1) {
+  bag.set(name, (bag.get(name) ?? 0) + n);
+  savePurse();
+  updatePurseUI();
+}
+
+function updatePurseUI() {
+  const row = $('purse-row');
+  if (row) row.style.display = coins > 0 ? '' : 'none';
+  const c = $('purse');
+  if (c) c.textContent = `${coins.toLocaleString()} 円`;
+  const f = $('fishcount');
+  if (f) {
+    let n = 0;
+    for (const [k, v] of bag) if (FISH_NAMES.has(k)) n += v;
+    f.textContent = `${n} 匹 / ${seenFish.size} 種`;
+  }
+}
+
+loadPurse();
+// updatePurseUI() はここでは呼べない。中で FISH_NAMES を読むが、あれは下の
+// 釣りの節で宣言されるので TDZ で落ちる。表示の初期化は FISH_NAMES を
+// 組み立てた直後に置いてある
+
+// ---------------------------------------------------------------- 釣り
+// 水際に立って水面を向くと釣れる。水面の高さは waterAt() が池78面・川193本・
+// 海のどれからでも返すので、**釣りのために足す当たり判定は無い**。
+//
+// 魚は「この池にこの魚が居る」とは言わない。OSM にも PLATEAU にも魚は
+// 入っていないので、言えるのは**沖縄の池・川・干潟・海で釣れる魚**まで
+// (史跡289件のうち253件を説明なしで出したのと同じ線引き)。
+// だから水域の**種別**で表を分け、個々の池の名前では変えない。
+const CAST_R = 14;            // 竿を振って届く距離(m)
+const BITE_MS = [1800, 7000]; // 当たりが来るまで(ms)
+const HOOK_MS = 900;          // 当たってから合わせる猶予(ms)
+
+// 沖縄の水辺で釣れる魚。名前は現地の呼び方を添える。
+// k は waters の種別(water=池・貯水池 / wetland=干潟)、river=川、sea=海。
+const FISH = {
+  water: [
+    ['ティラピア', 'ちかごろの池でいちばん釣れる。もとは食用に持ちこまれた魚', 18, 34],
+    ['コイ', '公園の池でよく見る。人に慣れていて岸まで寄ってくる', 30, 62],
+    ['オオウナギ', '夜に出てくる大きなウナギ。石垣の隙間にひそむ', 60, 110],
+    ['テナガエビ', '腕の長いエビ。魚ではないが、よく釣れる', 6, 13],
+  ],
+  wetland: [
+    ['ミナミトビハゼ', 'トントンミー。干潟をはねて歩く、水から出られる魚', 5, 10],
+    ['ミナミクロダイ', 'チンシラー。汽水の濁りを好む', 22, 45],
+    ['シオマネキ', '片方のはさみだけ大きいカニ。潮を招くように振る', 3, 5],
+  ],
+  river: [
+    ['ボウズハゼ', '腹の吸盤で滝をのぼる。川の上流にいる', 8, 15],
+    ['ヨシノボリ', '石の間を跳ねるように動く小さなハゼ', 5, 11],
+    ['オオウナギ', '川の淵の岩陰にひそむ。夜に動く', 60, 110],
+    ['テナガエビ', '腕の長いエビ。石を起こすと逃げていく', 6, 13],
+  ],
+  sea: [
+    ['グルクン', 'タカサゴ。沖縄県の魚。から揚げでよく食べる', 20, 30],
+    ['イラブチャー', 'ブダイ。青い体。サンゴをかじって砂にする', 30, 60],
+    ['ミーバイ', 'ハタ。岩の穴で待ちぶせる。刺身にも汁にも', 25, 55],
+    ['ガーラ', 'ロウニンアジ。港の中まで入ってくる大物', 40, 90],
+    ['チヌマン', 'アイゴ。ひれのとげに毒があるので触らない', 18, 30],
+  ],
+};
+const FISH_NAMES = new Set();
+for (const list of Object.values(FISH)) for (const f of list) FISH_NAMES.add(f[0]);
+updatePurseUI();          // 前の節の loadPurse() の結果をここで初めて出せる
+
+// 状態は1つだけ。null=釣っていない / 'cast'=待っている / 'bite'=当たり /
+// 'reel'=引き上げの見せ場
+let fishing = null;   // {phase, t, biteAt, spot:{x,y,z}, kind, place}
+let rodGroup = null, floatMesh = null, lineMesh = null;
+
+/**
+ * 目の前の水面を探す。見ている向きへ CAST_R まで伸ばす。
+ * **自分の足元は見ない**(泳ぎながら釣らせないため)。
+ *
+ * 最初に当たった点には落とさない。岸から振ると水際は足のすぐ先なので、
+ * 浮きが画面の下の端に沈んで「投げた」ように見えない。当たった所から
+ * 水が続くかぎり先へ進み、CAST_OUT ぶん沖へ置く。
+ */
+const CAST_OUT = 6.5;         // 水際からさらに沖へ振る距離(m)
+
+function castTarget() {
+  if (riding || transit || inShop || fishing) return null;
+  if (inWater) return null;                 // 泳いでいるあいだは振れない
+  const dx = -Math.sin(player.yaw), dz = -Math.cos(player.yaw);
+  let first = null, last = null;
+  for (let d = 2.5; d <= CAST_R; d += 0.8) {
+    const x = player.x + dx * d, z = player.z + dz * d;
+    const y = waterAt(x, z);
+    // 水面より高い地形が間にあるなら、そこは対岸。そこで打ち切る
+    if (y === null || groundAt(x, z) > y + 0.05) {
+      if (first !== null) break;            // 対岸に着いた。ここまでが水面
+      continue;
+    }
+    if (first === null) first = d;
+    last = { d, x, y, z };
+  }
+  if (first === null) return null;
+  // 水際から CAST_OUT 先。水面が途切れていればその手前まで
+  const want = Math.min(first + CAST_OUT, last.d);
+  const x = player.x + dx * want, z = player.z + dz * want;
+  const y = waterAt(x, z) ?? last.y;
+  return { x, y, z, ...waterKindAt(x, z) };
+}
+
+/** (x,z) の水域の種別と呼び名。waters に無ければ川か海。 */
+function waterKindAt(x, z) {
+  const hits = wmap.get(`${Math.floor(x / HASH)},${Math.floor(z / HASH)}`) ?? [];
+  for (const w of hits) {
+    if (x < w.minx || x > w.maxx || z < w.minz || z > w.maxz) continue;
+    if (pointInRing(w.ring, x, z)) {
+      return { kind: w.k === 'wetland' ? 'wetland' : 'water', place: w.name || '' };
+    }
+  }
+  if (riverAt(x, z) !== null) return { kind: 'river', place: '' };
+  return { kind: 'sea', place: '' };
+}
+
+// 竿の手元と先端(カメラ座標。-Z が前・+X が右・+Y が上)。
+// **糸の始点をここから作る。** 別々に数字を書くと竿先と糸が離れる。
+// 手元を近づけすぎると画面を横切る巨大な棒になる(0.55m で実際にそうなった)。
+const ROD_BUTT = new THREE.Vector3(0.52, -0.52, -0.95);
+const ROD_TIP = new THREE.Vector3(0.12, 0.30, -2.55);
+
+/** 竿と浮きを作る。竿はカメラの子にして、常に手元に見えるようにする。 */
+function buildRod() {
+  if (rodGroup) return;
+  rodGroup = new THREE.Group();
+  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
+  // 手元→先端の向きへ円柱を寝かせる。Euler で書くと order の解釈で狂うので
+  // 向きを直接与える(信号の腕木で踏んだのと同じ理由)
+  const dir = ROD_TIP.clone().sub(ROD_BUTT);
+  const len = dir.length();
+  dir.normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+  const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.022, len, 6), mat(0x6b4f33));
+  rod.quaternion.copy(q);
+  rod.position.copy(ROD_BUTT).addScaledVector(dir, len / 2);
+  const grip = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, 0.26, 6), mat(0x2f2a26));
+  grip.quaternion.copy(q);
+  grip.position.copy(ROD_BUTT).addScaledVector(dir, 0.12);
+  rodGroup.add(rod, grip);
+  rodGroup.visible = false;
+  // カメラの子。カメラは毎フレーム位置を書き換えられるが、子は付いてくる
+  camera.add(rodGroup);
+  scene.add(camera);                 // 子を描かせるにはカメラも木に居る必要がある
+
+  floatMesh = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 7), mat(0xe8642f));
+  floatMesh.visible = false;
+  scene.add(floatMesh);
+  // 糸。竿先から浮きまで。毎フレーム2点を書き換える
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(6), 3));
+  lineMesh = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0xf2efe6 }));
+  lineMesh.visible = false;
+  lineMesh.frustumCulled = false;    // 2点しかないので境界球が当てにならない
+  scene.add(lineMesh);
+}
+
+/** [F] とボタンの共通処理。投げる／合わせる／やめる。 */
+function fishAction() {
+  if (!fishing) {
+    const spot = castTarget();
+    if (!spot) return;
+    buildRod();
+    fishing = {
+      phase: 'cast', t: 0, spot,
+      biteAt: (BITE_MS[0] + Math.random() * (BITE_MS[1] - BITE_MS[0])) / 1000,
+      kind: spot.kind, place: spot.place,
+    };
+    rodGroup.visible = true;
+    floatMesh.visible = lineMesh.visible = true;
+    floatMesh.position.set(spot.x, spot.y + 0.1, spot.z);
+    say(spot.place ? `${spot.place} に糸をたらした` : '糸をたらした');
+  } else if (fishing.phase === 'bite') {
+    landFish();
+  } else {
+    stopFishing('やめた');
+  }
+  updateFishUI();
+}
+
+function stopFishing(msg) {
+  fishing = null;
+  if (rodGroup) rodGroup.visible = false;
+  if (floatMesh) floatMesh.visible = lineMesh.visible = false;
+  if (msg) say(msg);
+  updateFishUI();
+}
+
+/** 合わせに成功したとき。種を選んで持ち物に入れる。 */
+function landFish() {
+  const list = FISH[fishing.kind] ?? FISH.water;
+  const [name, note, lo, hi] = list[(Math.random() * list.length) | 0];
+  const cm = Math.round(lo + Math.random() * (hi - lo));
+  const first = !seenFish.has(name);
+  seenFish.add(name);
+  addItem(name, 1);
+  const where = fishing.place ? `${fishing.place}で` : '';
+  stopFishing(null);
+  if (first) {
+    say(`${where}${name} ${cm}cm を釣った — ${note}`);
+  } else {
+    say(`${where}${name} ${cm}cm を釣った`);
+  }
+  savePurse();
+}
+
+/** 釣りを1フレーム進める。 */
+function stepFishing(dt) {
+  if (!fishing) return;
+  // 乗り物に乗る・店に入る・泳ぐと竿は仕舞う
+  if (riding || transit || inShop || inWater) { stopFishing(null); return; }
+  fishing.t += dt;
+  const f = floatMesh, s = fishing.spot;
+  if (fishing.phase === 'cast') {
+    // 待っているあいだ、浮きは水面で上下に揺れるだけ
+    f.position.set(s.x, s.y + 0.10 + Math.sin(fishing.t * 2.1) * 0.03, s.z);
+    if (fishing.t >= fishing.biteAt) {
+      fishing.phase = 'bite'; fishing.t = 0;
+      say('きた！');
+      updateFishUI();
+    }
+  } else if (fishing.phase === 'bite') {
+    // 当たり。浮きが水面下へ引きこまれる
+    f.position.set(s.x, s.y - 0.16 - Math.sin(fishing.t * 15) * 0.08, s.z);
+    if (fishing.t * 1000 >= HOOK_MS) stopFishing('逃げられた');
+  }
+  if (!fishing) return;
+  // 糸を竿先から浮きへ張る。竿先はカメラ座標なので世界座標へ直す
+  camera.updateMatrixWorld();
+  const tip = ROD_TIP.clone().applyMatrix4(camera.matrixWorld);
+  const p = lineMesh.geometry.attributes.position;
+  p.setXYZ(0, tip.x, tip.y, tip.z);
+  p.setXYZ(1, f.position.x, f.position.y, f.position.z);
+  p.needsUpdate = true;
+}
+
+const fishEl = $('fish');
+
+function updateFishUI() {
+  if (!fishEl) return;
+  const set = (t, m, b) => {
+    $('fs-title').textContent = t;
+    $('fs-msg').textContent = m;
+    $('fs-btn').textContent = TOUCH ? b : `${b} [F]`;
+    fishEl.classList.add('on');
+  };
+  if (fishing?.phase === 'bite') {
+    set('きた！', 'いま引く', '合わせる');
+  } else if (fishing) {
+    set('糸をたらしている', '当たりを待つ', 'やめる');
+  } else {
+    const spot = castTarget();
+    if (spot) set(spot.place || '水辺', '釣れます', '釣る');
+    else fishEl.classList.remove('on');
+  }
+}
+
 /**
  * 乗降のあいだの中間状態。
  *
@@ -6287,9 +6583,16 @@ $('rd-btn').addEventListener('touchstart', (e) => {
   rideAction();
 }, { passive: false });
 addEventListener('keydown', (e) => {
-  if (e.code !== 'KeyE' || !started) return;
-  rideAction();
+  if (!started) return;
+  if (e.code === 'KeyE') rideAction();
+  else if (e.code === 'KeyF') fishAction();
 });
+
+$('fs-btn').addEventListener('click', fishAction);
+$('fs-btn').addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  fishAction();
+}, { passive: false });
 
 // ---------------------------------------------------------------- 議会パネル
 const COUNCIL_R = 16;          // この距離まで近づくと出る(m)
@@ -6518,6 +6821,11 @@ function tick() {
     }
     if (prev !== enterable) updateRideUI();
   }
+
+  // 釣り。castTarget は見ている向きへ 15 回ほど waterAt を撃つので、
+  // 当たりを待っているあいだ以外は 8 フレームに1回に間引く
+  stepFishing(dt);
+  if (fishing?.phase === 'bite' || (frame & 7) === 0) updateFishUI();
 
   if (active && !riding) {
     // 入力を「前後(fb)・左右(lr)」にまとめてから向きに乗せる
@@ -6841,6 +7149,12 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   // 工事(検証用)。可動部の姿勢をそのまま読める
   machines, stepMachines, siteAreasOf, addFences, addMachines,
   makeExcavator, makeCrawlerCrane, makeDumpTruck,
+  // 釣りと持ち物(検証用)。当たりを待たずに合わせられる
+  get fishing() { return fishing; }, fishAction, stepFishing, castTarget,
+  waterKindAt, landFish, stopFishing, updateFishUI, FISH,
+  bag, seenFish, get coins() { return coins; }, addItem, savePurse,
+  resetPurse: () => { bag.clear(); seenFish.clear(); coins = 0;
+    savePurse(); updatePurseUI(); },
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
