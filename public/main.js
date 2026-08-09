@@ -971,7 +971,65 @@ function addTerrain(t) {
   ground.position.set(t.offX, 0, t.offZ);
   ground.receiveShadow = true;
   t.group.add(ground);
+  // 重機で掘るときに頂点を差し替える。t.terrain と対になる入れ物
+  t.ground = ground;
   console.log(`[${t.key}] 地形 ${n}×${n} (${cell}m格子)`);
+}
+
+/**
+ * (x,z) を中心に半径 r ぶん地面を掘る。掘った土の量(m3ざっくり)を返す。
+ *
+ * 地形は `t.terrain` の値をそのまま PlaneGeometry の頂点Yに載せたものなので、
+ * 配列と頂点の**両方**を書き換えれば凹む。地面テクスチャは焼き直さない
+ * (工事区域はもともと赤土なので、掘っても色は変わらない)。
+ *
+ * **格子は行が x・列が z。** `terrain[ix * n + iz]` で、頂点の番号は
+ * `iz * n + ix`。ここを取り違えると、掘った所と違う所が凹む
+ * (水域を掘るときに一度踏んだ罠)。
+ *
+ * タイルをまたぐ穴は端で継ぎ目が出るので、**掛かるタイルを全部**書き換える。
+ */
+function digGround(x, z, r, depth, floor = -Infinity) {
+  let moved = 0;
+  const touched = new Set();
+  for (const t of tiles.values()) {
+    if (x + r < t.offX - HALF || x - r > t.offX + HALF ||
+        z + r < t.offZ - HALF || z - r > t.offZ + HALF) continue;
+    const { n, cell, terrain } = t;
+    const pos = t.ground?.geometry.attributes.position;
+    if (!pos) continue;
+    // 中心の格子番号と、半径ぶんの幅
+    const ci = (x - t.offX + HALF) / cell, cj = (z - t.offZ + HALF) / cell;
+    const w = Math.ceil(r / cell) + 1;
+    let hit = false;
+    for (let ix = Math.max(0, Math.floor(ci - w)); ix <= Math.min(n - 1, Math.ceil(ci + w)); ix++) {
+      for (let iz = Math.max(0, Math.floor(cj - w)); iz <= Math.min(n - 1, Math.ceil(cj + w)); iz++) {
+        const gx = t.offX - HALF + ix * cell, gz = t.offZ - HALF + iz * cell;
+        const d = Math.hypot(gx - x, gz - z);
+        if (d > r) continue;
+        // 縁をなだらかにする。真ん中がいちばん深い
+        const k = 1 - (d / r) * (d / r);
+        const idx = ix * n + iz;
+        const was = terrain[idx];
+        // depth<0 は盛り土。limit は掘るときは下限・盛るときは上限
+        const want = depth > 0 ? Math.max(floor, was - depth * k)
+                               : Math.min(floor, was - depth * k);
+        if (depth > 0 ? want >= was : want <= was) continue;
+        terrain[idx] = want;
+        pos.setY(iz * n + ix, want);
+        moved += Math.abs(was - want) * cell * cell;
+        hit = true;
+      }
+    }
+    if (hit) touched.add(t);
+  }
+  for (const t of touched) {
+    const geo = t.ground.geometry;
+    geo.attributes.position.needsUpdate = true;
+    geo.computeVertexNormals();
+    geo.computeBoundingSphere();
+  }
+  return moved;
 }
 
 // タイルの外側。端が崖に見えないよう、外周の標高をそのまま外へ引き伸ばす(世界に1枚)。
@@ -3017,7 +3075,9 @@ function addMachines(t, sites) {
 
     // ダンプ。重機の脇に停める。置けなければ諦める(現場が狭いだけ)
     for (let k = 0; k < 12; k++) {
-      const a = t.rnd() * Math.PI * 2, r = 7 + t.rnd() * 5;
+      // ショベルの腕は 5.1m しか届かない。離して停めると土を積めないので
+      // 6〜8.5m に収める(12m だとバケットがダンプの 6.9m 手前で止まる)
+      const a = t.rnd() * Math.PI * 2, r = 6 + t.rnd() * 2.5;
       const dx = x + Math.cos(a) * r, dz = z + Math.sin(a) * r;
       if (Math.abs(dx - t.offX) > HALF - 6 || Math.abs(dz - t.offZ) > HALF - 6) continue;
       if (!s.inside(dx, dz) || blocked(dx, dz, 3.4) || onRoad(dx, dz)) continue;
@@ -3049,6 +3109,7 @@ const MACH_R2 = 220 * 220;        // これより遠い重機は動かさない
 function stepMachines(dt) {
   if (!machines.length) return;
   for (const m of machines) {
+    if (m === operating) continue;        // 動かしている1台は自動で動かさない
     const dx = m.g.position.x - player.x, dz = m.g.position.z - player.z;
     if (dx * dx + dz * dz > MACH_R2) continue;
     m.phase += dt;
@@ -3074,6 +3135,9 @@ function stepMachines(dt) {
       p.hook.position.y = m.hookY0 - d;
       if (p.hook.userData.rope) p.hook.userData.rope.scale.y = d;
     } else if (m.kind === 'dump') {
+      // 土が載っているあいだは荷台を下ろしたままにする。
+      // 積んでいる最中に勝手に傾くと、載せた土がこぼれる絵になる
+      if ((m.load ?? 0) > 0) { p.bed.rotation.x = 0; continue; }
       // たまに荷台を上げて土を落とす。上げっぱなしにしない
       const c = (m.phase * 0.06) % 1;
       const up = c < 0.18 ? Math.sin((c / 0.18) * Math.PI) : 0;
@@ -5276,6 +5340,9 @@ function setFly(on) {
 }
 
 function jumpDown() {
+  // 重機を動かしているあいだ、ジャンプのボタンは「掘る」になる。
+  // タッチには空いているボタンが無く、飛行に切り替わっても困るため
+  if (operating) { digAction(); return; }
   if (jumpHeld) return;
   jumpHeld = true; jumpSince = performance.now(); holdUsed = false;
   jumpTap = true;                          // 短押しはその場でジャンプ
@@ -5630,9 +5697,13 @@ function dropTile(t) {
   for (let i = signals.length - 1; i >= 0; i--) {
     if (signals[i].tile === t.key) signals.splice(i, 1);
   }
-  // 重機の絵は t.group ごと捨てられるが、動かす登録簿はここで外す
+  // 重機の絵は t.group ごと捨てられるが、動かす登録簿はここで外す。
+  // 動かしている1台が消えるなら先に降ろす(消えた重機の座席に貼り付いたままに
+  // なると、地面より上に取り残される)
   for (let i = machines.length - 1; i >= 0; i--) {
-    if (machines[i].tile === t.key) machines.splice(i, 1);
+    if (machines[i].tile !== t.key) continue;
+    if (machines[i] === operating) leaveMachine();
+    machines.splice(i, 1);
   }
   dropWalkLines(t.key);
   dropCarLines(t.key);
@@ -6115,7 +6186,16 @@ function updateRideUI() {
     $('rd-btn').textContent = TOUCH ? b : `${b} [E]`;
     rideEl.classList.add('on');
   };
-  if (inShop) {
+  if (operating) {
+    const dump = nearestDump(operating.g.position.x, operating.g.position.z, 14);
+    const n = dump?.load ?? 0;
+    set('油圧ショベル',
+        opLoad ? `土をすくっている — ダンプの上で放す（${n}/${OP_BED_FULL}）`
+               : `A D 旋回 ／ W S ブーム ／ ${TOUCH ? 'ボタン' : 'Space'} で掘る`,
+        '降りる');
+  } else if (opBoard) {
+    set('油圧ショベル', '動かせます', '乗る');
+  } else if (inShop) {
     set(`${inShop.userData.mark}　${inShop.userData.name}`,
         inShop.userData.oh || '店内', '出る');
   } else if (riding) {
@@ -6289,7 +6369,7 @@ let rodGroup = null, floatMesh = null, lineMesh = null;
 const CAST_OUT = 6.5;         // 水際からさらに沖へ振る距離(m)
 
 function castTarget() {
-  if (riding || transit || inShop || fishing) return null;
+  if (riding || transit || inShop || fishing || operating) return null;
   if (inWater) return null;                 // 泳いでいるあいだは振れない
   const dx = -Math.sin(player.yaw), dz = -Math.cos(player.yaw);
   let first = null, last = null;
@@ -6807,6 +6887,197 @@ function updateFishUI() {
   }
 }
 
+// ---------------------------------------------------------------- 重機を動かす
+// ミニゲームの三つめ。ショベルに乗り、**本当に地面を掘って**土をダンプへ積む。
+// 地形は t.terrain の値を頂点Yに載せたものなので、配列と頂点を書き換えれば凹む
+// (digGround)。工事区域はもともと赤土なので、地面テクスチャは焼き直さない。
+//
+// これが**財布の入り口**。釣りを換金にするとこの街の調子から外れるので
+// 保留していたが、工事の日当なら素直に入る。
+const OP_R = 7.0;              // 乗り込める距離(m)
+// ひとすくいの半径。バケットの実寸は 0.9m だが、**地形が 5m 格子**なので
+// それより小さく掘っても双一次補間で均されて凹まない(半径1.5mで実測 0.14m
+// しか下がらなかった。水域を掘るときに踏んだのと同じ罠)。格子の四隅に必ず
+// 届く 4.0m にする。1回で 8m 幅の窪みができるが、5m 格子の地形で
+// 「掘った」と分かるのはここが下限
+const OP_DIG_R = 4.0;
+const OP_DIG_D = 0.6;          // ひとすくいの深さ(m)
+const OP_FLOOR = 4.0;          // 足元からこれ以上は掘り下げない(m)
+const OP_BED_FULL = 6;         // ダンプの荷台がいっぱいになる杯数
+const OP_PAY = 900;            // いっぱいにしたときの日当(円)
+const OP_SWING = 0.9;          // 旋回の速さ(rad/s)
+const OP_BOOM = 0.55;          // ブームの速さ(rad/s)
+const OP_BOOM_RANGE = [-1.45, -0.55];
+
+let operating = null;          // 動かしている重機
+let opReturn = null;           // 降りたときに戻る場所
+let opFloor = -Infinity;       // 掘り下げの下限(標高)
+let opLoad = 0;                // バケットに載っている土(0か1)
+let opLoadMesh = null;
+let opBoard = null;            // 近くにある乗り込める重機
+
+/** バケットの歯先の世界座標。掘る場所も放す場所もここで決まる。 */
+function bucketTip(m) {
+  const b = m.parts?.bucket;
+  if (!b) return null;
+  b.updateMatrixWorld(true);
+  return b.localToWorld(new THREE.Vector3(0, -0.85, -0.15));
+}
+
+/** 運転席の世界座標。旋回体の子なので、旋回すれば一緒に回る。 */
+function cabAt(m) {
+  const s = m.parts?.swing;
+  if (!s) return null;
+  s.updateMatrixWorld(true);
+  // 運転席の中。キャビンは旋回体の -0.65/1.55 に高さ1.6mの箱なので、
+  // その中の目の高さ。**箱の中から見ても壁は邪魔にならない**
+  // (BoxGeometry の既定 FrontSide は内側から面が消える。車内で踏んだ性質が
+  // ここでは味方になる)
+  return s.localToWorld(new THREE.Vector3(-0.65, 1.85, -0.6));
+}
+
+function boardMachine(m = opBoard) {
+  if (!m || operating || riding || transit || inShop) return;
+  operating = m;
+  opReturn = { x: player.x, y: player.y, z: player.z,
+               yaw: player.yaw, pitch: player.pitch };
+  opFloor = m.g.position.y - OP_FLOOR;
+  opBoard = null;
+  setFly(false);
+  stopFishing(null);
+  player.vy = 0; player.onGround = true;
+  document.body.classList.add('riding');    // 移動スティックを隠す(バスと同じ)
+  say(`ショベルに乗った — ${TOUCH ? 'ボタン' : 'Space'} で掘る`);
+  updateRideUI();
+}
+
+function leaveMachine() {
+  if (!operating) return;
+  const back = opReturn;
+  operating = null; opReturn = null;
+  if (opLoadMesh) { opLoadMesh.parent?.remove(opLoadMesh); disposeTree(opLoadMesh); opLoadMesh = null; }
+  opLoad = 0;
+  document.body.classList.remove('riding');
+  player.x = back.x; player.z = back.z;
+  player.y = supportY(back.x, back.z) + EYE;
+  player.yaw = back.yaw; player.pitch = back.pitch;
+  player.vy = 0; player.onGround = true;
+  say('ショベルから降りた');
+  updateRideUI();
+}
+
+/** バケットに土を載せる／降ろす見た目。 */
+function setBucketLoad(on) {
+  if (on && !opLoadMesh) {
+    opLoadMesh = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.45, 0.5),
+      new THREE.MeshLambertMaterial({ color: 0x8f6a52 }));
+    opLoadMesh.position.set(0, -0.42, 0);
+    opLoadMesh.castShadow = true;
+    operating.parts.bucket.add(opLoadMesh);
+  } else if (!on && opLoadMesh) {
+    opLoadMesh.parent?.remove(opLoadMesh);
+    disposeTree(opLoadMesh);
+    opLoadMesh = null;
+  }
+}
+
+/** いちばん近いダンプ。荷台に積めるかの判定に使う。 */
+function nearestDump(x, z, r = 9) {
+  let best = null, bd = r;
+  for (const m of machines) {
+    if (m.kind !== 'dump') continue;
+    const d = Math.hypot(m.g.position.x - x, m.g.position.z - z);
+    if (d < bd) { bd = d; best = m; }
+  }
+  return best;
+}
+
+/** 荷台の土。積むほど高くなる。 */
+function showBedLoad(m) {
+  let box = m.bedLoad;
+  if (!box) {
+    box = new THREE.Mesh(new THREE.BoxGeometry(1.9, 1, 3.2),
+      new THREE.MeshLambertMaterial({ color: 0x8f6a52 }));
+    box.castShadow = true;
+    m.parts.bed.add(box);
+    m.bedLoad = box;
+  }
+  const h = Math.max(0.02, (m.load ?? 0) / OP_BED_FULL * 0.85);
+  box.scale.y = h;
+  box.position.set(0, 0.08 + h / 2, -1.7);
+  box.visible = (m.load ?? 0) > 0;
+}
+
+/** 掘る／放す。Space とボタンの共通処理。 */
+function digAction() {
+  if (!operating) return;
+  const tip = bucketTip(operating);
+  if (!tip) return;
+  if (!opLoad) {
+    // 掘る。歯先が地面の近くにあること
+    const g = groundAt(tip.x, tip.z);
+    if (tip.y > g + 0.7) { say('バケットを地面まで下ろす'); return; }
+    if (g <= opFloor + 0.02) { say('これ以上は掘れない'); return; }
+    digGround(tip.x, tip.z, OP_DIG_R, OP_DIG_D, opFloor);
+    opLoad = 1;
+    setBucketLoad(true);
+    say('すくった');
+  } else {
+    // 放す。ダンプの荷台の上なら積む。そうでなければその場に盛る
+    // 荷台の上か。**きつくしすぎない。** 腕の届く先で「荷台の縁より上」を
+    // 満たす姿勢は、実測でブーム角の幅 0.01m ぶんしかなかった。
+    // 荷台の床(車体から約1.0m)より上に来ていれば積めることにする
+    const dump = nearestDump(tip.x, tip.z, 9);
+    const overBed = dump && Math.hypot(dump.g.position.x - tip.x,
+                                       dump.g.position.z - tip.z) < 4.5 &&
+                    tip.y > dump.g.position.y + 0.9;
+    opLoad = 0;
+    setBucketLoad(false);
+    if (overBed) {
+      dump.load = (dump.load ?? 0) + 1;
+      showBedLoad(dump);
+      if (dump.load >= OP_BED_FULL) {
+        dump.load = 0;
+        showBedLoad(dump);
+        coins += OP_PAY;
+        savePurse(); updatePurseUI();
+        say(`荷台がいっぱいになった — 日当 ${OP_PAY} 円`);
+      } else {
+        say(`ダンプに積んだ（${dump.load}/${OP_BED_FULL}）`);
+      }
+    } else {
+      digGround(tip.x, tip.z, OP_DIG_R, -OP_DIG_D * 0.8, groundAt(tip.x, tip.z) + 1.2);
+      say('土を落とした');
+    }
+  }
+  updateRideUI();
+}
+
+/** 運転を1フレーム進める。カメラは運転席へ貼り付ける。 */
+function stepOperate(dt) {
+  if (!operating) return;
+  const p = operating.parts;
+  let sw = 0, bm = 0;
+  if (keys.has('KeyA') || keys.has('ArrowLeft')) sw += 1;
+  if (keys.has('KeyD') || keys.has('ArrowRight')) sw -= 1;
+  if (keys.has('KeyW') || keys.has('ArrowUp')) bm += 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown')) bm -= 1;
+  if (stick) {                                  // タッチはスティックで同じ操作
+    if (Math.abs(stick.dx) > 6) sw -= stick.dx / STICK_R;
+    if (Math.abs(stick.dy) > 6) bm -= stick.dy / STICK_R;
+  }
+  p.swing.rotation.y += sw * OP_SWING * dt;
+  p.boom.rotation.x = Math.min(OP_BOOM_RANGE[1], Math.max(OP_BOOM_RANGE[0],
+    p.boom.rotation.x + bm * OP_BOOM * dt));
+  // アームはブームに連れて動かす。3本を別々に操らせると難しすぎる
+  p.arm.rotation.x = 1.55 - (p.boom.rotation.x + 1.25) * 0.9;
+  p.bucket.rotation.x = 0.35 + (p.boom.rotation.x + 1.25) * 0.5;
+
+  const cab = cabAt(operating);
+  if (cab) { player.x = cab.x; player.y = cab.y; player.z = cab.z; }
+  player.vy = 0; player.onGround = true;
+}
+
 /**
  * 乗降のあいだの中間状態。
  *
@@ -6925,7 +7196,9 @@ function stepRide(dt) {
 
 /** [E] とボタンの共通処理。出入りは1つのボタンで賄う。 */
 function rideAction() {
-  if (inShop) exitShop();
+  if (operating) leaveMachine();
+  else if (opBoard) boardMachine();
+  else if (inShop) exitShop();
   else if (riding) alight();
   else if (boardable) board();
   else if (enterable) enterShop();
@@ -6940,6 +7213,8 @@ addEventListener('keydown', (e) => {
   if (!started) return;
   if (e.code === 'KeyE') rideAction();
   else if (e.code === 'KeyF') fishAction();
+  // 運転中の Space は掘る。ジャンプ・飛行に取られないよう、ここで食い止める
+  else if (e.code === 'Space' && operating) { e.preventDefault(); digAction(); }
 });
 
 $('fs-btn').addEventListener('click', fishAction);
@@ -7179,10 +7454,27 @@ function tick() {
   // 釣りといきもの。castTarget は見ている向きへ 15 回ほど waterAt を撃つので、
   // 当たりを待っているあいだ以外は 8 フレームに1回に間引く
   stepFishing(dt);
-  if (active && !inShop) stepCreatures(dt);
+  if (active && !inShop && !operating) stepCreatures(dt);
   if (fishing?.phase === 'bite' || (frame & 7) === 0) updateFishUI();
 
-  if (active && !riding) {
+  // 重機。乗り込める1台を探し、乗っているあいだは運転を進める
+  if (active && !operating) {
+    const prev = opBoard;
+    opBoard = null;
+    if (!riding && !transit && !inShop) {
+      let best = OP_R;
+      for (const m of machines) {
+        if (m.kind !== 'excavator') continue;   // 動かせるのはショベルだけ
+        const d = Math.hypot(m.g.position.x - player.x, m.g.position.z - player.z);
+        if (Math.abs((player.y - EYE) - m.g.position.y) > 4) continue;
+        if (d < best) { best = d; opBoard = m; }
+      }
+    }
+    if (prev !== opBoard) updateRideUI();
+  }
+  if (operating) stepOperate(dt);
+
+  if (active && !riding && !operating) {
     // 入力を「前後(fb)・左右(lr)」にまとめてから向きに乗せる
     let fb = 0, lr = 0, throttle = 1, run = keys.has('ShiftLeft') || keys.has('ShiftRight');
     if (keys.has('KeyW') || keys.has('ArrowUp')) fb += 1;
@@ -7513,6 +7805,11 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   // いきもの(検証用)。湧かし直しと記録を tick を待たずに回せる
   creatures, seenCrea, CREATURES, stepCreatures, spawnCreature, pickHome,
   recordCreature, makeCreature, get creaNear() { return creaNear; },
+  // 重機の運転(検証用)。乗って掘ってダンプへ積むまで tick を待たずに回せる
+  digGround, boardMachine, leaveMachine, digAction, stepOperate,
+  bucketTip, cabAt, nearestDump, OP_BED_FULL, OP_PAY,
+  get operating() { return operating; }, get opBoard() { return opBoard; },
+  get opLoad() { return opLoad; },
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
