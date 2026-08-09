@@ -155,6 +155,13 @@
   /* PLATEAU(PDL1.0/CC BY 4.0)は出典と「加工した旨」の表示が必須 */
   /* PLATEAU は出典・加工した旨・国交省でない旨の3点表示が必須。消せないので、
      読めるぎりぎりまで抑えて主役(おもろ)を食わないようにする */
+  #card .spawn { margin:14px 0 2px; display:flex; align-items:center;
+    justify-content:center; gap:9px; font-size:12px; opacity:.82; flex-wrap:wrap; }
+  #card .spawn label { letter-spacing:.06em; }
+  #card .spawn select { font:inherit; font-size:12px; padding:5px 9px;
+    color:var(--paper); background:rgba(0,0,0,.28); border:1px solid rgba(255,255,255,.28);
+    border-radius:6px; max-width:15em; }
+  #card .spawn select:focus { outline:2px solid rgba(255,255,255,.45); outline-offset:1px; }
   #card .credit { margin-top:14px; font-size:9.5px; opacity:.34; line-height:1.75;
     max-width:34em; margin-left:auto; margin-right:auto; }
   #card .credit:hover { opacity:.62; }
@@ -437,6 +444,11 @@
       <div class="v" id="omoro-v"></div>
       <div class="g" id="omoro-g"></div>
       <div class="r" id="omoro-r"></div>
+    </div>
+
+    <div class="spawn">
+      <label for="spawn-sel">歩きはじめる場所</label>
+      <select id="spawn-sel"><option value="">城東小まわり</option></select>
     </div>
 
     <div class="btns">

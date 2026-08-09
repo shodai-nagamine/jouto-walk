@@ -4124,7 +4124,78 @@ const overlay = $('overlay');
 let started = false, dragging = false;
 const locked = () => document.pointerLockElement === renderer.domElement;
 
+// ------------------------------------------------------------ 歩きだす場所
+// 既定は城東小まわり(原点)。モノレールの駅からも始められる。
+// corridor.json は全16駅を持っていて起動時に読めているので、タイルが
+// まだ載っていない駅も選べる（選んでから、そこのタイルを読みに行く）。
+const SPAWN_KEY = 'jouto-walk:spawn';
+
+/** ゆいレールの駅を、那覇空港から石嶺までの並び順で返す。 */
+function spawnPoints() {
+  const st = (corridor?.stations ?? []).slice();
+  // 線形上の距離では並べ替えられない(駅が乗る線形が1本とは限らない)ので、
+  // 空港から石嶺へ向かう向き=西から東・南から北に近い順で並べる
+  st.sort((a, b) => (a.x - b.x) || (b.z - a.z));
+  return st;
+}
+
+function fillSpawnSelect() {
+  const sel = $('spawn-sel');
+  if (!sel) return;
+  for (const st of spawnPoints()) {
+    const o = document.createElement('option');
+    o.value = st.name;
+    o.textContent = `${st.name}駅`;
+    sel.appendChild(o);
+  }
+  // ?at=首里 で直に指定できる。前回選んだ場所も覚えておく
+  const want = new URLSearchParams(location.search).get('at')
+            ?? localStorage.getItem(SPAWN_KEY) ?? '';
+  if (want && [...sel.options].some((o) => o.value === want)) sel.value = want;
+  sel.addEventListener('change', () => {
+    try { localStorage.setItem(SPAWN_KEY, sel.value); } catch {}
+  });
+}
+fillSpawnSelect();
+
+/**
+ * 選ばれた場所へプレイヤーを移す。タイルはこのあと syncTiles が読む。
+ *
+ * 駅そのものの真上ではなく少し手前に降ろす。駅は高架なので、真下は
+ * 桁の下になって空が見えない。
+ */
+function applySpawn(name) {
+  if (!name) return false;
+  const st = spawnPoints().find((s) => s.name === name);
+  if (!st) return false;
+  player.x = st.x + 18;
+  player.z = st.z + 18;
+  player.y = groundAt(player.x, player.z) + EYE;
+  player.vy = 0; player.onGround = true;
+  player.yaw = Math.atan2(-(st.x - player.x), -(st.z - player.z));  // 駅の方を向く
+  player.pitch = 0.06;
+  return true;
+}
+
+let spawned = false;
+
 function start() {
+  // 最初に歩きだすときだけ、選ばれた場所へ移す。
+  // 一時停止からの再開で毎回飛ばされては困る
+  if (!spawned) {
+    spawned = true;
+    const name = $('spawn-sel')?.value ?? '';
+    if (applySpawn(name)) {
+      say(`${name}駅 から歩きだす`);
+      // 移った先のタイルを読みに行く。**読み終わってから座り直す**のが要点。
+      // applySpawn の時点の groundAt は、まだ載っていないタイルを最寄りの
+      // タイルの縁で埋めた値なので当てにならない(実測で地面より 6.2m 下に居た)
+      Promise.resolve(syncTiles()).then(() => {
+        player.y = supportY(player.x, player.z) + EYE;
+        player.vy = 0; player.onGround = true;
+      });
+    }
+  }
   started = true;
   overlay.classList.add('hide');
   if (TOUCH) {
@@ -4604,6 +4675,384 @@ async function syncTiles() {
   }
 }
 
+// ------------------------------------------------------------------ 車内
+// 乗ると、これまでは何も描かれていなかった。車体は BoxGeometry の既定
+// (FrontSide) なので、内側からは面がぜんぶ裏を向いて消える。床も窓枠も無い
+// 空中の一点から街を見ることになり、それが「屋根に乗っている」感じの正体だった。
+//
+// 造形は Antigravity(agy) に契約を渡して書かせた（シーサー・正殿と同じやり方）。
+// 契約の要点は可動部の受け渡しで、扉を userData.parts に Group で出させてある。
+// 併せて「重くなる2つ」を禁止条項に入れた:
+//   transparent 禁止（窓は板を分けて本当の開口にする。半透明パスを増やさない）
+//   castShadow 禁止（影は別パス。qLevel 3 の影切りにも巻き込まない）
+// 検分の結果、両方とも違反ゼロ（バス35メッシュ/4マテリアル、モノレール39/6）。
+
+function makeBusCabin() {
+    // 寸法根拠: 内寸 幅2.3m, 天井高2.2m(y=0.95~3.15), 長さ8.8m(z=-4.4~+4.4)。目線y=2.15。
+    // 左に座席、右に扉(z=-0.6~0.6)を配置し、厚みのある扉なども全てこのバウンディングボックス内に収めています。
+    const cabin = new THREE.Group();
+
+    // マテリアル (4種のみ生成し使い回す)
+    const matFloor = new THREE.MeshLambertMaterial({ color: 0x333333 });
+    const matWall = new THREE.MeshLambertMaterial({ color: 0xeeeee0 });
+    const matSeat = new THREE.MeshLambertMaterial({ color: 0x1f5c87 });
+    const matRail = new THREE.MeshLambertMaterial({ color: 0xcccccc });
+
+    // 床・天井
+    const geoFloor = new THREE.PlaneGeometry(2.3, 8.8);
+    
+    const floor = new THREE.Mesh(geoFloor, matFloor);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(0, 0.95, 0);
+    cabin.add(floor);
+
+    const ceiling = new THREE.Mesh(geoFloor, matWall);
+    ceiling.rotation.x = Math.PI / 2;
+    ceiling.position.set(0, 3.15, 0);
+    cabin.add(ceiling);
+
+    // 前面・背面
+    const geoCap = new THREE.PlaneGeometry(2.3, 2.2);
+    
+    const frontWall = new THREE.Mesh(geoCap, matWall);
+    frontWall.position.set(0, 2.05, -4.4);
+    cabin.add(frontWall);
+
+    const rearWall = new THREE.Mesh(geoCap, matWall);
+    rearWall.rotation.y = Math.PI;
+    rearWall.position.set(0, 2.05, 4.4);
+    cabin.add(rearWall);
+
+    // 左側面 (x = -1.15)
+    const geoWaist = new THREE.PlaneGeometry(8.8, 0.75); // 0.95~1.70
+    const leftWaist = new THREE.Mesh(geoWaist, matWall);
+    leftWaist.rotation.y = Math.PI / 2;
+    leftWaist.position.set(-1.15, 1.325, 0);
+    cabin.add(leftWaist);
+
+    const geoFrieze = new THREE.PlaneGeometry(8.8, 0.5); // 2.65~3.15
+    const leftFrieze = new THREE.Mesh(geoFrieze, matWall);
+    leftFrieze.rotation.y = Math.PI / 2;
+    leftFrieze.position.set(-1.15, 2.90, 0);
+    cabin.add(leftFrieze);
+
+    const geoPillar = new THREE.PlaneGeometry(0.08, 0.95); // 1.70~2.65
+    [-2.2, 0, 2.2].forEach(z => {
+        const pillar = new THREE.Mesh(geoPillar, matWall);
+        pillar.rotation.y = Math.PI / 2;
+        pillar.position.set(-1.15, 2.175, z);
+        cabin.add(pillar);
+    });
+
+    // 右側面 (x = 1.15) - z=-0.6~0.6が扉
+    const geoWaistHalf = new THREE.PlaneGeometry(3.8, 0.75);
+    const geoFriezeHalf = new THREE.PlaneGeometry(3.8, 0.5);
+
+    const rightWaistF = new THREE.Mesh(geoWaistHalf, matWall);
+    rightWaistF.rotation.y = -Math.PI / 2;
+    rightWaistF.position.set(1.15, 1.325, -2.5);
+    cabin.add(rightWaistF);
+
+    const rightFriezeF = new THREE.Mesh(geoFriezeHalf, matWall);
+    rightFriezeF.rotation.y = -Math.PI / 2;
+    rightFriezeF.position.set(1.15, 2.90, -2.5);
+    cabin.add(rightFriezeF);
+
+    const rightWaistR = new THREE.Mesh(geoWaistHalf, matWall);
+    rightWaistR.rotation.y = -Math.PI / 2;
+    rightWaistR.position.set(1.15, 1.325, 2.5);
+    cabin.add(rightWaistR);
+
+    const rightFriezeR = new THREE.Mesh(geoFriezeHalf, matWall);
+    rightFriezeR.rotation.y = -Math.PI / 2;
+    rightFriezeR.position.set(1.15, 2.90, 2.5);
+    cabin.add(rightFriezeR);
+
+    // 右扉上の壁 (y=2.90~3.15)
+    const geoTop = new THREE.PlaneGeometry(1.2, 0.25);
+    const rightTop = new THREE.Mesh(geoTop, matWall);
+    rightTop.rotation.y = -Math.PI / 2;
+    rightTop.position.set(1.15, 3.025, 0);
+    cabin.add(rightTop);
+
+    // 右柱
+    [-2.5, 2.5].forEach(z => {
+        const pillar = new THREE.Mesh(geoPillar, matWall);
+        pillar.rotation.y = -Math.PI / 2;
+        pillar.position.set(1.15, 2.175, z);
+        cabin.add(pillar);
+    });
+
+    // 扉
+    const doorL = new THREE.Group();
+    doorL.position.set(1.15, 0.95, -0.6);
+    const doorR = new THREE.Group();
+    doorR.position.set(1.15, 0.95, 0.6);
+
+    const geoDoor = new THREE.BoxGeometry(0.04, 1.95, 0.6);
+    // 箱からはみ出さないよう、x方向に-0.02ずらして厚みを内側に収める
+    const meshDoorL = new THREE.Mesh(geoDoor, matWall);
+    meshDoorL.position.set(-0.02, 0.975, 0.3);
+    doorL.add(meshDoorL);
+
+    const meshDoorR = new THREE.Mesh(geoDoor, matWall);
+    meshDoorR.position.set(-0.02, 0.975, -0.3);
+    doorR.add(meshDoorR);
+
+    cabin.add(doorL);
+    cabin.add(doorR);
+    cabin.userData.parts = { doorL, doorR };
+
+    // 座席 (左3列、右3列) プレイヤー目線位置(x=-0.75, z=1.6)を避ける
+    const geoSeatBase = new THREE.BoxGeometry(0.9, 0.1, 0.5);
+    const geoSeatBack = new THREE.BoxGeometry(0.9, 0.5, 0.1);
+    
+    [-3.0, -1.0, 3.0].forEach(z => {
+        const base = new THREE.Mesh(geoSeatBase, matSeat);
+        base.position.set(-0.65, 1.1, z);
+        cabin.add(base);
+        const back = new THREE.Mesh(geoSeatBack, matSeat);
+        back.position.set(-0.65, 1.4, z + 0.2); // 後ろ側に背もたれ
+        cabin.add(back);
+    });
+
+    [-3.0, 2.0, 3.5].forEach(z => {
+        const base = new THREE.Mesh(geoSeatBase, matSeat);
+        base.position.set(0.65, 1.1, z);
+        cabin.add(base);
+        const back = new THREE.Mesh(geoSeatBack, matSeat);
+        back.position.set(0.65, 1.4, z + 0.2);
+        cabin.add(back);
+    });
+
+    // 手すり
+    const geoRail = new THREE.CylinderGeometry(0.02, 0.02, 8.8, 8);
+    const railL = new THREE.Mesh(geoRail, matRail);
+    railL.rotation.x = Math.PI / 2;
+    railL.position.set(-0.7, 2.8, 0);
+    cabin.add(railL);
+
+    const railR = new THREE.Mesh(geoRail, matRail);
+    railR.rotation.x = Math.PI / 2;
+    railR.position.set(0.7, 2.8, 0);
+    cabin.add(railR);
+
+    // つり革
+    const geoStrap = new THREE.CylinderGeometry(0.01, 0.01, 0.2, 5);
+    [-2.0, 0, 2.0].forEach(z => {
+        const strapL = new THREE.Mesh(geoStrap, matRail);
+        strapL.position.set(-0.7, 2.7, z);
+        cabin.add(strapL);
+
+        const strapR = new THREE.Mesh(geoStrap, matRail);
+        strapR.position.set(0.7, 2.7, z);
+        cabin.add(strapR);
+    });
+
+    return cabin;
+}
+
+function makeTrainCabin() {
+    // 寸法根拠: 内寸(2.4x2.5x12.8)を遵守し、床Plane(y=-1.05)、天井Plane(y=1.45)で高さを固定
+    // 中央プレイヤ位置(z=0)半径0.6mを避け、ドア開口部(z=-0.65〜0.65)を設けて壁と座席を配置
+    const cabin = new THREE.Group();
+
+    const matFloor = new THREE.MeshLambertMaterial({ color: 0xc0c0c0 });
+    const matWall = new THREE.MeshLambertMaterial({ color: 0xf5f5f5 });
+    const matSeat = new THREE.MeshLambertMaterial({ color: 0x2266cc });
+    const matBack = new THREE.MeshLambertMaterial({ color: 0xee7722 });
+    const matPole = new THREE.MeshLambertMaterial({ color: 0xcccccc });
+    const matDoor = new THREE.MeshLambertMaterial({ color: 0xe8e8e8 });
+
+    const floorGeo = new THREE.PlaneGeometry(2.4, 12.8);
+    const floor = new THREE.Mesh(floorGeo, matFloor);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(0, -1.05, 0);
+    cabin.add(floor);
+
+    const ceil = new THREE.Mesh(floorGeo, matFloor);
+    ceil.rotation.x = Math.PI / 2;
+    ceil.position.set(0, 1.45, 0);
+    cabin.add(ceil);
+
+    const fwGeo = new THREE.BoxGeometry(2.4, 0.7, 0.02);
+    const fw = new THREE.Mesh(fwGeo, matWall);
+    fw.position.set(0, -0.7, -6.39);
+    cabin.add(fw);
+
+    const ffGeo = new THREE.BoxGeometry(2.4, 0.5, 0.02);
+    const ff = new THREE.Mesh(ffGeo, matWall);
+    ff.position.set(0, 1.2, -6.39);
+    cabin.add(ff);
+
+    const bwGeo = new THREE.BoxGeometry(2.4, 2.5, 0.02);
+    const bw = new THREE.Mesh(bwGeo, matWall);
+    bw.position.set(0, 0.2, 6.39);
+    cabin.add(bw);
+
+    const wainscotGeo = new THREE.BoxGeometry(0.02, 0.7, 5.75);
+    const friezeGeo = new THREE.BoxGeometry(0.02, 0.5, 12.8);
+    const pillarGeo = new THREE.BoxGeometry(0.02, 1.3, 0.08);
+
+    const sideSigns = [-1, 1];
+    sideSigns.forEach(sx => {
+        const x = sx * 1.19;
+
+        const wFront = new THREE.Mesh(wainscotGeo, matWall);
+        wFront.position.set(x, -0.7, -3.525);
+        cabin.add(wFront);
+
+        const wBack = new THREE.Mesh(wainscotGeo, matWall);
+        wBack.position.set(x, -0.7, 3.525);
+        cabin.add(wBack);
+
+        const frieze = new THREE.Mesh(friezeGeo, matWall);
+        frieze.position.set(x, 1.2, 0);
+        cabin.add(frieze);
+
+        [-4.5, -2.5, 2.5, 4.5].forEach(pz => {
+            const pillar = new THREE.Mesh(pillarGeo, matWall);
+            pillar.position.set(x, 0.3, pz);
+            cabin.add(pillar);
+        });
+    });
+
+    const doorL = new THREE.Group();
+    doorL.position.set(-1.18, 0, -0.65);
+    const doorR = new THREE.Group();
+    doorR.position.set(1.18, 0, -0.65);
+
+    const doorLeafGeo = new THREE.BoxGeometry(0.02, 2.0, 0.65);
+    [doorL, doorR].forEach(doorGroup => {
+        const leaf1 = new THREE.Mesh(doorLeafGeo, matDoor);
+        leaf1.position.set(0, -0.05, 0.325);
+        const leaf2 = new THREE.Mesh(doorLeafGeo, matDoor);
+        leaf2.position.set(0, -0.05, 0.975);
+        doorGroup.add(leaf1, leaf2);
+        cabin.add(doorGroup);
+    });
+
+    cabin.userData.parts = { doorL, doorR };
+
+    const seatBaseGeo = new THREE.BoxGeometry(0.45, 0.4, 5.69);
+    const seatBackGeo = new THREE.BoxGeometry(0.1, 0.3, 5.69);
+
+    sideSigns.forEach(sx => {
+        const baseX = sx * 0.955;
+        const backX = sx * 1.13;
+        [-3.545, 3.545].forEach(sz => {
+            const sBase = new THREE.Mesh(seatBaseGeo, matSeat);
+            sBase.position.set(baseX, -0.85, sz);
+            cabin.add(sBase);
+
+            const sBack = new THREE.Mesh(seatBackGeo, matBack);
+            sBack.position.set(backX, -0.5, sz);
+            cabin.add(sBack);
+        });
+    });
+
+    const handrailGeo = new THREE.CylinderGeometry(0.02, 0.02, 12.8, 8);
+    sideSigns.forEach(sx => {
+        const hr = new THREE.Mesh(handrailGeo, matPole);
+        hr.rotation.x = Math.PI / 2;
+        hr.position.set(sx * 0.8, 1.1, 0);
+        cabin.add(hr);
+    });
+
+    const poleGeo = new THREE.CylinderGeometry(0.02, 0.02, 2.5, 8);
+    const poleL = new THREE.Mesh(poleGeo, matPole);
+    poleL.position.set(-0.7, 0.2, -0.75);
+    cabin.add(poleL);
+    
+    const poleR = new THREE.Mesh(poleGeo, matPole);
+    poleR.position.set(0.7, 0.2, 0.75);
+    cabin.add(poleR);
+
+    const strapGeo = new THREE.CylinderGeometry(0.015, 0.015, 0.2, 8);
+    sideSigns.forEach(sx => {
+        [-2.5, 2.5].forEach(sz => {
+            const strap = new THREE.Mesh(strapGeo, matPole);
+            strap.position.set(sx * 0.8, 1.0, sz);
+            cabin.add(strap);
+        });
+    });
+
+    return cabin;
+}
+
+/**
+ * 乗り物に車内を建てて、扉を動かせる形にして返す。
+ *
+ * 店(buildRoom)と違って舞台へ飛ばす必要は無い。車体はもともと街にあるし、
+ * supportY が footprint の天端に立たせてしまう問題も乗車中は起きない
+ * (乗車中はプレイヤーを座席へ貼り付けるので地形を見ない)。
+ */
+function buildCabin(v) {
+  const cabin = v.isTrain ? makeTrainCabin() : makeBusCabin();
+  // モノレールは2両編成。座席のある側の車両にぶら下げる
+  if (v.isTrain) cabin.position.z = seatOf(v).z;
+  const { doorL, doorR } = cabin.userData.parts;
+
+  // 扉の動かし方は車種で違う。バスは折戸なので内側へ回し、
+  // モノレールは引戸なので2枚を前後へ滑らせる。
+  // agy には「2枚を1つの Group にまとめてよい」と書いたので、
+  // モノレールは同じ蝶番に2枚ぶら下がっている。回すと外側の戸が
+  // 1.3m の弧を描いてしまうため、こちらは子を個別に滑らせる。
+  let setDoors;
+  if (v.isTrain) {
+    const base = [];
+    for (const g of [doorL, doorR]) {
+      for (const leaf of g.children) base.push([leaf, leaf.position.z]);
+    }
+    setDoors = (u) => {
+      for (let i = 0; i < base.length; i++) {
+        const [leaf, z0] = base[i];
+        // 各 Group の 0番目は手前、1番目は奥。前後へ開く
+        base[i][0].position.z = z0 + (i % 2 === 0 ? -1 : 1) * 0.62 * u;
+      }
+    };
+  } else {
+    setDoors = (u) => {
+      doorL.rotation.y = -1.5 * u;
+      doorR.rotation.y = 1.5 * u;
+    };
+  }
+  setDoors(0);
+  cabin.userData.setDoors = setDoors;
+  cabin.userData.open = 0;
+
+  // 外から見る車体を、乗っているあいだは隠す。
+  // 車体は帯・窓・裾を「実体のある箱」で重ねて作ってあり、その何枚かが
+  // 車内の床より上に来る（バスの帯は床の 0.2m 上）。箱は内側からは面が
+  // 消えるが、**天面より下に目線があるとは限らない**ので、見下ろすと
+  // 帯の天面が床を覆う。実際にオレンジの板が床一面に見えた。
+  const hidden = [];
+  for (const o of v.g.children) {
+    if (o === cabin || !o.visible) continue;
+    o.visible = false;
+    hidden.push(o);
+  }
+  cabin.userData.hidden = hidden;
+
+  v.g.add(cabin);
+  return cabin;
+}
+
+function disposeCabin(cabin) {
+  if (!cabin) return;
+  for (const o of cabin.userData.hidden ?? []) o.visible = true;
+  cabin.parent?.remove(cabin);
+  const seen = new Set();
+  cabin.traverse((o) => {
+    if (o.geometry && !seen.has(o.geometry)) { seen.add(o.geometry); o.geometry.dispose(); }
+    for (const m of [o.material].flat().filter(Boolean)) {
+      if (seen.has(m)) continue;
+      seen.add(m);
+      m.dispose();
+    }
+  });
+}
+
 // ---------------------------------------------------------------- バスに乗る
 // バス停に停まっているバスへ近づくと乗れる。乗車中は移動入力を切り、
 // 座席の位置にプレイヤーを貼り付ける(見回しは自由)。
@@ -4676,20 +5125,38 @@ function exitShop() {
   updateRideUI();
 }
 
-function board() {
-  if (riding || !boardable) return;
-  riding = boardable;
+/**
+ * 乗降のあいだの中間状態。
+ *
+ * ここを独立した状態にしないと落ちる。毎フレームの処理は
+ * 「riding なら座席へ貼り付け／riding でなければ歩かせる」の二択で、
+ * 補間中はそのどちらでもない。riding のまま transit を重ねることで、
+ * 移動処理と supportY を止めたまま카メラだけを動かせる。
+ */
+let transit = null;      // {mode:'board'|'alight', t, dur, from, to?}
+let cabin = null;        // 乗っている車内(乗っていなければ null)
+
+const smooth = (u) => u * u * (3 - 2 * u);
+
+/** v を省くと、いま近くに居る乗り物(boardable)に乗る。 */
+function board(v = boardable) {
+  if (riding || transit || !v) return;
+  riding = v;
   boardable = null;
   setFly(false);
   player.vy = 0; player.onGround = true;
   document.body.classList.add('riding');
   stick = null; stickShow(false);
+  cabin = buildCabin(riding);
+  // 立っていた所から座席へ寄る。乗り物は停まっているので補間が暴れない
+  transit = { mode: 'board', t: 0, dur: 0.85,
+              from: { x: player.x, y: player.y, z: player.z } };
   say(`${riding.ref} ${riding.name} に乗車`);
   updateRideUI();
 }
 
 function alight() {
-  if (!riding) return;
+  if (!riding || transit) return;
   const b = riding;
   // バスは歩道側、モノレールはホーム側へ降ろす。塞がっていたら順に試す
   const yaw = b.g.rotation.y;
@@ -4697,21 +5164,81 @@ function alight() {
   const cands = b.isTrain
     ? [[3.4, 0], [3.4, 6], [3.4, -6], [-3.4, 0], [3.4, 12]]
     : [[2.6, 0], [3.4, 0], [2.6, 3], [2.6, -3], [-2.6, 0], [0, 5]];
-  let done = false;
+  // 降車地点は変数に受ける。ここで player を書くと横移動が1フレームで
+  // 終わってしまい、補間するのが高さだけになる(実際にそうなっていた)
+  let tx = b.g.position.x + 3, tz = b.g.position.z;
   for (const [ox, oz] of cands) {
     const x = b.g.position.x + ox * cos + oz * sin;
     const z = b.g.position.z - ox * sin + oz * cos;
     // 降りた先の足場(ホームの天端も含む)で判定する
     const s = supportY(x, z);
-    if (!blocked(x, z, RADIUS, s)) { player.x = x; player.z = z; done = true; break; }
+    if (!blocked(x, z, RADIUS, s)) { tx = x; tz = z; break; }
   }
-  if (!done) { player.x = b.g.position.x + 3; player.z = b.g.position.z; }
-  player.y = supportY(player.x, player.z) + EYE;
+  // すぐには降ろさない。riding を保ったまま、座席から降車地点へ寄せる。
+  // ここで player を書き換えてしまうと、次のフレームの座席貼り付けが
+  // それを上書きして、降りる動きが1フレームも見えない
+  transit = { mode: 'alight', t: 0, dur: 0.8,
+              from: { x: player.x, y: player.y, z: player.z },
+              to: { x: tx, z: tz, y: supportY(tx, tz) + EYE } };
   player.vy = 0; player.onGround = true;
-  riding = null;
-  document.body.classList.remove('riding');
   say('降車');
   updateRideUI();
+}
+
+/** 降車の補間が終わったところで、本当に降ろす。 */
+function finishAlight() {
+  const to = transit.to;
+  player.x = to.x; player.z = to.z;
+  player.y = supportY(to.x, to.z) + EYE;
+  player.vy = 0; player.onGround = true;
+  disposeCabin(cabin); cabin = null;
+  riding = null;
+  transit = null;
+  document.body.classList.remove('riding');
+  updateRideUI();
+}
+
+
+/**
+ * 乗車中のカメラ。座席へ貼り付け、乗降のあいだだけ補間する。
+ *
+ * tick から切り出してあるのは、ペインが隠れて rAF が止まる環境でも
+ * 合成 dt で直接回して確かめられるようにするため(stepTrain/stepCars と同じ)。
+ */
+function stepRide(dt) {
+  if (!riding) return;
+  {
+    const s = seatOf(riding);
+    const yaw = riding.g.rotation.y;
+    const cos = Math.cos(yaw), sin = Math.sin(yaw);
+    const sx = riding.g.position.x + s.x * cos + s.z * sin;
+    const sz = riding.g.position.z - s.x * sin + s.z * cos;
+    const sy = riding.g.position.y + s.y;
+
+    if (transit) {
+      transit.t += dt;
+      const u = Math.min(1, transit.t / transit.dur);
+      const e = smooth(u);
+      const f = transit.from;
+      const to = transit.mode === 'board' ? { x: sx, y: sy, z: sz } : transit.to;
+      player.x = f.x + (to.x - f.x) * e;
+      player.y = f.y + (to.y - f.y) * e;
+      player.z = f.z + (to.z - f.z) * e;
+      // 扉は乗り降りのあいだだけ開ける。閉じきってから走り出す
+      if (cabin) {
+        const open = Math.sin(Math.PI * u);      // 0 → 1 → 0
+        cabin.userData.open = open;
+        cabin.userData.setDoors(open);
+      }
+      if (u >= 1) {
+        if (transit.mode === 'alight') { finishAlight(); }
+        else { transit = null; cabin?.userData.setDoors(0); }
+      }
+    } else {
+      player.x = sx; player.y = sy; player.z = sz;
+    }
+    player.vy = 0; player.onGround = true;
+  }
 }
 
 /** [E] とボタンの共通処理。出入りは1つのボタンで賄う。 */
@@ -4917,16 +5444,7 @@ function tick() {
       Math.hypot(q.x - player.x, q.z - player.z) < 110;
   }
 
-  // 乗車中は座席に貼り付ける(見回しは自由)
-  if (riding) {
-    const s = seatOf(riding);
-    const yaw = riding.g.rotation.y;
-    const cos = Math.cos(yaw), sin = Math.sin(yaw);
-    player.x = riding.g.position.x + s.x * cos + s.z * sin;
-    player.z = riding.g.position.z - s.x * sin + s.z * cos;
-    player.y = riding.g.position.y + s.y;
-    player.vy = 0; player.onGround = true;
-  }
+  stepRide(dt);
 
   // 乗れる車両を探す(停車中で、十分近いもの)
   {
@@ -5245,7 +5763,10 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   WORLD_TILES, WORLD_B, tileDist, syncTiles, dropTile,
   tileRange: () => ({ load: TILE_LOAD, drop: TILE_DROP }),
   setTileRange: (load, drop) => { TILE_LOAD = load; TILE_DROP = drop; },
-  rebuildDerived, dropWalkLines, addWalkLines, carLines, cars, stepCars, addCarLines, bakeMap, buildApron, seesaaGroup,
+  rebuildDerived, dropWalkLines, addWalkLines, carLines, cars, stepCars, addCarLines,
+  board, alight, get riding() { return riding; }, get transit() { return transit; },
+  get cabin() { return cabin; }, buildCabin, disposeCabin, stepRide,
+  spawnPoints, applySpawn, bakeMap, buildApron, seesaaGroup,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
