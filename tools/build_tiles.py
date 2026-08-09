@@ -48,6 +48,7 @@ OSM = {
     "--water": "naha_water_osm.json",
     "--footways": "naha_footways_osm.json",
     "--parks": "naha_parks_osm.json",
+    "--construction": "naha_construction_osm.json",
     "--walls": "naha_shurijo_osm.json",
     "--historic": "naha_historic_osm.json",
 }

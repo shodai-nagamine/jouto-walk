@@ -45,6 +45,9 @@ BBOX_OVERRIDE = {
     # 海岸線は世界より広く取る。受け皿(外へ1500m)まで判断したいので
     "coast": (26.140, 127.600, 26.290, 127.790),
     "rivers": (26.170, 127.633, 26.259, 127.752),
+    # 工事も世界のすみずみまで。名前つきだけを拾っていた naha_named_osm.json では
+    # corridor 時代の狭い範囲に 50 件しか入っていない（無名の工事区域が全部落ちる）
+    "construction": (26.170, 127.633, 26.259, 127.752),
 }
 
 # 名前は build_world.py の引数に対応する。timeout は Overpass 側の秒数。
@@ -116,6 +119,19 @@ QUERIES = {
     # 約束の線で、面ではない。海の側を決めるのにこの向きを使う
     "coast": (300, [
         'way["natural"="coastline"]{bbox};',
+    ], "out geom tags;"),
+    # --construction。工事区域。landuse=construction が「土地が工事中」、
+    # building=construction が「建設中の建物」、highway=construction が「工事中の道」。
+    # **name で絞らない**(公園と同じ理由。無名の区域が大半で、名前で絞ると
+    # 名前つき 50 件しか残らない)。
+    #
+    # OSM の工事は **いつの記録か分からない**。start_date も check_date も
+    # ほとんど入っていないので、描画側で「工事中です」と断定しないこと。
+    "construction": (300, [
+        'way["landuse"="construction"]{bbox};',
+        'way["building"="construction"]{bbox};',
+        'way["highway"="construction"]{bbox};',
+        'relation["landuse"="construction"]{bbox};',
     ], "out geom tags;"),
     # --parks。["name"] で絞らないのが要点(那覇の街区公園と校庭は半数以上が無名で、
     # 名前で絞ると見た目に一番効く大きなグラウンドが軒並み落ちる)

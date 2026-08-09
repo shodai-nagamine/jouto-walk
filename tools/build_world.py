@@ -697,6 +697,61 @@ def parse_parks(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=60.0):
     return out
 
 
+def parse_construction(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=60.0):
+    """OSM の工事区域を「面」として取り出す。
+
+    parse_parks とほぼ同じ作り。違うのは種別の決め方と、**線を採らない**こと。
+
+    name では絞らない。公園と同じ理由で、無名の区域が大半を占める
+    (255面のうち名前があるのは 62件。名前つきだけを持っていた
+    naha_named_osm.json では corridor 時代の狭い範囲に 50件しか無かった)。
+
+    **highway=construction(129本)は採らない。** 那覇空港自動車道の高架部と
+    赤嶺トンネルが大半で、線を地上に描くと空中／地下にあるものを地面に
+    寝かせることになる。加えて赤嶺トンネルは実際にはもう開通している
+    可能性が高い。データは naha_construction_osm.json に残してあるので、
+    高さを持たせて描く工程を作るときに使える。
+
+    **「工事中」と断定しない。** start_date と check_date が入っているのは
+    384件中2件しかなく、いつの記録か分からない。描画側の見出しも
+    「OSM 上そう記録されている」に留める(史跡と同じ判断)。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = -margin, size + margin
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        if t.get("building") == "construction":
+            kind = "building"           # 建設中の建物
+        elif t.get("landuse") == "construction":
+            kind = "site"               # 造成中の土地
+        else:
+            continue
+        g = [p for p in (e.get("geometry") or []) if p]
+        if not g and e.get("type") == "relation":
+            g = [p for m in e.get("members", []) for p in (m.get("geometry") or []) if p]
+        if len(g) < 3:
+            continue
+        pts = [((p["lon"] - lon_c) * m_lon + half,
+                -(p["lat"] - lat_c) * m_lat + half) for p in g]
+        if pts[0] == pts[-1]:
+            pts.pop()
+        if len(pts) < 3:
+            continue
+        xs = [p[0] for p in pts]
+        zs = [p[1] for p in pts]
+        if max(xs) < lo or min(xs) > hi or max(zs) < lo or min(zs) > hi:
+            continue
+        pts = simplify(pts, tol=0.6)
+        if len(pts) < 3:
+            continue
+        out.append({
+            "name": t.get("name", ""), "k": kind,
+            "f": [round(v, 2) for p in pts for v in p],
+        })
+    return out
+
+
 def parse_water(path, lat_c, lon_c, m_lat, m_lon, half, size, levels=None, margin=60.0):
     """OSM の水面を「面」として取り出し、水位を地形から決める。
 
@@ -939,6 +994,7 @@ def main():
     ap.add_argument("--rivers", default="", help="川のリボン (build_rivers.py の出力)")
     ap.add_argument("--coast", default="", help="海岸線 (build_coast.py の出力)")
     ap.add_argument("--parks", default="", help="公園・広場・グラウンド (OSM Overpass JSON)")
+    ap.add_argument("--construction", default="", help="工事区域 (OSM Overpass JSON)")
     ap.add_argument("--walls", default="", help="首里城の石垣 (OSM Overpass JSON)")
     ap.add_argument("--historic", default="", help="史跡・碑・墓・拝所 (OSM Overpass JSON)")
     ap.add_argument("--max-routes", type=int, default=4, help="走らせる路線数")
@@ -1191,6 +1247,19 @@ def main():
         nn = sum(1 for p in parks if p["name"])
         print(f"  {os.path.basename(path)}: 公園系 {len(parks)}面 {cnt} "
               f"(名前あり{nn}/無名{len(parks) - nn})", file=sys.stderr)
+
+    construction = []
+    if args.construction:
+        path = (args.construction if os.path.isabs(args.construction)
+                else os.path.join(NAHA, args.construction))
+        construction = parse_construction(
+            path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        cnt = {}
+        for p in construction:
+            cnt[p["k"]] = cnt.get(p["k"], 0) + 1
+        nn = sum(1 for p in construction if p["name"])
+        print(f"  {os.path.basename(path)}: 工事 {len(construction)}面 {cnt} "
+              f"(名前あり{nn}/無名{len(construction) - nn})", file=sys.stderr)
 
     size_f = float(args.size)
 
@@ -1461,6 +1530,7 @@ def main():
         "footways": footways,
         "roadLines": road_lines,
         "parks": parks,
+        "construction": construction,
         "water": water,
         "walls": walls,
         "castle": castle,

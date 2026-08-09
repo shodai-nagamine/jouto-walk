@@ -454,12 +454,22 @@ function groundTexture(t) {
   // 公園・広場・グラウンド(OSM)。地面の緑は「建物からどれだけ離れているか」で
   // 推定しているだけなので実際の公園と一致しない。ここだけは実データで塗る。
   // canvas を2枚持つと重いので、1枚の R=芝(公園・庭園・遊び場) /
-  // G=土(グラウンド) に分けて入れる。縁のアンチエイリアスも混ざらない。
+  // G=土(グラウンド) / B=工事区域 に分けて入れる。縁のアンチエイリアスも混ざらない。
   const pk = document.createElement('canvas'); pk.width = pk.height = W;
   const pg = pk.getContext('2d', { willReadFrequently: true });
   pg.fillStyle = '#000'; pg.fillRect(0, 0, W, W);
   for (const p of t.data.parks ?? []) {
     pg.fillStyle = p.k === 'pitch' ? '#0f0' : '#f00';
+    pg.beginPath();
+    for (let i = 0; i < p.f.length; i += 2) {
+      const x = pxX(t.X(p.f[i])), z = pxZ(t.Z(p.f[i + 1]));
+      i ? pg.lineTo(x, z) : pg.moveTo(x, z);
+    }
+    pg.closePath(); pg.fill();
+  }
+  // 工事区域は空いていた B に入れる。公園と同じ canvas なので読み出しは増えない
+  pg.fillStyle = '#00f';
+  for (const p of t.data.construction ?? []) {
     pg.beginPath();
     for (let i = 0; i < p.f.length; i += 2) {
       const x = pxX(t.X(p.f[i])), z = pxZ(t.Z(p.f[i + 1]));
@@ -474,6 +484,7 @@ function groundTexture(t) {
   const GREEN = [111, 147, 73];             // 緑地(建物からの距離で推定したもの)
   const PARK = [92, 137, 60];               // 公園の芝(実データ)
   const DIRT = [156, 130, 96];              // グラウンドの土(那覇の校庭は土が多い)
+  const SITE = [143, 108, 84];              // 工事区域(掘り返した国頭マージ＝沖縄の赤土)
   // 閾値で切ると色の帯ができるので、密度に沿って連続的に混ぜる
   const mix = (p, q, t) => [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t,
                             p[2] + (q[2] - p[2]) * t];
@@ -512,9 +523,11 @@ function groundTexture(t) {
       c = mix(c, EDGE, sstep(0.04, 0.5, rsv));            // 実道路の際は路肩
       c = mix(c, ROAD, sstep(0.5, 0.95, rc));             // 縁のアンチエイリアス
       // 実データの公園が最後に来る(推定の緑より優先)。道路・歩道の下には敷かない
-      const pgv = pv[i] / 255, pdv = pv[i + 1] / 255;
+      const pgv = pv[i] / 255, pdv = pv[i + 1] / 255, psv = pv[i + 2] / 255;
       if (pgv > 0.01) c = mix(c, PARK, pgv);
       if (pdv > 0.01) c = mix(c, DIRT, pdv);
+      // 工事は公園より後(整備中の公園は両方に入っている。今の姿は工事のほう)
+      if (psv > 0.01) c = mix(c, SITE, psv);
     }
     const n = 0.88 + Math.random() * 0.24;                // ざらつき
     a[i] = c[0] * n; a[i + 1] = c[1] * n; a[i + 2] = c[2] * n;
@@ -1384,6 +1397,9 @@ function buildTileProps(t) {
   const playSites = playSitesOf(t);
   addTrees(t, playSites);   // 幹は addSolid で固体にする(groundTexture の後)
   addPlayground(t, playSites);
+  const sites = siteAreasOf(t);
+  addFences(t, sites);      // 仮囲いも addSolid で固体にする
+  addMachines(t, sites);    // 重機は仮囲いの後(ゲートの位置とは無関係だが順で読める)
 }
 
 // 道路・建物を全タイルぶん先に入れてから地形を焼くと、隣のタイルの建物が
@@ -2686,6 +2702,632 @@ function addPlayground(t, playSites) {
     t.group.add(g); n++;
   }
   if (n) console.log(`[${t.key}] 遊具 ${n}組`);
+}
+
+// ---------------------------------------------------------------- 工事区域
+// OSM の landuse=construction(203) / building=construction(52)。
+//
+// **「ここは工事中です」と断定して出さない。** start_date も check_date も
+// 384件中2件にしか入っていないので、いつの記録か分からない。名札は
+// 「OSM 上そう記録されている」に留める(史跡289件のうち253件を説明なしで
+// 出したのと同じ判断)。
+//
+// **highway=construction(129本)は使わない。** 那覇空港自動車道の高架部と
+// 赤嶺トンネルが大半で、線を地上に描くと空中・地下にあるものを地面へ寝かせる
+// ことになる。赤嶺トンネルは実際にはもう開通している可能性が高い。
+//
+// 出すもの: 地面の赤土(groundTexture の B チャンネル) / 仮囲い / 重機 /
+//           カラーコーン。
+const SITE_FENCE = 240;    // これより小さい面には仮囲いを立てない(m2)
+const SITE_MACH = 900;     // 重機を置く下限(m2)
+const MACH_PER_TILE = 2;   // 1タイルに置く重機の上限(1台10〜14メッシュあるため)
+const FENCE_H = 2.15;      // 仮囲いの高さ(実物の鋼板は 2.0〜2.4m)
+const FENCE_STEP = 2.5;    // 地形を拾うために打ち直す間隔(m)
+const GATE_W = 7.0;        // 現場ゲートの開口(m)
+const FOUND_H = 0.45;      // 建設中の建物に出す基礎の立ち上がり(m)
+const machines = [];       // {g, parts, kind, phase, tile}
+
+/**
+ * タイル t の工事区域を、面積・重心・内外判定つきで返す。
+ *
+ * 重心は多角形の重心。凹んだ形だと面の外へ出るので、外れたら外接矩形の
+ * 中心に落とす(それも外れたら重機を置かないので実害が無い)。
+ */
+function siteAreasOf(t) {
+  const out = [];
+  for (const p of t.data.construction ?? []) {
+    const pts = [];
+    for (let i = 0; i < p.f.length; i += 2) pts.push([t.X(p.f[i]), t.Z(p.f[i + 1])]);
+    if (pts.length < 3) continue;
+    let a2 = 0, cx = 0, cz = 0;
+    let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const [x, z] = pts[i], [nx, nz] = pts[(i + 1) % pts.length];
+      const cr = x * nz - nx * z;
+      a2 += cr; cx += (x + nx) * cr; cz += (z + nz) * cr;
+      if (x < minx) minx = x; if (x > maxx) maxx = x;
+      if (z < minz) minz = z; if (z > maxz) maxz = z;
+    }
+    if (Math.abs(a2) < 2) continue;
+    const inside = (x, z) => {
+      let s = false;
+      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        const [ax, az] = pts[i], [bx, bz] = pts[j];
+        if ((az > z) !== (bz > z) && x < (bx - ax) * (z - az) / (bz - az) + ax) s = !s;
+      }
+      return s;
+    };
+    cx /= 3 * a2; cz /= 3 * a2;
+    if (!inside(cx, cz)) { cx = (minx + maxx) / 2; cz = (minz + maxz) / 2; }
+    out.push({
+      name: p.name, k: p.k, pts, area: Math.abs(a2) / 2,
+      cx, cz, minx, maxx, minz, maxz, inside,
+    });
+  }
+  return out;
+}
+
+/**
+ * (x,z) の周り r m が平らか。高さの開きが tol を超えたら偽。
+ *
+ * **重機は地形の傾きを拾わない**（水平に置く）。那覇の高台は斜面が急で、
+ * 傾きを無視して置くとダンプの半分が地中に埋まり、残り半分が宙に浮く
+ * (実測で久場川公園の斜面に置いたダンプが片側 1.9m 浮いた)。
+ * 実際の工事現場は造成して平らにしてあるので、平らな所だけに置くのが近い。
+ */
+function flatEnough(x, z, r, tol) {
+  const c = groundAt(x, z);
+  let lo = c, hi = c;
+  for (const [ox, oz] of [[r, 0], [-r, 0], [0, r], [0, -r],
+                          [r * 0.7, r * 0.7], [-r * 0.7, -r * 0.7]]) {
+    const y = groundAt(x + ox, z + oz);
+    if (y < lo) lo = y; if (y > hi) hi = y;
+  }
+  return hi - lo <= tol;
+}
+
+/**
+ * 仮囲い。工事区域の外周に鋼板を立てる。
+ *
+ * 見た目は FENCE_STEP ごとに打ち直して地形を拾う(斜面で足元が浮かないように)。
+ * **当たり判定は打ち直す前の辺ごとに1つ**にする。2.5m ごとに addSolid すると
+ * 1タイルで数百件になり、blocked() の総当たりが効いてくる。辺は simplify 済みで
+ * まっすぐなので、回転した箱1つで足りる。
+ *
+ * 一番長い辺の真ん中を GATE_W ぶん空けて現場ゲートにする。空けないと、
+ * 高さ 2.15m の囲いは目の高さ 1.6m から越えられず、中の重機を近くで見られない。
+ *
+ * **区間ごとに持ち主のタイルを決める。** 面はタイルの矩形で切らずに、外接矩形が
+ * 掛かるタイル全部に入っている(公園と同じ)。そのまま全周を建てると、境界を
+ * またぐ面で囲いが二重に建つ(実測: 久場川公園26,481m2 と石嶺市営住宅17,990m2 が
+ * 2枚ずつに入っていた)。中点が自分の矩形に入る区間だけを建てれば、
+ * 隣と重ならず隙間も空かない。境界そのものは半開区間で片側に寄せる。
+ */
+function addFences(t, sites) {
+  const owns = (x, z) => {
+    const dx = x - t.offX, dz = z - t.offZ;
+    return dx >= -HALF && dx < HALF && dz >= -HALF && dz < HALF;
+  };
+  const V = [], VT = [];
+  const push = (A, p) => { A.push(p[0], p[1], p[2]); };
+  const quad = (A, a, b, c, d) => {
+    push(A, a); push(A, b); push(A, c); push(A, a); push(A, c); push(A, d);
+  };
+  let nseg = 0, nsite = 0, cones = [];
+
+  for (const s of sites) {
+    // **建設中の建物(building=construction)は囲わない。** 囲うのは
+    // 「工事をしている土地」であって、建てかけの建物そのものではない。
+    // 中城御殿跡(10,922m2)の中に建物3件(106/849/527m2)が入っていて、
+    // それぞれ 2.15m の鋼板で囲んだら、敷地の真ん中が迷路の壁になった。
+    // 建物のほうは下で低い基礎の立ち上がりとして出す
+    if (s.k === 'building' || s.area < SITE_FENCE) continue;
+    const n = s.pts.length;
+    // ゲートを空ける辺。一番長い辺。短すぎる辺しか無ければ空けない(閉じたまま)
+    let gi = -1, gl = GATE_W + 4;
+    for (let i = 0; i < n; i++) {
+      const [ax, az] = s.pts[i], [bx, bz] = s.pts[(i + 1) % n];
+      const L = Math.hypot(bx - ax, bz - az);
+      if (L > gl) { gl = L; gi = i; }
+    }
+    const seg0 = nseg;
+
+    for (let i = 0; i < n; i++) {
+      const [ax, az] = s.pts[i], [bx, bz] = s.pts[(i + 1) % n];
+      const L = Math.hypot(bx - ax, bz - az);
+      if (L < 0.6) continue;
+      // この辺のうち囲いを立てる区間。ゲートの辺は真ん中を空けて2本に割る
+      const runs = (i === gi)
+        ? [[0, (L - GATE_W) / 2], [(L + GATE_W) / 2, L]]
+        : [[0, L]];
+      const ux = (bx - ax) / L, uz = (bz - az) / L;
+      const px = uz, pz = -ux;                       // 辺に直交(板の厚み方向)
+      for (const [d0, d1] of runs) {
+        if (d1 - d0 < 0.6) continue;
+        const steps = Math.max(1, Math.round((d1 - d0) / FENCE_STEP));
+        // 自分の持ち分がひと続きになっているあいだ、当たり判定を1つに伸ばす
+        let head = null, topMax = -Infinity;
+        const flush = (dEnd) => {
+          if (head === null) return;
+          const mid = (head + dEnd) / 2;
+          addSolid(ax + ux * mid, az + uz * mid, 0.16, (dEnd - head) + 0.3,
+                   Math.atan2(ux, uz), topMax, t.key);
+          head = null; topMax = -Infinity;
+        };
+        let prev = null;
+        for (let k = 0; k <= steps; k++) {
+          const d = d0 + (d1 - d0) * (k / steps);
+          const x = ax + ux * d, z = az + uz * d;
+          const y0 = groundAt(x, z) - 0.18;          // 少し埋めて斜面の隙間を消す
+          const cur = { d, x, z, y0 };
+          if (prev) {
+            const mx = (prev.x + x) / 2, mz = (prev.z + z) / 2;
+            if (owns(mx, mz)) {
+              const a = [prev.x, prev.y0, prev.z], b = [x, y0, z];
+              const c = [x, y0 + FENCE_H, z], e = [prev.x, prev.y0 + FENCE_H, prev.z];
+              quad(V, a, b, c, e);                   // 板(両面で描く)
+              // 天端の帯。板の上に薄く出す
+              const g0 = [prev.x, prev.y0 + FENCE_H, prev.z];
+              const g1 = [x, y0 + FENCE_H, z];
+              const h0 = [prev.x + px * 0.06, prev.y0 + FENCE_H - 0.16, prev.z + pz * 0.06];
+              const h1 = [x + px * 0.06, y0 + FENCE_H - 0.16, z + pz * 0.06];
+              quad(VT, h0, h1, g1, g0);
+              nseg++;
+              if (head === null) head = prev.d;
+              topMax = Math.max(topMax, prev.y0 + FENCE_H, y0 + FENCE_H);
+            } else {
+              flush(prev.d);
+            }
+          }
+          prev = cur;
+        }
+        flush(prev.d);
+      }
+      // ゲートの脇にカラーコーンを2本ずつ立てる
+      if (i === gi) {
+        for (const d of [(L - GATE_W) / 2 + 0.9, (L + GATE_W) / 2 - 0.9]) {
+          const cx2 = ax + ux * d + px * 0.5, cz2 = az + uz * d + pz * 0.5;
+          if (owns(cx2, cz2)) cones.push([cx2, cz2]);
+        }
+      }
+    }
+    if (nseg > seg0) nsite++;         // 持ち分が1区間も無い面は数えない
+  }
+
+  // 建設中の建物は、基礎の立ち上がりだけを出す。囲いと同じ作りで高さを
+  // FOUND_H にしたもの。**当たり判定には入れない**(0.45m は STEP=0.55 以下で
+  // 跨げる段差なので、固体にすると跨げないのに見た目は跨げそう、になる)
+  const FV = [];
+  let nfound = 0;
+  for (const s of sites) {
+    if (s.k !== 'building' || s.area < 40) continue;
+    const n = s.pts.length;
+    let hit = false;
+    for (let i = 0; i < n; i++) {
+      const [ax, az] = s.pts[i], [bx, bz] = s.pts[(i + 1) % n];
+      const L = Math.hypot(bx - ax, bz - az);
+      if (L < 0.6) continue;
+      const ux = (bx - ax) / L, uz = (bz - az) / L;
+      const steps = Math.max(1, Math.round(L / FENCE_STEP));
+      let prev = null;
+      for (let k = 0; k <= steps; k++) {
+        const dd = L * (k / steps);
+        const x = ax + ux * dd, z = az + uz * dd;
+        const y0 = groundAt(x, z) - 0.15;
+        if (prev && owns((prev.x + x) / 2, (prev.z + z) / 2)) {
+          quad(FV, [prev.x, prev.y0, prev.z], [x, y0, z],
+               [x, y0 + FOUND_H, z], [prev.x, prev.y0 + FOUND_H, prev.z]);
+          hit = true;
+        }
+        prev = { x, z, y0 };
+      }
+    }
+    if (hit) nfound++;
+  }
+  if (FV.length) {
+    const fg = new THREE.BufferGeometry();
+    fg.setAttribute('position', new THREE.Float32BufferAttribute(FV, 3));
+    fg.computeVertexNormals();
+    const fm = new THREE.Mesh(fg, new THREE.MeshLambertMaterial({
+      color: 0xb8b4ac, side: THREE.DoubleSide,       // 打ちっぱなしのコンクリート
+    }));
+    fm.receiveShadow = true;
+    t.group.add(fm);
+  }
+
+  if (V.length) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+    geo.computeVertexNormals();
+    // 板は厚みを持たせていないので両面で描く。仮囲いの鋼板は実際に薄い
+    const m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+      color: 0xd7dad5, side: THREE.DoubleSide,
+    }));
+    m.receiveShadow = true;
+    t.group.add(m);
+    const gt = new THREE.BufferGeometry();
+    gt.setAttribute('position', new THREE.Float32BufferAttribute(VT, 3));
+    gt.computeVertexNormals();
+    t.group.add(new THREE.Mesh(gt, new THREE.MeshLambertMaterial({
+      color: 0x2f6ea8, side: THREE.DoubleSide,
+    })));
+  }
+  if (cones.length) {
+    const cg = new THREE.ConeGeometry(0.22, 0.7, 6);
+    cg.translate(0, 0.35, 0);
+    const im = new THREE.InstancedMesh(
+      cg, new THREE.MeshLambertMaterial({ color: 0xe8642f }), cones.length);
+    const m4 = new THREE.Matrix4(), qt = new THREE.Quaternion();
+    const pv = new THREE.Vector3(), sv = new THREE.Vector3(1, 1, 1);
+    cones.forEach(([x, z], i) => {
+      m4.compose(pv.set(x, groundAt(x, z), z), qt, sv);
+      im.setMatrixAt(i, m4);
+    });
+    im.castShadow = true;
+    t.group.add(im);
+  }
+  if (nsite || nfound) {
+    console.log(`[${t.key}] 仮囲い ${nsite}区域 / ${nseg}区間 / コーン${cones.length}本 `
+                + `/ 基礎 ${nfound}棟`);
+  }
+}
+
+/**
+ * 重機。1台10〜14メッシュあるので、**タイルあたり MACH_PER_TILE 台まで**。
+ * 広い面から順に置く。t.group に足すので、タイルを捨てれば一緒に消える
+ * (machines の登録簿だけは dropTile で外す)。
+ */
+function addMachines(t, sites) {
+  const big = sites.filter((s) => s.area >= SITE_MACH)
+                   .sort((a, b) => b.area - a.area).slice(0, MACH_PER_TILE);
+  let n = 0;
+  for (const s of big) {
+    // 面の中で、建物にも道にもぶつからず、**平らな**場所を探す
+    let x = null, z = null;
+    for (let k = 0; k < 40; k++) {
+      const px = s.minx + t.rnd() * (s.maxx - s.minx);
+      const pz = s.minz + t.rnd() * (s.maxz - s.minz);
+      if (Math.abs(px - t.offX) > HALF - 8 || Math.abs(pz - t.offZ) > HALF - 8) continue;
+      if (!s.inside(px, pz)) continue;
+      if (blocked(px, pz, 3.4)) continue;
+      if (onRoad(px, pz)) continue;
+      if (!flatEnough(px, pz, 3.0, 0.8)) continue;
+      x = px; z = pz; break;
+    }
+    if (x === null) continue;
+    // 広い面にはクレーン、そうでなければショベル。ダンプはその脇に付ける。
+    // クレーンは控えめに出す。ブーム18mは遠くからでも目立つので、実際の街より
+    // 多く見えると嘘になる(6000m2 以上の面で 0.3 だと、読み込み6枚で1〜2台)
+    const kind = s.area >= 6000 && t.rnd() < 0.3 ? 'crane' : 'excavator';
+    const g = kind === 'crane' ? makeCrawlerCrane() : makeExcavator();
+    g.position.set(x, groundAt(x, z), z);
+    g.rotation.y = t.rnd() * Math.PI * 2;
+    g.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+    t.group.add(g);
+    machines.push({
+      g, parts: g.userData.parts, kind, tile: t.key,
+      phase: t.rnd() * Math.PI * 2,
+    });
+    // 重機は動くので当たり判定に入れない(動く固体は bstore が扱えない)。
+    // 代わりに現場そのものを仮囲いで囲ってある
+    n++;
+
+    // ダンプ。重機の脇に停める。置けなければ諦める(現場が狭いだけ)
+    for (let k = 0; k < 12; k++) {
+      const a = t.rnd() * Math.PI * 2, r = 7 + t.rnd() * 5;
+      const dx = x + Math.cos(a) * r, dz = z + Math.sin(a) * r;
+      if (Math.abs(dx - t.offX) > HALF - 6 || Math.abs(dz - t.offZ) > HALF - 6) continue;
+      if (!s.inside(dx, dz) || blocked(dx, dz, 3.4) || onRoad(dx, dz)) continue;
+      if (!flatEnough(dx, dz, 3.2, 0.8)) continue;
+      const d = makeDumpTruck();
+      d.position.set(dx, groundAt(dx, dz), dz);
+      d.rotation.y = t.rnd() * Math.PI * 2;
+      d.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+      t.group.add(d);
+      machines.push({
+        g: d, parts: d.userData.parts, kind: 'dump', tile: t.key,
+        phase: t.rnd() * Math.PI * 2,
+      });
+      n++;
+      break;
+    }
+  }
+  if (n) console.log(`[${t.key}] 重機 ${n}台`);
+}
+
+/**
+ * 重機を1フレーム動かす。**可動部を回すだけ**で、位置は動かさない。
+ *
+ * クレーンのフックは boom ではなく swing の子になっている。ワイヤが
+ * 世界の鉛直に垂れるのはそのおかげなので、**ブームは起こさない**
+ * (起こすとフックが先端から離れる)。旋回と巻き上げだけ動かす。
+ */
+const MACH_R2 = 220 * 220;        // これより遠い重機は動かさない
+function stepMachines(dt) {
+  if (!machines.length) return;
+  for (const m of machines) {
+    const dx = m.g.position.x - player.x, dz = m.g.position.z - player.z;
+    if (dx * dx + dz * dz > MACH_R2) continue;
+    m.phase += dt;
+    const p = m.parts;
+    if (!p) continue;
+    if (m.kind === 'excavator') {
+      // 掘る→旋回して放す→戻る、をひと続きの周期にする。
+      // **下げる側だけ振れを半分にする。** 地形は掘れないので、対称に振ると
+      // バケットが地面の 0.64m 下まで潜って丸ごと埋まる(実測)。半分にすると
+      // 歯先が 0.21m 噛むだけで止まり、掘っているようには見えたまま
+      const c = (m.phase * 0.22) % 1;
+      const s = Math.sin(c * Math.PI * 2);
+      const dig = s < 0 ? s * 0.5 : s;
+      p.swing.rotation.y = Math.sin(c * Math.PI * 2 - 1.2) * 0.85;
+      p.boom.rotation.x = -1.25 + dig * 0.22;
+      p.arm.rotation.x = 1.55 - dig * 0.40;
+      p.bucket.rotation.x = 0.35 + dig * 0.55;
+    } else if (m.kind === 'crane') {
+      p.swing.rotation.y = Math.sin(m.phase * 0.12) * 0.7;
+      // 巻き上げ・巻き下ろし。ワイヤはフックの下げ幅ぶん伸ばす
+      const d = 5.5 + Math.sin(m.phase * 0.35) * 4.5;
+      p.hook.position.y = m.hookY0 ?? (m.hookY0 = p.hook.position.y);
+      p.hook.position.y = m.hookY0 - d;
+      if (p.hook.userData.rope) p.hook.userData.rope.scale.y = d;
+    } else if (m.kind === 'dump') {
+      // たまに荷台を上げて土を落とす。上げっぱなしにしない
+      const c = (m.phase * 0.06) % 1;
+      const up = c < 0.18 ? Math.sin((c / 0.18) * Math.PI) : 0;
+      p.bed.rotation.x = up * 0.85;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 重機の造形
+// 造形は Antigravity(agy)に契約を渡して書かせたものを検分して取り込んだ。
+// シーサー・正殿・車内と同じやり方。
+//
+// 契約: 原点=接地面の中心・すべて y>=0 / 正面=-Z / MeshLambertMaterial のみ /
+//       transparent 禁止・castShadow 禁止(呼び出し側でまとめる) /
+//       Math.random 禁止 / 1関数40メッシュ以内 /
+//       **可動部は「回転の付け根を原点にした Group」を userData.parts に出す**。
+//
+// 検分で見つけて直したもの2件（どちらも初期姿勢の誤り。構造は契約どおり）:
+//   1. クレーンの boom.rotation.x が -1.0 で、ブームが**地中 13m まで刺さって
+//      いた**。フックの置き場所 (0, 1.0+15.14, -1.7-9.72) が +1.0 のときの
+//      先端と小数点以下まで一致するので、符号だけの取り違え。+1.0 に直した
+//   2. ショベルの初期姿勢でバケットが**空中 5.3m** にあった(契約は
+//      「バケットを地面近くに下ろした待機の形」)。この腕の長さだと、
+//      バケットが接地するにはブームがほぼ水平まで下りる必要がある
+//      (ブーム先端の高さ 1.75+4.2cosθ が 3.25m 以下、つまり |θ|>=1.21)。
+//      θb=-1.25 / θa=1.55 / θc=0.35 にしてバケット下端 0.11m・総高 3.10m。
+//      この姿勢を stepMachines の振れ幅の中心にしている
+
+// 油圧ショベル (0.25m3級) クローラ全長3.6m / 全幅2.4m / 旋回体幅2.3m / ブーム4.2m / アーム2.2m
+function makeExcavator() {
+  const group = new THREE.Group();
+  group.userData.parts = {};
+
+  const matYellow = new THREE.MeshLambertMaterial({ color: 0xe8b423 });
+  const matBlack = new THREE.MeshLambertMaterial({ color: 0x3a3a3c });
+  const matWindow = new THREE.MeshLambertMaterial({ color: 0x1e2a30 });
+
+  const crawlerGroup = new THREE.Group();
+  group.add(crawlerGroup);
+
+  const trackGeo = new THREE.BoxGeometry(0.5, 0.75, 3.6);
+  const trackL = new THREE.Mesh(trackGeo, matBlack);
+  trackL.position.set(-0.95, 0.375, 0);
+  const trackR = new THREE.Mesh(trackGeo, matBlack);
+  trackR.position.set(0.95, 0.375, 0);
+  const baseGeo = new THREE.BoxGeometry(1.2, 0.6, 2.0);
+  const baseCenter = new THREE.Mesh(baseGeo, matBlack);
+  baseCenter.position.set(0, 0.45, 0);
+  crawlerGroup.add(trackL, trackR, baseCenter);
+
+  const swing = new THREE.Group();
+  swing.position.set(0, 0.75, 0);
+  group.add(swing);
+  group.userData.parts.swing = swing;
+
+  const swingBodyGeo = new THREE.BoxGeometry(2.3, 1.5, 2.9);
+  const swingBody = new THREE.Mesh(swingBodyGeo, matYellow);
+  swingBody.position.set(0, 0.75, 0.1);
+  const cabGeo = new THREE.BoxGeometry(1.0, 1.6, 1.6);
+  const cab = new THREE.Mesh(cabGeo, matYellow);
+  cab.position.set(-0.65, 1.55, -0.6);
+  const winGeo = new THREE.BoxGeometry(0.9, 0.7, 1.65);
+  const win = new THREE.Mesh(winGeo, matWindow);
+  win.position.set(-0.65, 1.9, -0.6);
+  swing.add(swingBody, cab, win);
+
+  const boom = new THREE.Group();
+  boom.position.set(0.3, 1.0, -0.5);
+  boom.rotation.x = -1.25;              // 検分で直した(元は -0.5 でバケットが空中)
+  swing.add(boom);
+  group.userData.parts.boom = boom;
+
+  const boomGeo = new THREE.BoxGeometry(0.4, 4.2, 0.5);
+  const boomMesh = new THREE.Mesh(boomGeo, matYellow);
+  boomMesh.position.set(0, 2.1, 0);
+  boom.add(boomMesh);
+
+  const arm = new THREE.Group();
+  arm.position.set(0, 4.2, 0);
+  arm.rotation.x = 1.55;                // 同上(元は -1.0)
+  boom.add(arm);
+  group.userData.parts.arm = arm;
+
+  const armGeo = new THREE.BoxGeometry(0.3, 2.2, 0.3);
+  const armMesh = new THREE.Mesh(armGeo, matYellow);
+  armMesh.position.set(0, -1.1, 0);
+  arm.add(armMesh);
+
+  const bucket = new THREE.Group();
+  bucket.position.set(0, -2.2, 0);
+  bucket.rotation.x = 0.35;             // 同上(元は 0.5)
+  arm.add(bucket);
+  group.userData.parts.bucket = bucket;
+
+  const bucketBaseGeo = new THREE.BoxGeometry(0.9, 0.8, 0.6);
+  const bucketBase = new THREE.Mesh(bucketBaseGeo, matBlack);
+  bucketBase.position.set(0, -0.4, 0);
+  const toothGeo = new THREE.BoxGeometry(0.9, 0.1, 0.3);
+  const tooth = new THREE.Mesh(toothGeo, matBlack);
+  tooth.position.set(0, -0.85, -0.15);
+  bucket.add(bucketBase, tooth);
+
+  return group;
+}
+
+// クローラクレーン (25t吊り級) クローラ全長5.0m / 全幅3.2m / ブーム18m
+function makeCrawlerCrane() {
+  const group = new THREE.Group();
+  group.userData.parts = {};
+
+  const matBody = new THREE.MeshLambertMaterial({ color: 0xd9d4c8 });
+  const matBoom = new THREE.MeshLambertMaterial({ color: 0xc4452f });
+  const matBlack = new THREE.MeshLambertMaterial({ color: 0x3a3a3c });
+  const matWindow = new THREE.MeshLambertMaterial({ color: 0x1e2a30 });
+
+  const trackGeo = new THREE.BoxGeometry(0.7, 0.9, 5.0);
+  const trackL = new THREE.Mesh(trackGeo, matBlack);
+  trackL.position.set(-1.25, 0.45, 0);
+  const trackR = new THREE.Mesh(trackGeo, matBlack);
+  trackR.position.set(1.25, 0.45, 0);
+  const baseGeo = new THREE.BoxGeometry(1.5, 0.7, 2.5);
+  const baseCenter = new THREE.Mesh(baseGeo, matBlack);
+  baseCenter.position.set(0, 0.45, 0);
+  group.add(trackL, trackR, baseCenter);
+
+  const swing = new THREE.Group();
+  swing.position.set(0, 0.9, 0);
+  group.add(swing);
+  group.userData.parts.swing = swing;
+
+  const bodyGeo = new THREE.BoxGeometry(2.8, 2.2, 4.4);
+  const bodyMesh = new THREE.Mesh(bodyGeo, matBody);
+  bodyMesh.position.set(0, 1.1, 0.5);
+  const cwGeo = new THREE.BoxGeometry(2.8, 1.5, 1.0);
+  const cwMesh = new THREE.Mesh(cwGeo, matBlack);
+  cwMesh.position.set(0, 0.75, 2.2);
+  const cabGeo = new THREE.BoxGeometry(1.0, 2.0, 1.5);
+  const cabMesh = new THREE.Mesh(cabGeo, matBody);
+  cabMesh.position.set(-0.9, 1.0, -1.5);
+  const winGeo = new THREE.BoxGeometry(0.9, 1.0, 1.55);
+  const winMesh = new THREE.Mesh(winGeo, matWindow);
+  winMesh.position.set(-0.9, 1.3, -1.5);
+  swing.add(bodyMesh, cwMesh, cabMesh, winMesh);
+
+  const boom = new THREE.Group();
+  boom.position.set(0, 1.0, -1.7);
+  // 検分で直した。元は -1.0 で、ブームが**地中 13m** まで刺さっていた
+  boom.rotation.x = 1.0;
+  swing.add(boom);
+  group.userData.parts.boom = boom;
+
+  const chordGeo = new THREE.BoxGeometry(0.1, 0.1, 18);
+  const c1 = new THREE.Mesh(chordGeo, matBoom); c1.position.set(-0.4, 0.4, -9);
+  const c2 = new THREE.Mesh(chordGeo, matBoom); c2.position.set(0.4, 0.4, -9);
+  const c3 = new THREE.Mesh(chordGeo, matBoom); c3.position.set(-0.4, -0.4, -9);
+  const c4 = new THREE.Mesh(chordGeo, matBoom); c4.position.set(0.4, -0.4, -9);
+  boom.add(c1, c2, c3, c4);
+
+  const latGeo = new THREE.BoxGeometry(0.05, 0.05, 1.4);
+  const latMesh = new THREE.InstancedMesh(latGeo, matBoom, 60);
+  const dummy = new THREE.Object3D();
+  let idx = 0;
+  for (let i = 0; i < 15; i++) {
+    const z = -1.2 * i - 0.6;
+    dummy.position.set(0, 0.4, z); dummy.rotation.set(0, 0.6, 0);
+    dummy.updateMatrix(); latMesh.setMatrixAt(idx++, dummy.matrix);
+    dummy.position.set(0, -0.4, z); dummy.rotation.set(0, -0.6, 0);
+    dummy.updateMatrix(); latMesh.setMatrixAt(idx++, dummy.matrix);
+    dummy.position.set(-0.4, 0, z); dummy.rotation.set(0.6, 0, 0);
+    dummy.updateMatrix(); latMesh.setMatrixAt(idx++, dummy.matrix);
+    dummy.position.set(0.4, 0, z); dummy.rotation.set(-0.6, 0, 0);
+    dummy.updateMatrix(); latMesh.setMatrixAt(idx++, dummy.matrix);
+  }
+  boom.add(latMesh);
+
+  // フックは boom ではなく swing の子。ワイヤが世界の鉛直に垂れるのはそのため。
+  // 代わりに**ブームを起こすとフックが先端から離れる**ので、起伏は動かさない
+  const hook = new THREE.Group();
+  hook.position.set(0, 1.0 + 15.14, -1.7 - 9.72);
+  swing.add(hook);
+  group.userData.parts.hook = hook;
+
+  const hookBodyGeo = new THREE.BoxGeometry(0.4, 0.6, 0.4);
+  const hookBody = new THREE.Mesh(hookBodyGeo, matBlack);
+  hookBody.position.set(0, -0.3, 0);
+  hook.add(hookBody);
+
+  const ropeGeo = new THREE.CylinderGeometry(0.02, 0.02, 1, 8);
+  ropeGeo.translate(0, 0.5, 0);
+  const rope = new THREE.Mesh(ropeGeo, matBlack);
+  rope.scale.y = 0.01;
+  hook.add(rope);
+  hook.userData.rope = rope;
+
+  return group;
+}
+
+// 4tダンプトラック 全長6.1m / 全幅2.2m / 全高2.6m / 荷台長さ3.4m
+function makeDumpTruck() {
+  const group = new THREE.Group();
+  group.userData.parts = {};
+
+  const matCab = new THREE.MeshLambertMaterial({ color: 0xe8e4dc });
+  const matBed = new THREE.MeshLambertMaterial({ color: 0x2f5c8a });
+  const matTire = new THREE.MeshLambertMaterial({ color: 0x22262a });
+  const matWindow = new THREE.MeshLambertMaterial({ color: 0x1e2a30 });
+  const matChassis = new THREE.MeshLambertMaterial({ color: 0x3a3a3c });
+
+  const chassisGeo = new THREE.BoxGeometry(2.0, 0.2, 5.8);
+  const chassis = new THREE.Mesh(chassisGeo, matChassis);
+  chassis.position.set(0, 0.85, 0.15);
+  group.add(chassis);
+
+  const cabGeo = new THREE.BoxGeometry(2.2, 1.5, 1.8);
+  const cab = new THREE.Mesh(cabGeo, matCab);
+  cab.position.set(0, 1.7, -1.8);
+  group.add(cab);
+
+  const winGeo = new THREE.BoxGeometry(2.1, 0.7, 1.85);
+  const win = new THREE.Mesh(winGeo, matWindow);
+  win.position.set(0, 1.9, -1.8);
+  group.add(win);
+
+  const tireGeo = new THREE.CylinderGeometry(0.45, 0.45, 0.28, 16);
+  tireGeo.rotateZ(Math.PI / 2);
+
+  const tFL = new THREE.Mesh(tireGeo, matTire); tFL.position.set(-0.96, 0.45, -1.8);
+  const tFR = new THREE.Mesh(tireGeo, matTire); tFR.position.set(0.96, 0.45, -1.8);
+  group.add(tFL, tFR);
+
+  const tRL1 = new THREE.Mesh(tireGeo, matTire); tRL1.position.set(-0.82, 0.45, 2.0);
+  const tRL2 = new THREE.Mesh(tireGeo, matTire); tRL2.position.set(-1.1, 0.45, 2.0);
+  const tRR1 = new THREE.Mesh(tireGeo, matTire); tRR1.position.set(0.82, 0.45, 2.0);
+  const tRR2 = new THREE.Mesh(tireGeo, matTire); tRR2.position.set(1.1, 0.45, 2.0);
+  group.add(tRL1, tRL2, tRR1, tRR2);
+
+  // ヒンジは荷台の**後端の下**。中心を原点にすると上げたとき車体にめり込む
+  const bed = new THREE.Group();
+  bed.position.set(0, 0.95, 3.0);
+  group.add(bed);
+  group.userData.parts.bed = bed;
+
+  const floorGeo = new THREE.BoxGeometry(2.1, 0.1, 3.4);
+  const floor = new THREE.Mesh(floorGeo, matBed);
+  floor.position.set(0, 0.05, -1.7);
+
+  const sideGeo = new THREE.BoxGeometry(0.1, 0.9, 3.4);
+  const leftWall = new THREE.Mesh(sideGeo, matBed); leftWall.position.set(-1.0, 0.55, -1.7);
+  const rightWall = new THREE.Mesh(sideGeo, matBed); rightWall.position.set(1.0, 0.55, -1.7);
+
+  const fbGeo = new THREE.BoxGeometry(1.9, 0.9, 0.1);
+  const frontWall = new THREE.Mesh(fbGeo, matBed); frontWall.position.set(0, 0.55, -3.35);
+  const backWall = new THREE.Mesh(fbGeo, matBed); backWall.position.set(0, 0.55, -0.05);
+
+  bed.add(floor, leftWall, rightWall, frontWall, backWall);
+
+  return group;
 }
 
 // ---------------------------------------------------------------- 店舗の看板
@@ -4981,6 +5623,10 @@ function dropTile(t) {
   for (let i = signals.length - 1; i >= 0; i--) {
     if (signals[i].tile === t.key) signals.splice(i, 1);
   }
+  // 重機の絵は t.group ごと捨てられるが、動かす登録簿はここで外す
+  for (let i = machines.length - 1; i >= 0; i--) {
+    if (machines[i].tile === t.key) machines.splice(i, 1);
+  }
   dropWalkLines(t.key);
   dropCarLines(t.key);
   dropWater(t.key);
@@ -5996,6 +6642,7 @@ function tick() {
 
   stepTrain(dt);
   stepCars(dt, sigT);
+  stepMachines(dt);
 
   // タイルの足し引き。毎フレームやる必要は無い(歩き 4.6m/s なので
   // 30フレーム=0.5秒で 2.3m しか進まない)し、fetch が絡むので間引く
@@ -6191,6 +6838,9 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   waters, waterAt, addWater, dropWater, get inWater() { return inWater; },
   isSea, buildSea, coast, SEA, riverAt, buildRivers, riverData,
   stepUnderwater, get underwater() { return wasUnder; }, stepWaves, WAVE, bakeMap, buildApron, seesaaGroup,
+  // 工事(検証用)。可動部の姿勢をそのまま読める
+  machines, stepMachines, siteAreasOf, addFences, addMachines,
+  makeExcavator, makeCrawlerCrane, makeDumpTruck,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
