@@ -2655,6 +2655,9 @@ function addTrees(t, playSites) {
                  0.24 + t.rnd() * 0.13);
       leaves.setColorAt(i, col);
       addSolid(x, z, 0.55, 0.55, 0, y + h, t.key);   // 幹だけ固体にする
+      // 幹の位置と高さを残す。セミやキノボリトカゲを幹にとまらせるのに要る。
+      // InstancedMesh の行列からは読み出しにくいので、ここで控えておく
+      (t.trees ??= []).push({ x, z, y, h });
     });
     trunks.castShadow = leaves.castShadow = leaves.receiveShadow = true;
     t.group.add(trunks); t.group.add(leaves);
@@ -6173,6 +6176,9 @@ const PURSE_KEY = 'jouto-walk.purse.v1';
 let coins = 0;                    // 円
 const bag = new Map();            // 品名 -> 個数
 const seenFish = new Set();       // 一度でも釣った魚(図鑑)
+// いきものは**持ち帰らない**。図鑑に載せるだけなので bag には入れない
+// (オカヤドカリは国の天然記念物で、そもそも持ち帰れない)。
+const seenCrea = new Set();
 
 function loadPurse() {
   try {
@@ -6180,6 +6186,7 @@ function loadPurse() {
     coins = Number(j.coins) || 0;
     for (const [k, v] of Object.entries(j.bag || {})) bag.set(k, Number(v) || 0);
     for (const k of j.seenFish || []) seenFish.add(k);
+    for (const k of j.seenCrea || []) seenCrea.add(k);
   } catch { /* 壊れていたら空で始める。持ち物は失っても遊びは続く */ }
 }
 
@@ -6187,6 +6194,7 @@ function savePurse() {
   try {
     localStorage.setItem(PURSE_KEY, JSON.stringify({
       coins, bag: Object.fromEntries(bag), seenFish: [...seenFish],
+      seenCrea: [...seenCrea],
     }));
   } catch { /* プライベートモードなどで書けないことがある。落とさない */ }
 }
@@ -6209,6 +6217,8 @@ function updatePurseUI() {
     for (const [k, v] of bag) if (FISH_NAMES.has(k)) n += v;
     f.textContent = `${n} 匹 / ${seenFish.size} 種`;
   }
+  const cr = $('creacount');
+  if (cr) cr.textContent = `${seenCrea.size} 種`;
 }
 
 loadPurse();
@@ -6355,6 +6365,8 @@ function buildRod() {
 
 /** [F] とボタンの共通処理。投げる／合わせる／やめる。 */
 function fishAction() {
+  // 糸をたらしていないときは、近くのいきものが先。逃げてしまうので
+  if (!fishing && creaNear) { recordCreature(); return; }
   if (!fishing) {
     const spot = castTarget();
     if (!spot) return;
@@ -6432,6 +6444,332 @@ function stepFishing(dt) {
   p.needsUpdate = true;
 }
 
+// ---------------------------------------------------------------- いきもの
+// 公園の木・草地・水辺にいる虫や小さな生き物を見つけて図鑑に載せる。
+//
+// **つかまえて持ち帰るのではなく、記録する。** オカヤドカリは国の天然記念物で
+// 持ち帰れないし、街の生き物を袋に詰めて歩くのはこの街の調子に合わない。
+// 集めるのは「見た記録」のほう。
+//
+// 魚と同じで、**どこに何が居るとは言わない**。OSM にも PLATEAU にも生き物は
+// 入っていないので、言えるのは「沖縄のこういう場所で見かける生き物」まで。
+// だから居場所の**種類**(木・草地・淡水の岸・潮の岸)で表を分ける。
+//
+// **ヤンバルクイナは入れていない。** あれはやんばる(北部)の鳥で、那覇には居ない。
+// 沖縄でいちばん名の知れた生き物だが、出したら嘘になる。
+const CREA_N = 14;             // 同時に居る数(距離バジェット。歩行者36人・車44台と同じ考え)
+const CREA_NEAR = [7, 70];     // この距離の帯に湧かし直す(m)
+const CATCH_R = 3.4;           // 図鑑に載せられる距離(m)
+
+// [名前, 説明, 見た目, 動き]。動きは 'fly'=舞う / 'sit'=とまっている
+const CREATURES = {
+  tree: [
+    ['クロイワツクツク', '沖縄のツクツクボウシ。夏の終わりに鳴きだす', 'cicada', 'sit'],
+    ['リュウキュウアブラゼミ', '羽の茶色いセミ。街なかの木でも鳴く', 'cicada', 'sit'],
+    ['オキナワキノボリトカゲ', '幹でじっとしている緑のトカゲ。体の色を変える', 'lizard', 'sit'],
+    ['ナナフシ', '枝にそっくりな虫。動かないと見つけられない', 'stick', 'sit'],
+  ],
+  grass: [
+    ['オオゴマダラ', '沖縄県の蝶。日本でいちばん大きい蝶のひとつで、さなぎが金色になる', 'butterfly', 'fly'],
+    ['リュウキュウアサギマダラ', '浅葱色の蝶。冬になると谷あいに群れて集まる', 'butterfly', 'fly'],
+    ['アオカナヘビ', '草の上を走る細いトカゲ。しっぽが体より長い', 'lizard', 'sit'],
+  ],
+  // 民家の壁ぎわ。**この街でいちばん多い住みか**。公園だけを住みかにすると、
+  // 城東小のまわりのような住宅地では一匹も出ない(出発地点から最寄りの公園は
+  // 230m、最寄りの木は 240m だった)
+  wall: [
+    ['ホオグロヤモリ', '「ケケケ」と鳴くヤモリ。夜、灯りのそばの壁で虫を待つ', 'lizard', 'sit'],
+    ['シロオビアゲハ', '黒地に白い帯の蝶。庭のミカンの木で育つ', 'butterfly', 'fly'],
+    ['アオドウガネ', '緑色のコガネムシ。夜、灯りに集まってくる', 'cicada', 'sit'],
+  ],
+  // 淡水(池・川)の岸
+  bank: [
+    ['オオシオカラトンボ', '水色の太いトンボ。水辺を行ったり来たりする', 'dragonfly', 'fly'],
+    ['ショウジョウトンボ', '真っ赤なトンボ。赤とんぼの仲間ではない', 'dragonfly', 'fly'],
+    ['ヒメアマガエル', '小さくて丸いカエル。雨のあとによく鳴く', 'frog', 'sit'],
+  ],
+  // 潮の満ち引きのある岸(干潟・海岸)
+  tide: [
+    ['オカヤドカリ', '国の天然記念物。貝がらを借りて歩く。持ち帰れない', 'crab', 'sit'],
+    ['ミナミコメツキガニ', '干潟を群れになって歩く青いカニ。まっすぐ前に歩く', 'crab', 'sit'],
+  ],
+};
+
+const creatures = [];          // {g, name, note, look, mode, home, phase, alive}
+let creaNear = null;           // いま記録できる1匹
+
+// 体の寸法は実物に合わせてあるが、**描くときだけ2倍にする**。
+// この街で唯一、実寸から意図的にずらしている所。オオゴマダラの13cmは
+// 3.6m 先で15px にしかならず(実測)、何を記録したのか分からない。
+// 2倍でも 30px 程度で、路上の生き物として不自然ではない。
+const CREA_SCALE = 2.0;
+
+/** 小さな体を作る。見た目ごとに 2〜3 メッシュ。 */
+function makeCreature(look) {
+  const g = new THREE.Group();
+  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
+  const box = (w, h, d, x, y, z, c) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(c));
+    m.position.set(x, y, z); g.add(m); return m;
+  };
+  if (look === 'butterfly') {
+    box(0.02, 0.02, 0.10, 0, 0, 0, 0x2b2b2b);                 // 胴
+    // 翅は羽ばたかせるので、付け根を原点にした Group に入れる(重機と同じ型)
+    for (const s of [-1, 1]) {
+      const w = new THREE.Group();
+      w.position.set(0, 0, 0);
+      const p = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.004, 0.09), mat(0xf4f1e8));
+      p.position.set(s * 0.055, 0, 0);
+      w.add(p); g.add(w);
+      (g.userData.wings ??= []).push({ w, s });
+    }
+  } else if (look === 'dragonfly') {
+    box(0.014, 0.014, 0.16, 0, 0, 0, 0x4a7fa5);
+    for (const s of [-1, 1]) {
+      const w = new THREE.Group();
+      const p = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.003, 0.03), mat(0xdfe8ee));
+      p.position.set(s * 0.05, 0, -0.02);
+      w.add(p); g.add(w);
+      (g.userData.wings ??= []).push({ w, s });
+    }
+  } else if (look === 'cicada') {
+    box(0.022, 0.020, 0.055, 0, 0, 0, 0x4a3b2c);
+    box(0.030, 0.004, 0.065, 0, 0.012, 0.004, 0x6e6252);      // たたんだ羽
+  } else if (look === 'lizard') {
+    box(0.028, 0.022, 0.085, 0, 0, 0, 0x5f8f4a);
+    box(0.012, 0.012, 0.12, 0, 0, 0.10, 0x4f7a3e);            // しっぽ
+  } else if (look === 'stick') {
+    box(0.010, 0.010, 0.17, 0, 0, 0, 0x7a6b46);
+    box(0.008, 0.008, 0.07, 0, 0.004, -0.11, 0x7a6b46);
+  } else if (look === 'frog') {
+    box(0.05, 0.035, 0.06, 0, 0, 0, 0x6f8a55);
+    for (const s of [-1, 1]) box(0.014, 0.014, 0.014, s * 0.017, 0.024, -0.022, 0x2b2b2b);
+  } else {  // crab
+    box(0.06, 0.032, 0.05, 0, 0, 0, 0xb06a4a);
+    for (const s of [-1, 1]) box(0.022, 0.016, 0.03, s * 0.04, 0.004, -0.026, 0xc07a55);
+  }
+  g.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+  g.scale.setScalar(CREA_SCALE);
+  return g;
+}
+
+/**
+ * 湧かす場所を1つ選ぶ。
+ *
+ * 点をばらまいて分類するのではなく、**居場所の側から選ぶ**。木は幹の控えから、
+ * 草地は公園の面から、岸は水面の輪から。そのほうが外れが出ない。
+ *
+ * **候補を先に距離で絞る。** タイルを引いてから点を選び、あとで距離帯で
+ * 落とす書き方だと、1km 角のタイルに対して帯が 70m しかないので
+ * ほとんど当たらない(実測で 600 回試して 0 件だった)。
+ */
+function pickHome() {
+  const [near, far] = CREA_NEAR;
+  const px = player.x, pz = player.z;
+  const inBand = (x, z) => {
+    const d = Math.hypot(x - px, z - pz);
+    return d >= near && d <= far;
+  };
+  const trees = [], parks = [], banks = [];
+  for (const t of tiles.values()) {
+    // タイルまるごと帯の外なら見ない
+    if (Math.abs(t.offX - px) > far + HALF || Math.abs(t.offZ - pz) > far + HALF) continue;
+    for (const tr of t.trees ?? []) if (inBand(tr.x, tr.z)) trees.push(tr);
+    for (const p of t.data.parks ?? []) {
+      if (p.k === 'pitch') continue;
+      const pts = [];
+      let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
+      for (let i = 0; i < p.f.length; i += 2) {
+        const x = t.X(p.f[i]), z = t.Z(p.f[i + 1]);
+        pts.push([x, z]);
+        if (x < minx) minx = x; if (x > maxx) maxx = x;
+        if (z < minz) minz = z; if (z > maxz) maxz = z;
+      }
+      if (pts.length < 3) continue;
+      // 外接矩形が帯に掛かるものだけ。中の点を選ぶのはこの後
+      if (maxx < px - far || minx > px + far || maxz < pz - far || minz > pz + far) continue;
+      parks.push({ pts, minx, maxx, minz, maxz });
+    }
+  }
+  // 岸は**輪の頂点を先に帯で絞る**。水面レコードごと候補にして、あとから
+  // 頂点をランダムに引く書き方だと、漫湖のような大きな面で当たらない
+  // (実測: 龍潭は26件拾えたのに漫湖は1,200回試して0件)
+  for (const w of waters) {
+    if (w.maxx < px - far || w.minx > px + far ||
+        w.maxz < pz - far || w.minz > pz + far) continue;
+    const m = w.ring.length;
+    for (let i = 0; i < m; i++) {
+      const p = w.ring[i];
+      if (!inBand(p.x, p.y)) continue;
+      banks.push({ w, i });
+    }
+  }
+  // 民家の壁。bstore から建物だけを拾う(木の幹・仮囲い・店内の固体は外す)。
+  // 街のどこにでもあるので、ここが住みかの主力になる
+  const wallsB = [];
+  for (const b of bstore) {
+    if (!b.tile || b.tile === SOLID_SHOP) continue;
+    if (b.maxx - b.minx < 3 || b.maxz - b.minz < 3) continue;   // 幹や柱は除く
+    const cx = (b.minx + b.maxx) / 2, cz = (b.minz + b.maxz) / 2;
+    if (!inBand(cx, cz)) continue;
+    wallsB.push(b);
+  }
+
+  const pools = [];
+  if (wallsB.length) pools.push('wall', 'wall', 'wall');
+  if (trees.length) pools.push('tree', 'tree');
+  if (parks.length) pools.push('grass', 'grass');
+  if (banks.length) pools.push('bank');
+  if (!pools.length) return null;
+
+  for (let k = 0; k < 30; k++) {
+    const pool = pools[(Math.random() * pools.length) | 0];
+    if (pool === 'wall') {
+      const b = wallsB[(Math.random() * wallsB.length) | 0];
+      const m = b.ring.length;
+      const i = (Math.random() * m) | 0;
+      const a = b.ring[i], c = b.ring[(i + 1) % m];
+      const mx = (a.x + c.x) / 2, mz = (a.y + c.y) / 2;
+      const bx = (b.minx + b.maxx) / 2, bz = (b.minz + b.maxz) / 2;
+      // 壁の外へ少し離す。中心から見て外向き
+      let ox = mx - bx, oz = mz - bz;
+      const L = Math.hypot(ox, oz) || 1;
+      ox /= L; oz /= L;
+      const x = mx + ox * 0.34, z = mz + oz * 0.34;
+      if (!inBand(x, z)) continue;
+      if (blocked(x, z, 0.25)) continue;            // 壁にめり込む所は避ける
+      const gy = groundAt(x, z);
+      const y = gy + 1.2 + Math.random() * 0.8;
+      if (y > b.top - 0.3) continue;                // 屋根より上には付けない
+      return { x, z, y, kind: 'wall', yaw: Math.atan2(ox, oz) };
+    }
+    if (pool === 'tree') {
+      const tr = trees[(Math.random() * trees.length) | 0];
+      const a = Math.random() * Math.PI * 2;
+      return { x: tr.x + Math.cos(a) * 0.24, z: tr.z + Math.sin(a) * 0.24,
+               y: tr.y + 0.9 + Math.random() * Math.max(0.4, tr.h - 1.2),
+               kind: 'tree', yaw: a };
+    }
+    if (pool === 'grass') {
+      const p = parks[(Math.random() * parks.length) | 0];
+      const x = p.minx + Math.random() * (p.maxx - p.minx);
+      const z = p.minz + Math.random() * (p.maxz - p.minz);
+      if (!inBand(x, z)) continue;
+      if (!pointInPts(p.pts, x, z)) continue;
+      if (blocked(x, z, 0.8)) continue;
+      return { x, z, y: groundAt(x, z) + 0.9 + Math.random() * 0.8, kind: 'grass', yaw: 0 };
+    }
+    // 水辺。水面の輪の外へ少し出た陸の上。
+    // **外向きは辺の法線から取る。** 重心から見た向きだと、漫湖のように
+    // 長く曲がった面では岸と関係ない方角を指す
+    const { w, i } = banks[(Math.random() * banks.length) | 0];
+    const m = w.ring.length;
+    const p = w.ring[i];
+    const a = w.ring[(i - 1 + m) % m], c = w.ring[(i + 1) % m];
+    let tx = c.x - a.x, tz = c.y - a.y;
+    const L = Math.hypot(tx, tz) || 1;
+    tx /= L; tz /= L;
+    const o = 1.0 + Math.random() * 2.2;
+    // 法線の左右どちらが陸かは分からないので、両方あたる
+    let x = null, z = null;
+    for (const s of Math.random() < 0.5 ? [1, -1] : [-1, 1]) {
+      const qx = p.x + tz * s * o, qz = p.y - tx * s * o;
+      if (!inBand(qx, qz)) continue;
+      if (waterAt(qx, qz) !== null) continue;       // まだ水の上。岸ではない
+      if (groundAt(qx, qz) < w.y - 0.2) continue;   // 水面より低い。岸ではない
+      if (blocked(qx, qz, 0.8)) continue;
+      x = qx; z = qz; break;
+    }
+    if (x === null) continue;
+    const gy = groundAt(x, z);
+    // 淡水か潮かは**水面レコードの種別をそのまま見る**。
+    // waterKindAt に輪の頂点を渡してはいけない。頂点は境界の上にあるので
+    // 内外判定が当てにならず、外と出れば海に落ちる。実際に龍潭(首里の
+    // 淡水池、標高92m)でオカヤドカリが湧いた。
+    // waters に入っているのは池と干潟だけで、海は入っていない
+    return { x, z, y: gy + 0.05, yaw: 0,
+             kind: w.k === 'wetland' ? 'tide' : 'bank' };
+  }
+  return null;
+}
+
+/** 点が多角形(配列の配列)の内側か。pointInRing は Vector2 用なので別に持つ。 */
+function pointInPts(pts, x, z) {
+  let s = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [ax, az] = pts[i], [bx, bz] = pts[j];
+    if ((az > z) !== (bz > z) && x < (bx - ax) * (z - az) / (bz - az) + ax) s = !s;
+  }
+  return s;
+}
+
+function spawnCreature(c) {
+  const home = pickHome();
+  if (!home) { c.alive = false; return; }
+  const list = CREATURES[home.kind];
+  const [name, note, look, mode] = list[(Math.random() * list.length) | 0];
+  if (c.g) { scene.remove(c.g); disposeTree(c.g); }
+  c.g = makeCreature(look);
+  c.name = name; c.note = note; c.look = look; c.mode = mode;
+  c.home = home; c.phase = Math.random() * Math.PI * 2; c.alive = true;
+  c.g.position.set(home.x, home.y, home.z);
+  c.g.rotation.y = home.yaw + Math.random() * 0.8;
+  scene.add(c.g);
+}
+
+for (let i = 0; i < CREA_N; i++) creatures.push({ g: null, alive: false });
+
+/** いきものを1フレーム動かし、いちばん近い1匹を記録の相手にする。 */
+function stepCreatures(dt) {
+  creaNear = null;
+  let best = CATCH_R;
+  // 湧かし直しは1フレームに3匹まで。駅から歩きだすときのように場所が
+  // 飛ぶと14匹いっぺんに湧き直して 2.3ms の山になる(pickHome が1匹0.164ms)
+  let budget = 3;
+  for (const c of creatures) {
+    if (!c.alive) {
+      if (budget <= 0) continue;
+      budget--;
+      spawnCreature(c);
+      if (!c.alive) continue;
+    }
+    const h = c.home;
+    const d = Math.hypot(h.x - player.x, h.z - player.z);
+    // 帯から外れたら別の場所へ湧かし直す(車と同じ)
+    if (d > CREA_NEAR[1] * 1.4) { c.alive = false; continue; }
+    c.phase += dt;
+    if (c.mode === 'fly') {
+      // 住みかのまわりを漂う。上下にも揺れる
+      const r = 1.1 + Math.sin(c.phase * 0.37) * 0.6;
+      const a = c.phase * 0.55;
+      c.g.position.set(h.x + Math.cos(a) * r, h.y + Math.sin(c.phase * 1.7) * 0.28,
+                       h.z + Math.sin(a) * r);
+      c.g.rotation.y = -a;
+      // 羽ばたき。付け根の Group を Z 軸で振る
+      const f = Math.sin(c.phase * 22) * 0.85;
+      for (const { w, s } of c.g.userData.wings ?? []) w.rotation.z = f * s;
+    } else {
+      // とまっているものは、たまに向きを変えるだけ
+      c.g.rotation.y = h.yaw + Math.sin(c.phase * 0.4) * 0.5;
+    }
+    if (d < best) { best = d; creaNear = c; }
+  }
+}
+
+/** いま近くにいる1匹を図鑑に載せる。 */
+function recordCreature() {
+  const c = creaNear;
+  if (!c) return;
+  const first = !seenCrea.has(c.name);
+  seenCrea.add(c.name);
+  savePurse();
+  updatePurseUI();
+  say(first ? `${c.name} を図鑑に載せた — ${c.note}` : `${c.name} を見つけた`);
+  c.alive = false;              // 逃げていく。次の場所へ湧かし直す
+  creaNear = null;
+  updateFishUI();
+}
+
 const fishEl = $('fish');
 
 function updateFishUI() {
@@ -6446,6 +6784,9 @@ function updateFishUI() {
     set('きた！', 'いま引く', '合わせる');
   } else if (fishing) {
     set('糸をたらしている', '当たりを待つ', 'やめる');
+  } else if (creaNear) {
+    // いきものは逃げるので釣りより先。名前は近づけば見えているので出す
+    set(creaNear.name, seenCrea.has(creaNear.name) ? '図鑑にある' : 'はじめて見る', '記録する');
   } else {
     const spot = castTarget();
     if (spot) set(spot.place || '水辺', '釣れます', '釣る');
@@ -6822,9 +7163,10 @@ function tick() {
     if (prev !== enterable) updateRideUI();
   }
 
-  // 釣り。castTarget は見ている向きへ 15 回ほど waterAt を撃つので、
+  // 釣りといきもの。castTarget は見ている向きへ 15 回ほど waterAt を撃つので、
   // 当たりを待っているあいだ以外は 8 フレームに1回に間引く
   stepFishing(dt);
+  if (active && !inShop) stepCreatures(dt);
   if (fishing?.phase === 'bite' || (frame & 7) === 0) updateFishUI();
 
   if (active && !riding) {
@@ -7153,8 +7495,11 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   get fishing() { return fishing; }, fishAction, stepFishing, castTarget,
   waterKindAt, landFish, stopFishing, updateFishUI, FISH,
   bag, seenFish, get coins() { return coins; }, addItem, savePurse,
-  resetPurse: () => { bag.clear(); seenFish.clear(); coins = 0;
+  resetPurse: () => { bag.clear(); seenFish.clear(); seenCrea.clear(); coins = 0;
     savePurse(); updatePurseUI(); },
+  // いきもの(検証用)。湧かし直しと記録を tick を待たずに回せる
+  creatures, seenCrea, CREATURES, stepCreatures, spawnCreature, pickHome,
+  recordCreature, makeCreature, get creaNear() { return creaNear; },
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
