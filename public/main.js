@@ -4179,6 +4179,25 @@ function applySpawn(name) {
 
 let spawned = false;
 
+/**
+ * 移った先のタイルが本当に載ってから、地表に座り直す。
+ *
+ * applySpawn の時点の groundAt は、まだ載っていないタイルを最寄りのタイルの
+ * 縁で埋めた値なので当てにならない。**syncTiles を1回待つだけでは足りない**:
+ * すでに読み込みが走っているときは `syncing` で即座に返るので、待ったつもりで
+ * 古いタイルのまま高さを決めてしまう（本番で地面より 55.8m 上に立った）。
+ * 自分の乗るタイルが tiles に入るまで見張る。
+ */
+async function seatOnSpawn() {
+  for (let i = 0; i < 80; i++) {          // 最大8秒。届かなければ諦めて座る
+    await syncTiles();
+    if (tileOf(player.x, player.z)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  player.y = supportY(player.x, player.z) + EYE;
+  player.vy = 0; player.onGround = true;
+}
+
 function start() {
   // 最初に歩きだすときだけ、選ばれた場所へ移す。
   // 一時停止からの再開で毎回飛ばされては困る
@@ -4187,13 +4206,7 @@ function start() {
     const name = $('spawn-sel')?.value ?? '';
     if (applySpawn(name)) {
       say(`${name}駅 から歩きだす`);
-      // 移った先のタイルを読みに行く。**読み終わってから座り直す**のが要点。
-      // applySpawn の時点の groundAt は、まだ載っていないタイルを最寄りの
-      // タイルの縁で埋めた値なので当てにならない(実測で地面より 6.2m 下に居た)
-      Promise.resolve(syncTiles()).then(() => {
-        player.y = supportY(player.x, player.z) + EYE;
-        player.vy = 0; player.onGround = true;
-      });
+      seatOnSpawn();
     }
   }
   started = true;
@@ -5766,7 +5779,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   rebuildDerived, dropWalkLines, addWalkLines, carLines, cars, stepCars, addCarLines,
   board, alight, get riding() { return riding; }, get transit() { return transit; },
   get cabin() { return cabin; }, buildCabin, disposeCabin, stepRide,
-  spawnPoints, applySpawn, bakeMap, buildApron, seesaaGroup,
+  spawnPoints, applySpawn, seatOnSpawn, bakeMap, buildApron, seesaaGroup,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
