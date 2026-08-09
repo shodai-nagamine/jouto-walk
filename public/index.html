@@ -171,6 +171,71 @@
   #card .credit:hover { opacity:.62; }
   #card .credit a { color:var(--paper); }
 
+  /* ---- 図鑑 ---- */
+  /* 造形は Antigravity(agy)に契約を渡して書かせたものを検分して取り込んだ。
+     開発ログ(#logview)と同じ暗幕・同じ箱にそろえてある */
+  #btn-zukan { pointer-events:auto; top:14px; right:14px; cursor:pointer;
+    font-family:inherit; color:var(--paper); font-size:12px; font-weight:700;
+    display:flex; align-items:center; gap:6px; padding:8px 12px; }
+  #btn-zukan:hover, #btn-zukan:active { background:rgba(232,100,47,.3); }
+  #btn-zukan kbd { font-size:10px; }
+
+  #zukan { display:none; position:fixed; inset:0; z-index:20; }
+  #zukan.on { display:grid; place-items:center; }
+  #zukan .zukan-backdrop { position:absolute; inset:0;
+    background:rgba(6,14,16,.86); backdrop-filter:blur(4px); }
+  #zukan .zukan-box { position:relative; background:#101f22;
+    border:1px solid rgba(246,243,234,.18); border-radius:12px;
+    width:min(92vw, 640px); max-height:min(84vh, 100%);
+    display:flex; flex-direction:column; color:var(--paper); }
+  #zukan .zukan-header { padding:16px 18px 12px;
+    border-bottom:1px solid rgba(246,243,234,.14);
+    display:flex; flex-direction:column; gap:12px; flex-shrink:0; }
+  #zukan .zukan-header-top { display:flex; justify-content:space-between; align-items:center; }
+  #zukan .zukan-title { margin:0; font-size:17px; letter-spacing:.02em; }
+  #zukan .zukan-close { background:rgba(246,243,234,.14);
+    border:1px solid rgba(246,243,234,.28); color:var(--paper); border-radius:7px;
+    width:32px; height:32px; font-size:14px; cursor:pointer; font-family:inherit; flex:none; }
+  #zukan .zukan-close:hover { background:var(--accent); color:#160c06; }
+  #zukan .zukan-progresses { display:flex; gap:16px; flex-wrap:wrap; }
+  #zukan .zukan-progress { flex:1; min-width:140px; }
+  #zukan .zukan-prog-text { font-size:12px; margin-bottom:5px; opacity:.85; }
+  #zukan .zukan-prog-bar { height:4px; background:rgba(246,243,234,.18);
+    border-radius:2px; overflow:hidden; }
+  #zukan .zukan-prog-fill { height:100%; background:var(--accent);
+    width:0%; transition:width .3s; }
+  #zukan .zukan-tabs { display:flex;
+    border-bottom:1px solid rgba(246,243,234,.14); flex-shrink:0; }
+  #zukan .zukan-tab { flex:1; padding:11px; text-align:center; background:transparent;
+    border:none; border-bottom:2px solid transparent; color:var(--paper);
+    font:inherit; font-size:13px; font-weight:700; cursor:pointer; opacity:.5; }
+  #zukan .zukan-tab.active { opacity:1; border-bottom-color:var(--accent); color:var(--accent); }
+  #zukan .zukan-content { overflow-y:auto; padding:14px 18px 18px; flex:1;
+    -webkit-overflow-scrolling:touch; }
+  #zukan .zukan-pane { display:none; flex-direction:column; gap:20px; }
+  #zukan .zukan-pane.active { display:flex; }
+  #zukan .zukan-category-title { color:var(--accent); margin:0 0 10px; font-size:13px;
+    border-bottom:1px solid rgba(232,100,47,.3); padding-bottom:5px; }
+  /* 狭い画面(375px)でも横に溢れないよう、最小幅を切って自動で列数を落とす */
+  #zukan .zukan-grid { display:grid;
+    grid-template-columns:repeat(auto-fill, minmax(148px, 1fr)); gap:8px; }
+  #zukan .zukan-card { border:1px solid rgba(246,243,234,.18); border-radius:6px;
+    padding:9px 10px; display:flex; flex-direction:column; gap:4px;
+    background:rgba(0,0,0,.2); min-width:0; }
+  /* まだ見つけていない枠は薄く点線に。あと何種いるかが見えるのが図鑑の要 */
+  #zukan .zukan-card.unknown { opacity:.4; border-style:dashed; }
+  #zukan .zukan-card-name { font-weight:700; font-size:12.5px; }
+  #zukan .zukan-card-desc { font-size:11px; opacity:.8; line-height:1.55; }
+  #zukan .zukan-card-count { font-size:11px; color:var(--accent);
+    margin-top:auto; text-align:right; font-variant-numeric:tabular-nums; }
+  @media (max-width:820px), (max-height:560px) {
+    /* コンパスと重ならないよう、ボタンはミニマップの上へ逃がす */
+    #btn-zukan { top:auto; bottom:calc(126px + env(safe-area-inset-bottom));
+      right:calc(10px + env(safe-area-inset-right)); padding:7px 10px; font-size:11px; }
+    #zukan .zukan-header { padding:13px 14px 10px; }
+    #zukan .zukan-content { padding:12px 14px 14px; }
+  }
+
   /* ---- バスの乗降・釣り ---- */
   /* 同じ形の帯。乗降(#ride)は青、釣り(#fish)は緑青。バス停の前が水辺だと
      両方いっぺんに出るので、釣りのほうを一段上に置く */
@@ -389,6 +454,9 @@
   <div id="reticle"></div>
   <div id="toast"></div>
 
+  <!-- 図鑑を開くボタン。#hud は pointer-events:none なので、押せるよう戻す -->
+  <button id="btn-zukan" class="panel">図鑑 <kbd>Z</kbd></button>
+
   <!-- バスの乗降 -->
   <div id="ride" class="panel">
     <span class="rt" id="rd-route"></span>
@@ -441,6 +509,39 @@
     <button class="tbtn" id="jump">ジャンプ</button>
     <button class="tbtn" id="down">おりる</button>
     <button class="tbtn" id="pause">⏸</button>
+  </div>
+</div>
+
+<!-- 図鑑。造形は Antigravity(agy)に契約を渡して書かせたものを検分して取り込んだ -->
+<div id="zukan">
+  <div class="zukan-backdrop"></div>
+  <div class="zukan-box">
+    <div class="zukan-header">
+      <div class="zukan-header-top">
+        <h2 class="zukan-title">記録</h2>
+        <button class="zukan-close" aria-label="閉じる">✕</button>
+      </div>
+      <div class="zukan-progresses">
+        <div class="zukan-progress">
+          <div id="zukan-prog-fish-text" class="zukan-prog-text">さかな 0 / 0 種</div>
+          <div class="zukan-prog-bar"><div id="zukan-prog-fish-fill" class="zukan-prog-fill"></div></div>
+        </div>
+        <div class="zukan-progress">
+          <div id="zukan-prog-crea-text" class="zukan-prog-text">いきもの 0 / 0 種</div>
+          <div class="zukan-prog-bar"><div id="zukan-prog-crea-fill" class="zukan-prog-fill"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="zukan-tabs">
+      <button id="zukan-tab-fish" class="zukan-tab active">さかな</button>
+      <button id="zukan-tab-crea" class="zukan-tab">いきもの</button>
+    </div>
+
+    <div class="zukan-content">
+      <div id="zukan-pane-fish" class="zukan-pane active"></div>
+      <div id="zukan-pane-crea" class="zukan-pane"></div>
+    </div>
   </div>
 </div>
 

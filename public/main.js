@@ -7771,6 +7771,131 @@ function tick() {
 }
 let elapsed = 0, frame = 0;
 
+// ---------------------------------------------------------------- 図鑑
+// 釣った魚と見つけたいきものを見返す画面。造形は Antigravity(agy)に契約を
+// 渡して書かせたものを検分して取り込んだ(シーサー・正殿・車内・重機と同じ)。
+//
+// **まだ見つけていないものも枠として並べる。** 埋まっていない枠は名前を伏せる。
+// 「あと何種いるか」が見えることが、次に歩きだす理由になる。
+//
+// 検分で直したもの3件:
+//   1. 合計を 13/15 とべた書きしていた。表を足したときに黙ってずれるので、
+//      **表から数える**。しかも魚は正しくは14種だった(オオウナギとテナガエビが
+//      池と川の両方に出るので、延べ16件・実数14種。契約に書いた13が誤り)
+//   2. Esc が図鑑を閉じると同時にポーズも開いていた。開発ログと同じく
+//      **捕捉フェーズで止める**
+//   3. 開いても歩きっぱなしになり、視点も掴まれたままでタブを押せなかった。
+//      開くときに押しているキーを捨て、ポインタの固定を解く
+const ZUKAN_FISH_CATS = {
+  water: '池・貯水池', wetland: '干潟', river: '川', sea: '海',
+};
+const ZUKAN_CREA_CATS = {
+  tree: '公園の木', grass: '公園の草地', wall: '民家の壁ぎわ',
+  bank: '淡水の岸', tide: '干潟・海辺',
+};
+
+const zukanEl = $('zukan');
+const zukanPaneFish = $('zukan-pane-fish');
+const zukanPaneCrea = $('zukan-pane-crea');
+
+/** 表に出てくる名前の実数。延べ件数ではない(同じ魚が2つの水域に出る)。 */
+const zukanTotal = (table) => {
+  const s = new Set();
+  for (const list of Object.values(table)) for (const it of list) s.add(it[0]);
+  return s.size;
+};
+
+/** 1枠ぶんの DOM。名前と説明は textContent で入れる(innerHTML に混ぜない)。 */
+function zukanCard(name, desc, seen, count) {
+  const card = document.createElement('div');
+  card.className = 'zukan-card' + (seen ? '' : ' unknown');
+  const nameEl = document.createElement('div');
+  nameEl.className = 'zukan-card-name';
+  nameEl.textContent = seen ? name : '？？？';
+  card.appendChild(nameEl);
+  if (seen) {
+    const descEl = document.createElement('div');
+    descEl.className = 'zukan-card-desc';
+    descEl.textContent = desc;
+    card.appendChild(descEl);
+    if (count > 0) {
+      const c = document.createElement('div');
+      c.className = 'zukan-card-count';
+      c.textContent = `${count} 匹`;
+      card.appendChild(c);
+    }
+  }
+  return card;
+}
+
+/** 表を1つぶん、見出しと枠の並びにして pane へ足す。 */
+function zukanSection(pane, title, items, seenSet, counts) {
+  const sec = document.createElement('div');
+  const h = document.createElement('h3');
+  h.className = 'zukan-category-title';
+  h.textContent = title;
+  sec.appendChild(h);
+  const grid = document.createElement('div');
+  grid.className = 'zukan-grid';
+  for (const [name, desc] of items) {
+    grid.appendChild(zukanCard(name, desc, seenSet.has(name),
+                               counts ? (counts.get(name) ?? 0) : 0));
+  }
+  sec.appendChild(grid);
+  pane.appendChild(sec);
+}
+
+/** 開くたびに作り直す。記録は遊んでいるあいだに増えるので。 */
+function renderZukan() {
+  const fishTotal = zukanTotal(FISH), creaTotal = zukanTotal(CREATURES);
+  const setBar = (id, label, got, total) => {
+    $(`zukan-prog-${id}-text`).textContent = `${label} ${got} / ${total} 種`;
+    $(`zukan-prog-${id}-fill`).style.width = `${total ? (got / total) * 100 : 0}%`;
+  };
+  setBar('fish', 'さかな', Math.min(seenFish.size, fishTotal), fishTotal);
+  setBar('crea', 'いきもの', Math.min(seenCrea.size, creaTotal), creaTotal);
+
+  zukanPaneFish.replaceChildren();
+  for (const [k, items] of Object.entries(FISH)) {
+    zukanSection(zukanPaneFish, ZUKAN_FISH_CATS[k] ?? k, items, seenFish, bag);
+  }
+  zukanPaneCrea.replaceChildren();
+  for (const [k, items] of Object.entries(CREATURES)) {
+    zukanSection(zukanPaneCrea, ZUKAN_CREA_CATS[k] ?? k, items, seenCrea, null);
+  }
+}
+
+function openZukan() {
+  renderZukan();
+  zukanEl.classList.add('on');
+  // 開いたまま歩き続けないように。視点の固定も解いてタブを押せるようにする
+  keys.clear();
+  stick = null; look = null; stickShow(false);
+  if (locked()) document.exitPointerLock();
+}
+const closeZukan = () => zukanEl.classList.remove('on');
+const zukanOpen = () => zukanEl.classList.contains('on');
+
+$('btn-zukan').addEventListener('click', openZukan);
+zukanEl.querySelector('.zukan-close').addEventListener('click', closeZukan);
+zukanEl.querySelector('.zukan-backdrop').addEventListener('click', closeZukan);
+{
+  const tabs = [['zukan-tab-fish', 'zukan-pane-fish'], ['zukan-tab-crea', 'zukan-pane-crea']];
+  for (const [tid] of tabs) {
+    $(tid).addEventListener('click', () => {
+      for (const [t, p] of tabs) {
+        $(t).classList.toggle('active', t === tid);
+        $(p).classList.toggle('active', t === tid);
+      }
+    });
+  }
+}
+// Esc は捕捉フェーズで止める。そうしないと図鑑を閉じると同時にポーズが開く
+addEventListener('keydown', (e) => {
+  if (e.code === 'Escape' && zukanOpen()) { e.stopPropagation(); closeZukan(); }
+  else if (e.code === 'KeyZ') { e.stopPropagation(); zukanOpen() ? closeZukan() : openZukan(); }
+}, true);
+
 // 動作確認用(コンソールから位置や視点を動かせる)
 window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scene, camera,
   // ペインが隠れていると rAF が止まり、canvas が古い絵のままになる。確認用に手で描く
@@ -7810,6 +7935,8 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   bucketTip, cabAt, nearestDump, OP_BED_FULL, OP_PAY,
   get operating() { return operating; }, get opBoard() { return opBoard; },
   get opLoad() { return opLoad; },
+  // 図鑑(検証用)
+  renderZukan, openZukan, closeZukan, zukanOpen, zukanTotal,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
