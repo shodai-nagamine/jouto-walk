@@ -409,6 +409,66 @@ def parse_footways(path, lat_c, lon_c, m_lat, m_lon, half, size):
     return out
 
 
+_ROAD_CLASS = {
+    "motorway": 0, "motorway_link": 0, "trunk": 0, "trunk_link": 0,
+    "primary": 1, "primary_link": 1, "secondary": 1, "secondary_link": 1,
+    "tertiary": 2, "tertiary_link": 2,
+    "unclassified": 3, "residential": 3,
+}
+
+
+def parse_road_lines(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=80.0):
+    """OSM の車道 way を、車を走らせるための**中心線**にする。
+
+    PLATEAU の tran は道路の「面」で中心線を持たない。バスは route リレーション
+    から経路を作っているが、それだと路線バスの通る道しか走れない。
+
+    タイルの矩形で切るが、**余白ぶん外まで残す**（`margin`）。境界ぴったりで
+    切ると、隣のタイルへ入る手前で線が終わって車が消える。歩道(footways)と違って
+    こちらは車が乗って動くので、端が繋がっていることのほうが大事。
+
+    `k` は道の格。描画の太さと車の速さに使う（0=幹線 … 3=生活道路）。
+    `ow` は一方通行（1=線形の向き、-1=逆向き、0=対面通行）。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = -margin, float(size) + margin
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        k = _ROAD_CLASS.get(t.get("highway", ""))
+        if k is None:
+            continue
+        ow = {"yes": 1, "true": 1, "1": 1, "-1": -1}.get(t.get("oneway", ""), 0)
+        pts = [
+            ((p["lon"] - lon_c) * m_lon + half, -(p["lat"] - lat_c) * m_lat + half)
+            for p in (e.get("geometry") or []) if p
+        ]
+        if len(pts) < 2:
+            continue
+        cur = []
+        for i in range(len(pts) - 1):
+            seg = clip_segment(*pts[i], *pts[i + 1], lo, hi)
+            if seg is None:
+                if len(cur) >= 2:
+                    out.append({"k": k, "ow": ow,
+                                "f": [round(v, 2) for p in cur for v in p]})
+                cur = []
+                continue
+            ax, az, bx, bz = seg
+            if not cur:
+                cur = [(ax, az)]
+            elif abs(cur[-1][0] - ax) > 0.5 or abs(cur[-1][1] - az) > 0.5:
+                if len(cur) >= 2:
+                    out.append({"k": k, "ow": ow,
+                                "f": [round(v, 2) for p in cur for v in p]})
+                cur = [(ax, az)]
+            cur.append((bx, bz))
+        if len(cur) >= 2:
+            out.append({"k": k, "ow": ow,
+                        "f": [round(v, 2) for p in cur for v in p]})
+    return out
+
+
 def parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, size, radius=32.0,
                   roads=None):
     """OSM の信号ノードを、交差点ごとにまとめて系統(青になる向き)を決める。
@@ -808,6 +868,7 @@ def main():
     ap.add_argument("--bus-routes", default="", help="バス路線 (OSM route relation JSON)")
     ap.add_argument("--signals", default="", help="信号 (OSM Overpass JSON)")
     ap.add_argument("--footways", default="", help="歩道・横断歩道・階段 (OSM Overpass JSON)")
+    ap.add_argument("--road-lines", default="", help="車道の中心線 (OSM Overpass JSON)")
     ap.add_argument("--parks", default="", help="公園・広場・グラウンド (OSM Overpass JSON)")
     ap.add_argument("--walls", default="", help="首里城の石垣 (OSM Overpass JSON)")
     ap.add_argument("--historic", default="", help="史跡・碑・墓・拝所 (OSM Overpass JSON)")
@@ -1038,6 +1099,18 @@ def main():
         print(f"  {os.path.basename(path)}: 歩行者系 {len(footways)}本 {cnt}",
               file=sys.stderr)
 
+    road_lines = []
+    if args.road_lines:
+        path = (args.road_lines if os.path.isabs(args.road_lines)
+                else os.path.join(NAHA, args.road_lines))
+        road_lines = parse_road_lines(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        cnt = {}
+        for r in road_lines:
+            cnt[r["k"]] = cnt.get(r["k"], 0) + 1
+        ow = sum(1 for r in road_lines if r["ow"])
+        print(f"  {os.path.basename(path)}: 車道の中心線 {len(road_lines)}本 "
+              f"格別{dict(sorted(cnt.items()))} / 一方通行{ow}本", file=sys.stderr)
+
     parks = []
     if args.parks:
         path = (args.parks if os.path.isabs(args.parks)
@@ -1104,6 +1177,7 @@ def main():
         "landmarks": landmarks,
         "signals": signals,
         "footways": footways,
+        "roadLines": road_lines,
         "parks": parks,
         "walls": walls,
         "castle": castle,

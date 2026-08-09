@@ -29,11 +29,17 @@ ENDPOINT = "https://overpass-api.de/api/interpreter"
 # bbox で切るので、広いぶんには害がない。
 BBOX = (26.182, 127.638, 26.246, 127.742)
 
-# 一部の抽出だけ範囲を狭める。barrier=wall を回廊全体で取ると、市中の
+# 一部の抽出だけ範囲を変える（狭めることも広げることもある）。
+# barrier=wall を回廊全体で取ると、市中の
 # ブロック塀を何千本も拾ってしまう。首里城の石垣はランドマークとして
 # 城の範囲だけを取る。
 BBOX_OVERRIDE = {
     "shurijo": (26.2130, 127.7130, 26.2230, 127.7260),
+    # 車を走らせる道は世界のすみずみまで要る（端のタイルで道が切れると、
+    # そこに居る車が行き場を失う）。上の BBOX は corridor 時代のままで、
+    # 市域ぜんぶに広げた 61 タイルの世界より南北に約 1km ずつ狭い。
+    # tiles/index.json の tx -9..1 / tz -3..5 を覆う範囲に余白を足したもの。
+    "roads": (26.170, 127.633, 26.259, 127.752),
 }
 
 # 名前は build_world.py の引数に対応する。timeout は Overpass 側の秒数。
@@ -77,6 +83,14 @@ QUERIES = {
         'node["heritage"]{bbox};',
         'way["heritage"]{bbox};',
     ], "out center tags;"),
+    # --roads。車を走らせるための**中心線**。PLATEAU の tran は道路の「面」で
+    # 中心線を持たないので、走らせるにはこちらが要る（バスは route リレーション
+    # から経路を作っていて、それだと路線バスの通る道しか走れない）。
+    # service（駐車場の通路など）は入れない。数が多いわりに車が走って面白い道でない。
+    "roads": (300, [
+        'way["highway"~"^(motorway|trunk|primary|secondary|tertiary|'
+        'unclassified|residential)(_link)?$"]{bbox};',
+    ], "out geom tags;"),
     # --parks。["name"] で絞らないのが要点(那覇の街区公園と校庭は半数以上が無名で、
     # 名前で絞ると見た目に一番効く大きなグラウンドが軒並み落ちる)
     "parks": (300, [
@@ -167,7 +181,7 @@ def main():
     for name in names:
         bb = bbox_for(name)
         if bb is not BBOX:
-            print(f"  {name} は範囲を狭める: lat {bb[0]}〜{bb[2]} / lon {bb[1]}〜{bb[3]}",
+            print(f"  {name} は範囲を変える: lat {bb[0]}〜{bb[2]} / lon {bb[1]}〜{bb[3]}",
                   file=sys.stderr)
         path = os.path.join(args.out_dir, f"naha_{name}_osm.json")
         qpath = os.path.join(args.out_dir, f"naha_{name}_osm.query.txt")

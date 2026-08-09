@@ -44,6 +44,7 @@ OSM = {
     "--osm-named": "naha_named_osm.json",
     "--bus-routes": "naha_busroutes_osm.json",
     "--signals": "naha_signals_osm.json",
+    "--road-lines": "naha_roads_osm.json",
     "--footways": "naha_footways_osm.json",
     "--parks": "naha_parks_osm.json",
     "--walls": "naha_shurijo_osm.json",

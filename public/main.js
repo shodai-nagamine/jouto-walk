@@ -3827,6 +3827,253 @@ function stepTrain(dt) {
   }
 }
 
+// ------------------------------------------------------------ 車とタクシー
+// 道路の「面」しか無かったので、これまで走っていたのは経路を持つバスと
+// モノレールだけだった。OSM の車道中心線(roadLines)を足して、一般の車を流す。
+//
+// 歩行者(walkLines/peds)とまったく同じ作りにしてある:
+//   タイルを読んだら線を足し、捨てたら外す。線に乗った者は乗り換え先を探す。
+// 違うのは、①車は交差点で信号を見る ②左側通行なので車線ぶん横にずらす
+// ③台数が多いので InstancedMesh に畳む、の3点。
+const carLines = [];                    // {pts, cum, len, k, ow, tile}
+const cars = [];
+const CAR_N = 44;                       // 同時に走らせる台数(描画は4回で済む)
+const CAR_NEAR = [40, 260];             // この距離の帯に湧かし直す(m)
+const CAR_SPD = [15.5, 11.5, 8.5, 6.0]; // 道の格ごとの速さ(m/s)
+// 中心線からの車線のずらし(m)。道の格ごとに変える。生活道路(k=3)は
+// 幅が4〜5mしかないので、幹線と同じだけずらすと路肩から出て建物にめり込む
+// (実測で44台中8台が道路面の外に居て、全部 k=3 だった)
+const LANE = [2.4, 2.0, 1.6, 1.0];
+const TAXI_RATE = 0.22;                 // タクシーの割合
+// 沖縄の街を走っている車の色。白と銀が多いので厚めに入れてある
+const CAR_COL = [0xe9e9e6, 0xdcdde0, 0xc9ccd0, 0x2f3438, 0x8f989e,
+                 0x2b4a6f, 0x7a2b2b, 0x2f5c3a];
+const TAXI_COL = [0xf2e8d8, 0xdfe9ef, 0xeae2c8];  // 沖縄のタクシーは淡い車体が多い
+
+/** タイル t の車道中心線を道路網に足す。 */
+function addCarLines(t) {
+  let n = 0;
+  for (const r of t.data.roadLines ?? []) {
+    const pts = [];
+    for (let i = 0; i < r.f.length; i += 2) {
+      pts.push({ x: t.X(r.f[i]), z: t.Z(r.f[i + 1]) });
+    }
+    if (pts.length < 2) continue;
+    const cum = [0];
+    let len = 0;
+    for (let i = 1; i < pts.length; i++) {
+      len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
+      cum.push(len);
+    }
+    // 切り出しで生じる数十cmの破片は乗り換え先としてしか意味が無い。
+    // 乗せると1フレームで通り抜けてしまうので、線としては持たない
+    if (len < 8) continue;
+    carLines.push({ pts, cum, len, k: r.k, ow: r.ow, tile: t.key });
+    n++;
+  }
+  return n;
+}
+
+function dropCarLines(key) {
+  for (let i = carLines.length - 1; i >= 0; i--) {
+    if (carLines[i].tile === key) carLines.splice(i, 1);
+  }
+  // 消えた道に乗っていた車は湧かし直させる
+  for (const c of cars) if (c.L && c.L.tile === key) c.alive = false;
+}
+
+/**
+ * 端点 p から続く道を探す。
+ *
+ * 正式なグラフは組まない。OSM の way は交差点で切れているので、
+ * **端点どうしが近いこと**がそのまま接続を表す。曲がれる先が無ければ
+ * 元の道を逆向きに返す(行き止まりでのUターン)。
+ */
+function nextCarLine(from, px, pz, R = 7) {
+  const cand = [];
+  for (const L of carLines) {
+    if (L === from) continue;
+    const a = L.pts[0], b = L.pts[L.pts.length - 1];
+    if (Math.hypot(a.x - px, a.z - pz) < R) cand.push({ L, dir: 1, d: 0 });
+    if (Math.hypot(b.x - px, b.z - pz) < R) cand.push({ L, dir: -1, d: L.len });
+  }
+  // 一方通行は入れる向きだけ通す
+  const ok = cand.filter((c) => !c.L.ow || c.L.ow === c.dir);
+  if (!ok.length) return null;
+  return ok[(Math.random() * ok.length) | 0];
+}
+
+/** 端点の近くに信号があれば、その交差点と系統を返す。 */
+function signalAt(px, pz, yaw, R = 15) {
+  let best = null, bd = R;
+  for (const s of signals) {
+    if (s.k !== 'car') continue;
+    const d = Math.hypot(s.x - px, s.z - pz);
+    if (d < bd) { bd = d; best = s; }
+  }
+  if (!best) return null;
+  // 東西に進むなら axis 0、南北なら axis 1（バスの停止線と同じ決め方）
+  const axis = Math.abs(Math.sin(yaw)) >= Math.abs(Math.cos(yaw)) ? 0 : 1;
+  return { g: best.g, axis };
+}
+
+function spawnCar(c, force = false) {
+  if (!carLines.length) { c.alive = false; return; }
+  for (let tries = 0; tries < 24; tries++) {
+    const L = carLines[(Math.random() * carLines.length) | 0];
+    const d = Math.random() * L.len;
+    // force のときは player を見ない。この関数は初期化ブロックからも呼ばれ、
+    // player はこの下で宣言されるので、触ると TDZ で落ちる
+    if (!force) {
+      const q = walkAt(L, d);
+      const dist = Math.hypot(q.x - player.x, q.z - player.z);
+      if (dist < CAR_NEAR[0] || dist > CAR_NEAR[1]) continue;
+    }
+    c.L = L; c.d = d;
+    c.dir = L.ow ? L.ow : (Math.random() < 0.5 ? 1 : -1);
+    c.wait = 0; c.sig = null; c.alive = true;
+    return;
+  }
+  c.alive = false;
+}
+
+let carBody = null, carRoof = null, carWheel = null, carLamp = null;
+
+{
+  for (const t of tiles.values()) addCarLines(t);
+
+  // 車体・屋根・タイヤ・行灯の4つに畳む。台数を増やしても描画は4回のまま。
+  // バスのように1台ずつ Group にすると、44台で 300 回を超える
+  const bodyGeo = new THREE.BoxGeometry(1.72, 0.62, 4.15);
+  const roofGeo = new THREE.BoxGeometry(1.56, 0.56, 2.25);
+  const wheelGeo = new THREE.CylinderGeometry(0.31, 0.31, 0.2, 8);
+  wheelGeo.rotateZ(Math.PI / 2);
+  const lampGeo = new THREE.BoxGeometry(0.5, 0.17, 0.24);
+  const cmat = () => new THREE.MeshLambertMaterial({ vertexColors: false });
+  carBody = new THREE.InstancedMesh(bodyGeo, cmat(), CAR_N);
+  carRoof = new THREE.InstancedMesh(roofGeo, cmat(), CAR_N);
+  carWheel = new THREE.InstancedMesh(wheelGeo, cmat(), CAR_N * 4);
+  carLamp = new THREE.InstancedMesh(lampGeo, cmat(), CAR_N);
+  for (const [im, n] of [[carBody, CAR_N], [carRoof, CAR_N],
+                         [carWheel, CAR_N * 4], [carLamp, CAR_N]]) {
+    im.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(n * 3), 3);
+    im.castShadow = true;
+    im.frustumCulled = false;           // 毎フレーム行列を書き換えるので境界球が当てにならない
+    scene.add(im);
+  }
+  const col = new THREE.Color();
+  for (let i = 0; i < CAR_N; i++) {
+    const taxi = Math.random() < TAXI_RATE;
+    const c = {
+      L: null, d: 0, dir: 1, wait: 0, sig: null, alive: false,
+      taxi, spd: 0,
+      col: taxi ? TAXI_COL[(Math.random() * TAXI_COL.length) | 0]
+                : CAR_COL[(Math.random() * CAR_COL.length) | 0],
+    };
+    cars.push(c);
+    spawnCar(c, true);
+    col.setHex(c.col);
+    carBody.setColorAt(i, col);
+    // 屋根は車体より少し暗くする(窓の帯に見える)
+    carRoof.setColorAt(i, col.clone().multiplyScalar(0.62));
+    col.setHex(0x22262a);
+    for (let w = 0; w < 4; w++) carWheel.setColorAt(i * 4 + w, col);
+    // 行灯。タクシーでない車は下の stepCars で潰して消す
+    col.setHex(0xf6e7b0);
+    carLamp.setColorAt(i, col);
+  }
+  for (const im of [carBody, carRoof, carWheel, carLamp]) im.instanceColor.needsUpdate = true;
+}
+
+const CAR_M = new THREE.Matrix4(), CAR_Q = new THREE.Quaternion();
+const CAR_P = new THREE.Vector3(), CAR_S = new THREE.Vector3();
+const CAR_E = new THREE.Euler();
+const CAR_HIDE = new THREE.Vector3(0.0001, 0.0001, 0.0001);
+
+/** 車を1フレーム進める。 */
+function stepCars(dt, now) {
+  if (!carLines.length) return;
+  for (let i = 0; i < cars.length; i++) {
+    const c = cars[i];
+    if (!c.alive) { spawnCar(c); }
+    if (!c.alive || !c.L) { hideCar(i); continue; }
+
+    const L = c.L;
+    c.spd = CAR_SPD[L.k] ?? 6.0;
+
+    // 信号待ち。交差点は道の端にあるので、端に着いたところで見る
+    if (c.sig) {
+      if (sigPhase(c.sig.g, c.sig.axis, now) === 'g') c.sig = null;
+    } else {
+      c.d += c.spd * dt * c.dir;
+      if (c.d <= 0 || c.d >= L.len) {
+        const end = c.dir > 0 ? L.pts[L.pts.length - 1] : L.pts[0];
+        const q0 = walkAt(L, c.dir > 0 ? L.len : 0);
+        const sg = signalAt(end.x, end.z, q0.yaw);
+        if (sg && sigPhase(sg.g, sg.axis, now) !== 'g') {
+          // 停止線で待つ。線の端に張り付ける
+          c.d = c.dir > 0 ? L.len : 0;
+          c.sig = sg;
+        } else {
+          const nx = nextCarLine(L, end.x, end.z);
+          if (nx) { c.L = nx.L; c.d = nx.d; c.dir = nx.dir; }
+          else { c.dir = -c.dir; c.d = Math.max(0, Math.min(L.len, c.d)); }
+        }
+      }
+    }
+
+    const q = walkAt(c.L, c.d);
+    const yaw = q.yaw + (c.dir < 0 ? Math.PI : 0);
+    // 左側通行。進行方向の左へ車線ぶんずらす
+    const lane = LANE[c.L.k] ?? 1.2;
+    const ox = Math.cos(yaw) * -lane, oz = Math.sin(yaw) * lane;
+    const x = q.x + ox, z = q.z + oz;
+    const gy = groundAt(x, z);
+
+    // 遠い車は描かない(位置は進め続ける。戻ってきたときに街が止まって見えない)
+    const dist = Math.hypot(x - player.x, z - player.z);
+    if (dist > CAR_NEAR[1] + 120) { c.alive = false; hideCar(i); continue; }
+    if (dist > 190) { hideCar(i); continue; }
+
+    CAR_E.set(0, yaw, 0); CAR_Q.setFromEuler(CAR_E);
+    CAR_S.set(1, 1, 1);
+    CAR_P.set(x, gy + 0.62, z);
+    CAR_M.compose(CAR_P, CAR_Q, CAR_S); carBody.setMatrixAt(i, CAR_M);
+    CAR_P.set(x, gy + 1.18, z - 0);
+    CAR_M.compose(CAR_P, CAR_Q, CAR_S); carRoof.setMatrixAt(i, CAR_M);
+    // 行灯はタクシーだけ。他は潰して消す
+    if (c.taxi) {
+      CAR_P.set(x, gy + 1.52, z);
+      CAR_M.compose(CAR_P, CAR_Q, CAR_S);
+    } else {
+      CAR_M.compose(CAR_P.set(x, gy, z), CAR_Q, CAR_HIDE);
+    }
+    carLamp.setMatrixAt(i, CAR_M);
+
+    const fx = Math.sin(yaw), fz = Math.cos(yaw);
+    const rx = Math.cos(yaw), rz = -Math.sin(yaw);
+    let w = 0;
+    for (const [fwd, side] of [[1.3, 0.82], [1.3, -0.82], [-1.3, 0.82], [-1.3, -0.82]]) {
+      CAR_P.set(x + fx * fwd + rx * side, gy + 0.31, z + fz * fwd + rz * side);
+      CAR_M.compose(CAR_P, CAR_Q, CAR_S);
+      carWheel.setMatrixAt(i * 4 + w++, CAR_M);
+    }
+  }
+  carBody.instanceMatrix.needsUpdate = true;
+  carRoof.instanceMatrix.needsUpdate = true;
+  carWheel.instanceMatrix.needsUpdate = true;
+  carLamp.instanceMatrix.needsUpdate = true;
+}
+
+function hideCar(i) {
+  CAR_Q.identity(); CAR_P.set(0, -9999, 0);
+  CAR_M.compose(CAR_P, CAR_Q, CAR_HIDE);
+  carBody.setMatrixAt(i, CAR_M);
+  carRoof.setMatrixAt(i, CAR_M);
+  carLamp.setMatrixAt(i, CAR_M);
+  for (let w = 0; w < 4; w++) carWheel.setMatrixAt(i * 4 + w, CAR_M);
+}
+
 // ---------------------------------------------------------------- 操作
 const player = {
   x: 0, z: 0, y: 0, vy: 0, yaw: Math.PI * 0.15, pitch: 0.10, onGround: true,
@@ -4300,6 +4547,7 @@ function dropTile(t) {
     if (signals[i].tile === t.key) signals.splice(i, 1);
   }
   dropWalkLines(t.key);
+  dropCarLines(t.key);
   dropHistoric(t.key);
   // 焼きかけのテクスチャは捨てる(戻ってきたら最初から焼き直す)
   for (let i = bakes.length - 1; i >= 0; i--) if (bakes[i].tile === t.key) bakes.splice(i, 1);
@@ -4345,6 +4593,7 @@ async function syncTiles() {
       buildTileCore(t);
       buildTileProps(t);
       addWalkLines(t);
+      addCarLines(t);
     }
     for (const t of drop) dropTile(t);
     rebuildDerived();
@@ -4807,6 +5056,7 @@ function tick() {
   sun.target.updateMatrixWorld();
 
   stepTrain(dt);
+  stepCars(dt, sigT);
 
   // タイルの足し引き。毎フレームやる必要は無い(歩き 4.6m/s なので
   // 30フレーム=0.5秒で 2.3m しか進まない)し、fetch が絡むので間引く
@@ -4995,7 +5245,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   WORLD_TILES, WORLD_B, tileDist, syncTiles, dropTile,
   tileRange: () => ({ load: TILE_LOAD, drop: TILE_DROP }),
   setTileRange: (load, drop) => { TILE_LOAD = load; TILE_DROP = drop; },
-  rebuildDerived, dropWalkLines, addWalkLines, bakeMap, buildApron, seesaaGroup,
+  rebuildDerived, dropWalkLines, addWalkLines, carLines, cars, stepCars, addCarLines, bakeMap, buildApron, seesaaGroup,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
