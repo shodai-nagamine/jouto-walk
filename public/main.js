@@ -3421,6 +3421,9 @@ const SIG_CYCLE = (SIG_GREEN + SIG_YELLOW + SIG_RED_GAP) * 2;
 const signals = [];                        // 全タイル分。座標はワールド系
 let sigGidBase = 0;
 
+const SIG_UP = new THREE.Vector3();      // 腕木を倒すときの使い回し
+const SIG_DIR = new THREE.Vector3();
+
 const OFF = { r: 0x3a1416, y: 0x3a3216, g: 0x14321f };
 const ON = { r: 0xff3b30, y: 0xffcc00, g: 0x2fd158 };
 
@@ -3437,6 +3440,10 @@ function addSignals(t) {
     new THREE.CylinderGeometry(0.075, 0.1, 1, 6), poleMat, list.length);
   const cases = new THREE.InstancedMesh(
     new THREE.BoxGeometry(1, 1, 0.22), caseMat, list.length);
+  // 車両用は柱を歩道の縁に立て、灯器だけ車道の上へアームで出す。
+  // 腕木の無い基数ぶんは長さ0で潰す(数が変わらないほうが添字が単純)
+  const arms = new THREE.InstancedMesh(
+    new THREE.CylinderGeometry(0.055, 0.055, 1, 5), poleMat, list.length);
   // 灯火は1基3つ(歩行者用は上2つだけ使う)
   const lamps = new THREE.InstancedMesh(
     new THREE.CircleGeometry(0.15, 12),
@@ -3453,15 +3460,34 @@ function addSignals(t) {
     const g = groundAt(x, z);
     const car = s.k === 'car';
     const h = car ? 5.0 : 3.1;            // 車両用は高く、歩行者用は低く
+    // 柱は歩道の縁(x,z)。灯器は ax/az があれば車道の上へ張り出す
+    const armX = s.ax ?? 0, armZ = s.az ?? 0;
+    const armL = Math.hypot(armX, armZ);
+    const hx = x + armX, hz = z + armZ;   // 灯器の位置
+    const hy = g + h - 0.35;
+
     // 支柱
     e.set(0, 0, 0); q.setFromEuler(e);
     pos.set(x, g + h / 2, z); scl.set(1, h, 1);
     m.compose(pos, q, scl); poles.setMatrixAt(i, m);
 
+    // 腕木。円柱は Y 方向なので、腕木の向きへ倒す。
+    // Euler で組むと軸の順序を取り違えやすいので、向きを直接与える
+    // (`setFromEuler` の第2引数は order ではなく update フラグ。ここで一度踏んだ)
+    if (armL > 0.5) {
+      SIG_UP.set(0, 1, 0); SIG_DIR.set(armX / armL, 0, armZ / armL);
+      q.setFromUnitVectors(SIG_UP, SIG_DIR);
+      pos.set(x + armX / 2, hy + 0.28, z + armZ / 2); scl.set(1, armL, 1);
+    } else {
+      // 腕木の無い基。長さ0に潰して消す
+      q.identity(); pos.set(x, hy, z); scl.set(0.001, 0.001, 0.001);
+    }
+    m.compose(pos, q, scl); arms.setMatrixAt(i, m);
+
     // 灯器(交差点の中心を向く)
     e.set(0, s.r, 0); q.setFromEuler(e);
     const cw = car ? 1.15 : 0.5, ch = car ? 0.42 : 0.78;
-    pos.set(x, g + h - 0.35, z); scl.set(cw, ch, 1);
+    pos.set(hx, hy, hz); scl.set(cw, ch, 1);
     m.compose(pos, q, scl); cases.setMatrixAt(i, m);
 
     // 灯火を灯器の前面に並べる(車両用は横3つ、歩行者用は縦2つ)
@@ -3469,9 +3495,9 @@ function addSignals(t) {
     for (let k = 0; k < 3; k++) {
       let ox = 0, oy = 0;
       if (car) ox = (k - 1) * 0.34; else oy = k === 2 ? 0 : (k === 0 ? 0.19 : -0.19);
-      const lx = x + Math.cos(s.r) * ox + fx;
-      const lz = z - Math.sin(s.r) * ox + fz;
-      pos.set(lx, g + h - 0.35 + oy, lz);
+      const lx = hx + Math.cos(s.r) * ox + fx;
+      const lz = hz - Math.sin(s.r) * ox + fz;
+      pos.set(lx, hy + oy, lz);
       scl.set(car ? 1 : (k === 2 ? 0.001 : 1), 1, 1);   // 歩行者用は3つ目を消す
       m.compose(pos, q, scl);
       lamps.setMatrixAt(i * 3 + k, m);
@@ -3482,9 +3508,10 @@ function addSignals(t) {
   });
   poles.instanceMatrix.needsUpdate = true;
   cases.instanceMatrix.needsUpdate = true;
+  arms.instanceMatrix.needsUpdate = true;
   lamps.instanceMatrix.needsUpdate = true;
-  poles.castShadow = cases.castShadow = true;
-  t.group.add(poles, cases, lamps);
+  poles.castShadow = cases.castShadow = arms.castShadow = true;
+  t.group.add(poles, cases, arms, lamps);
   console.log(`[${t.key}] 信号 ${list.length}基 / ` +
     `交差点 ${new Set(list.map((s) => s.g)).size}箇所`);
 }

@@ -64,6 +64,92 @@ def simplify(pts, tol=0.35):
     return out if len(out) >= 3 else pts
 
 
+ARM_MAX = 6.0      # 車両用信号のアームの長さの上限(m)
+
+
+def point_in_ring(px, pz, f):
+    """f = [x0,z0,x1,z1,...] の輪の内側か（交差数判定）。"""
+    n = len(f) // 2
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, zi = f[2 * i], f[2 * i + 1]
+        xj, zj = f[2 * j], f[2 * j + 1]
+        if (zi > pz) != (zj > pz) and px < (xj - xi) * (pz - zi) / (zj - zi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def nearest_on_ring(px, pz, f):
+    """輪の周上でいちばん近い点と、そこまでの距離を返す。"""
+    n = len(f) // 2
+    best = (float("inf"), px, pz)
+    j = n - 1
+    for i in range(n):
+        ax, az = f[2 * j], f[2 * j + 1]
+        bx, bz = f[2 * i], f[2 * i + 1]
+        dx, dz = bx - ax, bz - az
+        L2 = dx * dx + dz * dz
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((px - ax) * dx + (pz - az) * dz) / L2))
+        qx, qz = ax + t * dx, az + t * dz
+        d = math.hypot(px - qx, pz - qz)
+        if d < best[0]:
+            best = (d, qx, qz)
+        j = i
+    return best
+
+
+def push_out_of_roads(px, pz, roads, margin=0.9, limit=16.0):
+    """道路面の内側にある点を、車道の外でいちばん近い所へ逃がす。
+
+    OSM の traffic_signals は **道路の way 上のノード**（＝中心線上）なので、
+    そのまま立てると信号柱が車道のど真ん中に生える。PLATEAU tran の道路面が
+    同じ世界に入っているので、面の外＝歩道側の縁へ出す。
+
+    **「今いる面のいちばん近い縁」へ出すのでは足りない。** 交差点では道路面が
+    複数に割れていて隣どうしが辺を共有しているので、面Aの縁へ出した先が面Bの
+    中になる（実測で 657基中 384基が出られなかった）。ここでは近傍の面の
+    **辺をぜんぶ候補に取り、どの面の内側でもない点のうち最短のもの**を選ぶ。
+    合併図形の外周までの最短距離を直接求めることになる。
+
+    `limit` より遠いところしか空いていなければ動かさない。広場の真ん中などで
+    十数メートル飛ばすくらいなら、元の位置のほうがまだ読める。
+    """
+    if not any(point_in_ring(px, pz, r["f"]) for r in roads):
+        return px, pz, False
+
+    best = None
+    for r in roads:
+        f = r["f"]
+        n = len(f) // 2
+        j = n - 1
+        for i in range(n):
+            ax, az = f[2 * j], f[2 * j + 1]
+            bx, bz = f[2 * i], f[2 * i + 1]
+            j = i
+            dx, dz = bx - ax, bz - az
+            L2 = dx * dx + dz * dz
+            if L2 == 0:
+                continue
+            t = max(0.0, min(1.0, ((px - ax) * dx + (pz - az) * dz) / L2))
+            qx, qz = ax + t * dx, az + t * dz
+            # 辺の法線の両側を試す。どちらが外かは形しだいなので決め打ちしない
+            nx_, nz_ = -dz / math.sqrt(L2), dx / math.sqrt(L2)
+            for sgn in (1.0, -1.0):
+                cx = qx + nx_ * margin * sgn
+                cz = qz + nz_ * margin * sgn
+                d = math.hypot(cx - px, cz - pz)
+                if d > limit or (best is not None and d >= best[0]):
+                    continue
+                if any(point_in_ring(cx, cz, rr["f"]) for rr in roads):
+                    continue
+                best = (d, cx, cz)
+    if best is None:
+        return px, pz, False
+    return best[1], best[2], True
+
+
 def parse_roads(gml_path):
     """交通(tran)モデルから道路の面ポリゴンを取り出す。
 
@@ -323,7 +409,8 @@ def parse_footways(path, lat_c, lon_c, m_lat, m_lon, half, size):
     return out
 
 
-def parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, size, radius=32.0):
+def parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, size, radius=32.0,
+                  roads=None):
     """OSM の信号ノードを、交差点ごとにまとめて系統(青になる向き)を決める。
 
     1つの交差点に複数のノードがあるので、近いものを1つの交差点として束ね、
@@ -368,19 +455,62 @@ def parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, size, radius=32.0):
     for i in range(n):
         groups.setdefault(find(i), []).append(i)
 
+    # 道路面を渡されていれば、車道に生えた柱を縁へ逃がす。
+    # 灯器は車道の上に残したいので、**元の位置を ax/az に控えて**おき、
+    # 描画側でそこへアームを伸ばす（日本の車両用信号のアーム式にあたる）。
+    prep = []
+    if roads:
+        # 総当たりだと重いので、信号の周りにある面だけ見る
+        bb = []
+        for r in roads:
+            f = r["f"]
+            xs = f[0::2]
+            zs = f[1::2]
+            bb.append((min(xs), max(xs), min(zs), max(zs), r))
+    for p in pts:
+        nx, nz, moved = p["x"], p["z"], False
+        if roads:
+            # 押し出し先は最大 limit(16m) 離れる。その候補が別の面の中かを
+            # 判定できないと素通りするので、絞り込みは limit より広く取る
+            near = [r for (x0, x1, z0, z1, r) in bb
+                    if x0 - 20 <= p["x"] <= x1 + 20 and z0 - 20 <= p["z"] <= z1 + 20]
+            if near:
+                nx, nz, moved = push_out_of_roads(p["x"], p["z"], near)
+        prep.append((nx, nz, moved))
+
     out = []
+    n_moved = 0
     for gi, (root, members) in enumerate(sorted(groups.items())):
         cx = sum(pts[i]["x"] for i in members) / len(members)
         cz = sum(pts[i]["z"] for i in members) / len(members)
         for i in members:
+            # 系統と向きは **元のノード位置** で決める。柱を縁へ出したあとの
+            # 座標で決めると、押し出した向きしだいで東西/南北が入れ替わる
             dx, dz = pts[i]["x"] - cx, pts[i]["z"] - cz
             axis = 0 if abs(dx) >= abs(dz) else 1
-            out.append({
-                "x": round(pts[i]["x"], 2), "z": round(pts[i]["z"], 2),
+            nx, nz, moved = prep[i]
+            rec = {
+                "x": round(nx, 2), "z": round(nz, 2),
                 "k": pts[i]["kind"], "g": gi, "a": axis,
                 # 交差点中心を向く角度(灯器の正面を車の来る側へ向ける)
                 "r": round(math.atan2(-dx, -dz), 3),
-            })
+            }
+            # 車両用だけアームを伸ばす。歩行者用は縁の柱に直付けでよい。
+            # 長さは押し出した距離そのままではなく ARM_MAX で頭打ちにする
+            # （広い交差点だと 15m 超のアームになり、腕木というより橋になる）
+            if moved and pts[i]["kind"] == "car":
+                vx, vz = pts[i]["x"] - nx, pts[i]["z"] - nz
+                L = math.hypot(vx, vz)
+                if L > 0.5:
+                    k = min(L, ARM_MAX) / L
+                    rec["ax"] = round(vx * k, 2)
+                    rec["az"] = round(vz * k, 2)
+            if moved:
+                n_moved += 1
+            out.append(rec)
+    if roads:
+        print(f"    信号の押し出し: {n_moved}/{len(pts)}基を道路面の外へ",
+              file=sys.stderr)
     return out
 
 
@@ -889,7 +1019,9 @@ def main():
     if args.signals:
         path = (args.signals if os.path.isabs(args.signals)
                 else os.path.join(NAHA, args.signals))
-        signals = parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, args.size)
+        # roads は上で組み終わっている。渡すと車道の中の柱を縁へ逃がす
+        signals = parse_signals(path, lat_c, lon_c, m_lat, m_lon, half, args.size,
+                                roads=roads)
         ng = len({s["g"] for s in signals})
         ncar = sum(1 for s in signals if s["k"] == "car")
         print(f"  {os.path.basename(path)}: 信号 {len(signals)}基 "
