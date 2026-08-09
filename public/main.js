@@ -970,6 +970,80 @@ function addTerrain(t) {
 // 外周に沿って高さを拾えば、どこに立っても頭上に板が来ない。
 // タイルを足し引きすると縁が動くので、そのつど張り直す。
 let skirt = null;
+const SEA = 0.0;               // 海面の高さ(m)
+const SEA_COL = 0x27606e;
+
+// 海岸線。OSM の natural=coastline は「**進行方向の左が陸・右が海**」という
+// 約束の線で、面ではない。海と陸の別は地形からは出せない
+// (世界の外周は 80% が標高 0〜12m で、受け皿が 12m 下がると内陸まで海になる)。
+// この向きを使って点がどちら側かを見る。
+const coast = await fetch('./data/coast.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .catch(() => null);
+
+// 線分を升目に配って、最寄りを総当たりしないで済むようにする
+const COAST_CELL = 400;
+const cmap = new Map();
+if (coast) {
+  for (const f of coast.lines) {
+    for (let i = 0; i + 3 < f.length; i += 2) {
+      const seg = [f[i], f[i + 1], f[i + 2], f[i + 3]];
+      const gx0 = Math.floor(Math.min(seg[0], seg[2]) / COAST_CELL);
+      const gx1 = Math.floor(Math.max(seg[0], seg[2]) / COAST_CELL);
+      const gz0 = Math.floor(Math.min(seg[1], seg[3]) / COAST_CELL);
+      const gz1 = Math.floor(Math.max(seg[1], seg[3]) / COAST_CELL);
+      for (let gx = gx0; gx <= gx1; gx++) {
+        for (let gz = gz0; gz <= gz1; gz++) {
+          const k = `${gx},${gz}`;
+          (cmap.get(k) ?? cmap.set(k, []).get(k)).push(seg);
+        }
+      }
+    }
+  }
+  console.log(`海岸線 ${coast.lines.length}本 / 升目 ${cmap.size}`);
+}
+
+/**
+ * (x,z) が海の側か。
+ *
+ * いちばん近い海岸線の線分を見つけ、その**右側**なら海。
+ * 升目を1つずつ外へ広げながら探し、見つかった半径の外は見ない
+ * (近い線分が別の升目にあることがあるので、1周ぶん余分に見る)。
+ */
+function isSea(x, z) {
+  if (!cmap.size) return false;
+  const cx = Math.floor(x / COAST_CELL), cz = Math.floor(z / COAST_CELL);
+  let best = Infinity, side = 0;
+  for (let r = 0; r <= 8; r++) {
+    for (let gx = cx - r; gx <= cx + r; gx++) {
+      for (let gz = cz - r; gz <= cz + r; gz++) {
+        // 外周だけ見る(内側は前の周で見た)
+        if (r > 0 && Math.abs(gx - cx) !== r && Math.abs(gz - cz) !== r) continue;
+        const segs = cmap.get(`${gx},${gz}`);
+        if (!segs) continue;
+        for (const [ax, az, bx, bz] of segs) {
+          const dx = bx - ax, dz = bz - az;
+          const L2 = dx * dx + dz * dz || 1;
+          const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / L2));
+          const qx = ax + t * dx, qz = az + t * dz;
+          const d = (x - qx) * (x - qx) + (z - qz) * (z - qz);
+          if (d < best) {
+            best = d;
+            // 外積の符号で左右を見る。OSM は「進行方向の左が陸」だが、
+            // この世界は z が南向きで OSM(北が正)と手系が逆なので左右が入れ替わる。
+            // 実測でも陸側が一貫して負、沖が正だった(城東小 -398691 / 西の沖 +553024)
+            side = dx * (z - az) - dz * (x - ax);
+          }
+        }
+      }
+    }
+    // 1周ぶん余裕を見てから打ち切る
+    if (best < Infinity && r > Math.sqrt(best) / COAST_CELL + 1) break;
+  }
+  return best < Infinity && side > 0;
+}
+
+
 function buildApron() {
   if (skirt) {
     scene.remove(skirt);
@@ -1009,10 +1083,17 @@ function buildApron() {
     const pi = ring[i], pj = ring[j];
     const yi = groundAt(pi[0], pi[1]), yj = groundAt(pj[0], pj[1]);
     const oi = outAt(i), oj = outAt(j);
-    // 外側はゆるく下げる。真っ平らだと地形との継ぎ目が板に見える
+    // 外側はゆるく下げる。真っ平らだと地形との継ぎ目が板に見える。
+    // ただし**海側だけ**海面より下げる。世界の外周は 80% が標高 0〜12m
+    // なので、一律に 12m 下げると内陸側まで海面に浸かる(実測)。
+    // 海か陸かは海岸線の向き(左が陸)で決める
+    const si = isSea(pi[0] + oi[0] * OUT, pi[1] + oi[1] * OUT);
+    const sj = isSea(pj[0] + oj[0] * OUT, pj[1] + oj[1] * OUT);
+    const outY = (y, sea) => (sea ? Math.min(SEA - 6, y - 12)
+                                  : Math.max(SEA + 1.5, y - 12));
     quad([pi[0], yi, pi[1]], [pj[0], yj, pj[1]],
-         [pj[0] + oj[0] * OUT, yj - 12, pj[1] + oj[1] * OUT],
-         [pi[0] + oi[0] * OUT, yi - 12, pi[1] + oi[1] * OUT]);
+         [pj[0] + oj[0] * OUT, outY(yj, sj), pj[1] + oj[1] * OUT],
+         [pi[0] + oi[0] * OUT, outY(yi, si), pi[1] + oi[1] * OUT]);
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
@@ -3827,6 +3908,255 @@ function stepTrain(dt) {
   }
 }
 
+// ---------------------------------------------------------------- 水面
+// 那覇は水の街なのに、これまで水が1つも無かった。奥武山まわりの地形は
+// 標高 -0.1m まで下がっていて 21% のセルが 0.2m 以下＝水が来るべき低地が
+// 正しく凹んでいるのに、そこが乾いた土のまま広がっていた。
+//
+// **水位は池ごとに1つ**（tools/build_water_levels.py が世界ぜんぶの DEM から
+// 決めた対応表を引く）。漫湖は 0.0m、龍潭は首里の高台で 92.0m。世界に1枚
+// 平面を張って済ませることはできない。
+const WATER_COL = { water: 0x2d6b78, wetland: 0x3f6b58 };
+// 川。**タイルに分けない。** 水面の高さが川筋に沿って変わるので、タイルごとに
+// 決めると継ぎ目で段差になる(池で実際に踏んだ)。世界ぜんぶを1本の折れ線として
+// 持ち、点ごとに高さを持たせて幅で膨らませたリボンにする。
+const riverData = await fetch('./data/rivers.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .catch(() => null);
+
+const RIVER_CELL = 120;
+const rmapW = new Map();          // 川の線分の升目。泳ぎの判定に使う
+let riverMesh = null;
+
+function buildRivers() {
+  if (!riverData) return;
+  const V = [];
+  for (const r of riverData.rivers) {
+    const f = r.f, n = f.length / 3, hw = r.w / 2;
+    if (n < 2) continue;
+    // 各点の法線は前後の向きの平均。曲がり角で幅が痩せない
+    const nx = new Float32Array(n), nz = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+      const dx = f[b * 3] - f[a * 3], dz = f[b * 3 + 1] - f[a * 3 + 1];
+      const L = Math.hypot(dx, dz) || 1;
+      nx[i] = -dz / L; nz[i] = dx / L;
+    }
+    for (let i = 0; i < n - 1; i++) {
+      const x0 = f[i * 3], z0 = f[i * 3 + 1], y0 = f[i * 3 + 2];
+      const x1 = f[(i + 1) * 3], z1 = f[(i + 1) * 3 + 1], y1 = f[(i + 1) * 3 + 2];
+      const ax = x0 + nx[i] * hw, az = z0 + nz[i] * hw;
+      const bx = x0 - nx[i] * hw, bz = z0 - nz[i] * hw;
+      const cx = x1 + nx[i + 1] * hw, cz = z1 + nz[i + 1] * hw;
+      const dx2 = x1 - nx[i + 1] * hw, dz2 = z1 - nz[i + 1] * hw;
+      // 上から見る向き
+      V.push(ax, y0, az, cx, y1, cz, bx, y0, bz);
+      V.push(bx, y0, bz, cx, y1, cz, dx2, y1, dz2);
+
+      // 判定用に線分を升目へ配る
+      const seg = { x0, z0, y0, x1, z1, y1, hw };
+      const g0 = Math.floor(Math.min(x0, x1) / RIVER_CELL);
+      const g1 = Math.floor(Math.max(x0, x1) / RIVER_CELL);
+      const h0 = Math.floor(Math.min(z0, z1) / RIVER_CELL);
+      const h1 = Math.floor(Math.max(z0, z1) / RIVER_CELL);
+      for (let gx = g0; gx <= g1; gx++) {
+        for (let gz = h0; gz <= h1; gz++) {
+          const k = `${gx},${gz}`;
+          (rmapW.get(k) ?? rmapW.set(k, []).get(k)).push(seg);
+        }
+      }
+    }
+  }
+  if (!V.length) return;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+  geo.computeVertexNormals();
+  riverMesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+    color: WATER_COL.water,
+  }));
+  addWave(riverMesh.material, 1.9);
+  riverMesh.renderOrder = 1;
+  scene.add(riverMesh);
+  console.log(`川 ${riverData.rivers.length}本 / 三角形 ${V.length / 9}`);
+}
+
+// 水の中に居るときの見え方。フォグを水の色にして一気に近づける。
+// 空ドームは depthWrite:false で常に描かれるので、水中では隠す
+// (隠さないと、水面より下に居るのに空が見えてしまう)。
+const AIR_FOG = { color: SKY_BOT.getHex(), near: 260, far: 1250 };
+const WET_FOG = { color: 0x14434f, near: 0.6, far: 34 };
+let wasUnder = false;
+
+/**
+ * 目が水面より下かどうかで、フォグと空を切り替える。
+ *
+ * **足元ではなく目で判定する。** 泳ぎ(inWater)は足元が水面より下なら真に
+ * なるので、それで切り替えると立ち泳ぎで顔が出ているのに水中の絵になる。
+ */
+// 水面のゆらぎ。頂点を動かすと当たり判定と食い違うので、**色だけ**を揺らす。
+// 実測で水面は 78面＋川193本＝マテリアルは数個しかないので、
+// 毎フレーム色を書き換えても描画の回数は増えない。
+const WAVE = [];                  // 揺らすマテリアル {mat, base, phase}
+let waveT = 0;
+
+function addWave(mat, phase) {
+  WAVE.push({ mat, base: mat.color.clone(), phase });
+}
+
+function stepWaves(dt) {
+  if (!WAVE.length) return;
+  waveT += dt;
+  for (const w of WAVE) {
+    // ゆっくり明暗するだけ。海と池と川で位相をずらすと、
+    // 同じ色の面が一斉に光らない
+    const k = 1 + Math.sin(waveT * 0.55 + w.phase) * 0.055;
+    w.mat.color.setRGB(w.base.r * k, w.base.g * k, w.base.b * k);
+  }
+}
+
+function stepUnderwater() {
+  const surf = waterAt(player.x, player.z);
+  const under = surf !== null && player.y < surf - 0.02;
+  if (under === wasUnder) return;
+  wasUnder = under;
+  const f = under ? WET_FOG : AIR_FOG;
+  scene.fog.color.setHex(f.color);
+  scene.fog.near = f.near;
+  scene.fog.far = f.far;
+  sky.visible = !under;
+  document.body.classList.toggle('under', under);
+}
+
+/** (x,z) が川の中なら水面の高さ。外なら null。 */
+function riverAt(x, z) {
+  const segs = rmapW.get(`${Math.floor(x / RIVER_CELL)},${Math.floor(z / RIVER_CELL)}`);
+  if (!segs) return null;
+  let best = null, bd = Infinity;
+  for (const s of segs) {
+    const dx = s.x1 - s.x0, dz = s.z1 - s.z0;
+    const L2 = dx * dx + dz * dz || 1;
+    const t = Math.max(0, Math.min(1, ((x - s.x0) * dx + (z - s.z0) * dz) / L2));
+    const qx = s.x0 + t * dx, qz = s.z0 + t * dz;
+    const d = Math.hypot(x - qx, z - qz);
+    if (d <= s.hw && d < bd) { bd = d; best = s.y0 + (s.y1 - s.y0) * t; }
+  }
+  return best;
+}
+
+let seaMesh = null;
+
+/** 海面。世界ぜんぶに1枚。地形より低い所だけが見える。 */
+function buildSea() {
+  if (seaMesh) {
+    scene.remove(seaMesh);
+    seaMesh.geometry.dispose();
+    seaMesh.material.dispose();
+    seaMesh = null;
+  }
+  if (!coast) return;
+  const [x0, z0, x1, z1] = coast.meta.bbox;
+  const geo = new THREE.PlaneGeometry(x1 - x0, z1 - z0);
+  geo.rotateX(-Math.PI / 2);
+  geo.translate((x0 + x1) / 2, SEA, (z0 + z1) / 2);
+  seaMesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: SEA_COL }));
+  addWave(seaMesh.material, 0);
+  seaMesh.renderOrder = -1;      // 受け皿より先に描く
+  scene.add(seaMesh);
+  console.log(`海面 ${Math.round(x1 - x0)}x${Math.round(z1 - z0)}m @ ${SEA}m`);
+}
+buildSea();
+buildRivers();
+
+const SWIM = 1.9;              // 泳ぐ速さ(m/s)。歩き4.6よりずっと遅い
+const SWIM_V = 1.5;            // 沈む/浮く速さ(m/s)
+const FLOAT = 0.22;            // 立ち泳ぎのとき水面から出る目の高さ(m)
+const WADE = 0.7;              // これより浅ければ歩いて渡れる(m)
+const waters = [];                 // {ring, minx, maxx, minz, maxz, y, k, tile}
+const wmap = new Map();            // 空間ハッシュ。泳ぎの判定に使う
+
+/** タイル t の水面を張る。 */
+function addWater(t) {
+  const list = t.data.water ?? [];
+  if (!list.length) return 0;
+  const byKind = new Map();
+  for (const w of list) {
+    const f = w.f, m = f.length / 2;
+    if (m < 3) continue;
+    const ring = new Array(m);
+    let minx = Infinity, maxx = -Infinity, minz = Infinity, maxz = -Infinity;
+    for (let i = 0; i < m; i++) {
+      const x = t.X(f[i * 2]), z = t.Z(f[i * 2 + 1]);
+      ring[i] = new THREE.Vector2(x, z);
+      if (x < minx) minx = x; if (x > maxx) maxx = x;
+      if (z < minz) minz = z; if (z > maxz) maxz = z;
+    }
+    const rec = { ring, minx, maxx, minz, maxz, y: w.y, k: w.k, tile: t.key };
+    waters.push(rec);
+    hashInsert(wmap, rec);
+
+    // 種別ごとに1つのジオメトリへ畳む(描画は種別の数だけで済む)
+    const V = byKind.get(w.k) ?? [];
+    byKind.set(w.k, V);
+    for (const [a, b, c] of THREE.ShapeUtils.triangulateShape(ring, [])) {
+      // 上から見る面。反時計回りだと法線が下を向くので順序を入れ替える
+      for (const i of [a, c, b]) V.push(ring[i].x, w.y, ring[i].y);
+    }
+  }
+  let n = 0;
+  for (const [kind, V] of byKind) {
+    if (!V.length) continue;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+      color: WATER_COL[kind] ?? WATER_COL.water,
+    }));
+    addWave(mesh.material, waters.length * 0.7);
+    mesh.renderOrder = 1;            // 地形と同じ高さで喧嘩したとき水を上に
+    t.group.add(mesh);
+    n++;
+  }
+  console.log(`[${t.key}] 水面 ${list.length}面 / 描画${n}`);
+  return list.length;
+}
+
+function dropWater(key) {
+  for (let i = waters.length - 1; i >= 0; i--) {
+    if (waters[i].tile === key) waters.splice(i, 1);
+  }
+  hashRemove(wmap, (r) => r.tile === key);
+}
+
+/**
+ * (x,z) の水面の高さ。水の無い所は null。
+ *
+ * 重なっている面があれば **高いほうを採る**。漫湖のような広い面の上に
+ * 小さな池が乗っている所で、低いほうを採ると池が消える。
+ */
+function waterAt(x, z) {
+  // 池が無い升目でも、川と海を見にいく必要がある。
+  // ここで早く返してしまうと川の上でも水が無いことになる(実際にそうなっていた)
+  const hits = wmap.get(`${Math.floor(x / HASH)},${Math.floor(z / HASH)}`) ?? [];
+  let best = null;
+  for (const w of hits) {
+    if (x < w.minx || x > w.maxx || z < w.minz || z > w.maxz) continue;
+    const g = w.ring, m = g.length;
+    let inside = false;
+    for (let k = 0, l = m - 1; k < m; l = k++) {
+      const a = g[k], c = g[l];
+      if ((a.y > z) !== (c.y > z) &&
+          x < (c.x - a.x) * (z - a.y) / (c.y - a.y) + a.x) inside = !inside;
+    }
+    if (inside && (best === null || w.y > best)) best = w.y;
+  }
+  if (best !== null) return best;
+  const rv = riverAt(x, z);
+  if (rv !== null) return rv;
+  // 池でなくても、海の側で地面が海面より低ければ海
+  if (groundAt(x, z) < SEA && isSea(x, z)) return SEA;
+  return null;
+}
+
 // ------------------------------------------------------------ 車とタクシー
 // 道路の「面」しか無かったので、これまで走っていたのは経路を持つバスと
 // モノレールだけだった。OSM の車道中心線(roadLines)を足して、一般の車を流す。
@@ -3940,7 +4270,7 @@ function spawnCar(c, force = false) {
 let carBody = null, carRoof = null, carWheel = null, carLamp = null;
 
 {
-  for (const t of tiles.values()) addCarLines(t);
+  for (const t of tiles.values()) { addCarLines(t); addWater(t); }
 
   // 車体・屋根・タイヤ・行灯の4つに畳む。台数を増やしても描画は4回のまま。
   // バスのように1台ずつ Group にすると、44台で 300 回を超える
@@ -4653,6 +4983,7 @@ function dropTile(t) {
   }
   dropWalkLines(t.key);
   dropCarLines(t.key);
+  dropWater(t.key);
   dropHistoric(t.key);
   // 焼きかけのテクスチャは捨てる(戻ってきたら最初から焼き直す)
   for (let i = bakes.length - 1; i >= 0; i--) if (bakes[i].tile === t.key) bakes.splice(i, 1);
@@ -4713,6 +5044,7 @@ async function syncTiles() {
       buildTileProps(t);
       addWalkLines(t);
       addCarLines(t);
+      addWater(t);
       // 1枚組み立てるあいだ主スレッドが止まる(建物の多いタイルで 220〜240ms)。
       // そのまま次へ行くと、おもろまち周辺のように重いタイルが6枚続く所で
       // 2秒ちかく画面が固まる。1枚ごとに1フレーム譲って描かせる。
@@ -5113,6 +5445,7 @@ const BOARD_R = 6.5;           // この距離まで近づくと乗れる(m)
 const SEAT = { x: -0.75, y: 2.15, z: 1.6 };   // バス内の座席(左の窓側)
 const seatOf = (v) => v.seat ?? SEAT;
 let riding = null, boardable = null;
+let inWater = false;              // 泳いでいるか(HUDと車の湧かし直しに使う)
 const rideEl = $('ride');
 
 // 店の出入り。乗り物と同じ「近づく → 入る → 出る」なので UI も共用する
@@ -5498,6 +5831,8 @@ function tick() {
   }
 
   stepRide(dt);
+  stepUnderwater();
+  stepWaves(dt);
 
   // 乗れる車両を探す(停車中で、十分近いもの)
   {
@@ -5566,12 +5901,27 @@ function tick() {
     right.set(Math.cos(player.yaw), 0, -Math.sin(player.yaw));
     let mx = fwd.x * fb + right.x * lr;
     let mz = fwd.z * fb + right.z * lr;
-    let my = flying ? fwd.y * fb : 0;   // 飛行時の垂直成分(この後 dt を掛ける)
+    // 水。足元が水面より下なら泳ぐ。ただし浅ければ歩いて渡れる
+    // (膝下の水たまりで泳ぎ出すと、岸沿いがまともに歩けない)
+    const feet0 = player.y - EYE;
+    const surf = flying ? null : waterAt(player.x, player.z);
+    const bed = surf === null ? 0 : supportY(player.x, player.z);
+    const swimming = surf !== null && feet0 < surf - 0.15 && surf - bed > WADE;
+
+    // 泳ぎも視線の上下に進む(飛行と同じ操作感にそろえる)
+    let my = (flying || swimming) ? fwd.y * fb : 0;
+    if (swimming) {
+      const cp = Math.cos(player.pitch);
+      fwd.set(-Math.sin(player.yaw) * cp, Math.sin(player.pitch), -Math.cos(player.yaw) * cp);
+      mx = fwd.x * fb + right.x * lr;
+      mz = fwd.z * fb + right.z * lr;
+      my = fwd.y * fb;
+    }
     // 足元(地表 or 屋根)の高さ。飛行中の当たり判定にも使う
-    const feet = player.y - EYE;
-    const len = flying ? Math.hypot(mx, my, mz) : Math.hypot(mx, mz);
+    const feet = feet0;
+    const len = (flying || swimming) ? Math.hypot(mx, my, mz) : Math.hypot(mx, mz);
     if (len > 0) {
-      const sp = (flying ? FLY : run ? RUN : WALK) * dt * throttle;
+      const sp = (flying ? FLY : swimming ? SWIM : run ? RUN : WALK) * dt * throttle;
       mx = mx / len * sp; mz = mz / len * sp; my = my / len * sp;
       // 軸ごとに試して壁ずりを効かせる(天端より上なら素通りできる)
       if (!blocked(player.x + mx, player.z, RADIUS, feet)) player.x += mx;
@@ -5603,6 +5953,23 @@ function tick() {
       if (player.y > ceil) { player.y = ceil; player.vy = 0; }
       if (player.y < gy) { player.y = gy; player.vy = 0; }   // 地面は突き抜けない
       player.onGround = false;
+    } else if (swimming) {
+      // 浮力。放っておくと目が水面のすこし上で落ち着く。
+      // ジャンプで浮上、Shift で潜る。飛行と同じ割り当てにそろえてある
+      const up = (jumpHeld ? 1 : 0) -
+                 (descend || keys.has('ShiftLeft') || keys.has('ShiftRight') ? 1 : 0);
+      const rest = surf + FLOAT;                 // 立ち泳ぎで落ち着く目の高さ
+      if (up !== 0) {
+        player.vy = up * SWIM_V;
+      } else {
+        // 水面へ戻る力。速度ではなく位置で寄せると、水面で上下に跳ねない
+        player.vy = Math.max(-SWIM_V, Math.min(SWIM_V, (rest - player.y) * 2.2));
+      }
+      player.y += player.vy * dt + my;
+      // 水底は抜けない。頭が水面から出すぎないように蓋もする
+      if (player.y < bed + EYE) { player.y = bed + EYE; player.vy = 0; }
+      if (player.y > rest + 0.35) { player.y = rest + 0.35; player.vy = 0; }
+      player.onGround = false;
     } else {
       if (player.onGround && (jumpHeld || jumpTap)) {
         player.vy = JUMP; player.onGround = false;
@@ -5611,6 +5978,7 @@ function tick() {
       player.y += player.vy * dt;
       if (player.y <= gy) { player.y = gy; player.vy = 0; player.onGround = true; }
     }
+    inWater = swimming;
     jumpTap = false;
   }
 
@@ -5819,7 +6187,10 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   rebuildDerived, dropWalkLines, addWalkLines, carLines, cars, stepCars, addCarLines,
   board, alight, get riding() { return riding; }, get transit() { return transit; },
   get cabin() { return cabin; }, buildCabin, disposeCabin, stepRide,
-  spawnPoints, applySpawn, seatOnSpawn, goSpawn, get lastSpawn() { return lastSpawn; }, bakeMap, buildApron, seesaaGroup,
+  spawnPoints, applySpawn, seatOnSpawn, goSpawn, get lastSpawn() { return lastSpawn; },
+  waters, waterAt, addWater, dropWater, get inWater() { return inWater; },
+  isSea, buildSea, coast, SEA, riverAt, buildRivers, riverData,
+  stepUnderwater, get underwater() { return wasUnder; }, stepWaves, WAVE, bakeMap, buildApron, seesaaGroup,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,

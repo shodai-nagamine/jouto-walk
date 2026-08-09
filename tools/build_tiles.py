@@ -45,6 +45,7 @@ OSM = {
     "--bus-routes": "naha_busroutes_osm.json",
     "--signals": "naha_signals_osm.json",
     "--road-lines": "naha_roads_osm.json",
+    "--water": "naha_water_osm.json",
     "--footways": "naha_footways_osm.json",
     "--parks": "naha_parks_osm.json",
     "--walls": "naha_shurijo_osm.json",
@@ -165,6 +166,12 @@ def main():
                "--out", str(out)]
         if tran:
             cmd += ["--tran", *tran]
+        rivers = ROOT / "public/data/rivers.json"
+        if rivers.exists():
+            cmd += ["--rivers", str(rivers)]
+        coastf = ROOT / "public/data/coast.json"
+        if coastf.exists():
+            cmd += ["--coast", str(coastf)]
         for flag, name in OSM.items():
             if (DATA / name).exists():
                 cmd += [flag, name]

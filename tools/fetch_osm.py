@@ -40,6 +40,11 @@ BBOX_OVERRIDE = {
     # 市域ぜんぶに広げた 61 タイルの世界より南北に約 1km ずつ狭い。
     # tiles/index.json の tx -9..1 / tz -3..5 を覆う範囲に余白を足したもの。
     "roads": (26.170, 127.633, 26.259, 127.752),
+    # 水面も世界のすみずみまで。海沿いや河口は端のタイルにある
+    "water": (26.170, 127.633, 26.259, 127.752),
+    # 海岸線は世界より広く取る。受け皿(外へ1500m)まで判断したいので
+    "coast": (26.140, 127.600, 26.290, 127.790),
+    "rivers": (26.170, 127.633, 26.259, 127.752),
 }
 
 # 名前は build_world.py の引数に対応する。timeout は Overpass 側の秒数。
@@ -90,6 +95,27 @@ QUERIES = {
     "roads": (300, [
         'way["highway"~"^(motorway|trunk|primary|secondary|tertiary|'
         'unclassified|residential)(_link)?$"]{bbox};',
+    ], "out geom tags;"),
+    # --water。水面。川は way だけでなく面(riverbank)を持つものがある。
+    # 漫湖は natural=wetland、ダムの貯水池は natural=water。
+    # 海(natural=coastline)は線なので面にならない。海面は世界全体に1枚張るほうが安い
+    "water": (300, [
+        'way["natural"="water"]{bbox};',
+        'relation["natural"="water"]{bbox};',
+        'way["natural"="wetland"]{bbox};',
+        'way["waterway"="riverbank"]{bbox};',
+        'way["landuse"="reservoir"]{bbox};',
+        'way["waterway"="dam"]{bbox};',
+    ], "out geom tags;"),
+    # --rivers。川の中心線。OSM に riverbank(面)は無く way(線)しか無いので、
+    # 幅で膨らませて水面にする。stream は細いが街なかの水路として効く
+    "rivers": (300, [
+        'way["waterway"~"^(river|stream|canal)$"]{bbox};',
+    ], "out geom tags;"),
+    # --coast。海岸線。OSM の natural=coastline は「進行方向の左が陸」という
+    # 約束の線で、面ではない。海の側を決めるのにこの向きを使う
+    "coast": (300, [
+        'way["natural"="coastline"]{bbox};',
     ], "out geom tags;"),
     # --parks。["name"] で絞らないのが要点(那覇の街区公園と校庭は半数以上が無名で、
     # 名前で絞ると見た目に一番効く大きなグラウンドが軒並み落ちる)

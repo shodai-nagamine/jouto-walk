@@ -65,6 +65,9 @@ def simplify(pts, tol=0.35):
 
 
 ARM_MAX = 6.0      # 車両用信号のアームの長さの上限(m)
+WATER_DEPTH = 1.2  # 水面から掘り下げる深さ(m)。泳げる深さがあればよい
+SEA_LEVEL = 0.0    # 海面の高さ(m)。描画側の SEA と合わせる
+SEA_DEPTH = 2.5    # 海底を海面からどれだけ下げるか(m)
 
 
 def point_in_ring(px, pz, f):
@@ -694,6 +697,69 @@ def parse_parks(path, lat_c, lon_c, m_lat, m_lon, half, size, margin=60.0):
     return out
 
 
+def parse_water(path, lat_c, lon_c, m_lat, m_lon, half, size, levels=None, margin=60.0):
+    """OSM の水面を「面」として取り出し、水位を地形から決める。
+
+    国場川・安里川は way(線)しか無く riverbank の面を持たないので、
+    ここで取れるのは池・貯水池・遊水地と漫湖(wetland)。川の水面は
+    線を幅で膨らませる別の工程が要る（未実装）。
+
+    **水位はポリゴンごとに違う**。漫湖は海面ちかく、龍潭は首里の高台に
+    あって90m超。世界に1枚平面を張って済ませることはできない。
+
+    水位はここで計算しない。タイルごとに自分の地形だけを見て決めると、
+    タイルをまたぐ池で値が割れる（実測で龍潭が t_-1_0 では 110.80m、
+    t_-2_0 では 98.93m になり、境界に 12m の段差ができた）。
+    tools/build_water_levels.py が世界ぜんぶの DEM から要素ごとに1つ決めた
+    対応表を引く。表に無いもの（DEM の外＝南風原ダム貯水池など）は落とす。
+
+    relation(円鑑池など)は members 側に geometry が入るので、そこから拾う。
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    lo, hi = -margin, size + margin
+    out = []
+    for e in d.get("elements", []):
+        t = e.get("tags") or {}
+        nat = t.get("natural")
+        kind = None
+        if nat == "water" or t.get("landuse") == "reservoir":
+            kind = "water"
+        elif nat == "wetland":
+            kind = "wetland"
+        elif t.get("waterway") == "riverbank":
+            kind = "water"
+        if kind is None:
+            continue
+        g = [p for p in (e.get("geometry") or []) if p]
+        if not g and e.get("type") == "relation":
+            g = [p for m in e.get("members", []) for p in (m.get("geometry") or []) if p]
+        if len(g) < 3:
+            continue
+        pts = [((p["lon"] - lon_c) * m_lon + half,
+                -(p["lat"] - lat_c) * m_lat + half) for p in g]
+        if pts[0] == pts[-1]:
+            pts.pop()
+        if len(pts) < 3:
+            continue
+        xs = [p[0] for p in pts]
+        zs = [p[1] for p in pts]
+        if max(xs) < lo or min(xs) > hi or max(zs) < lo or min(zs) > hi:
+            continue
+        pts = simplify(pts, tol=0.6)
+        if len(pts) < 3:
+            continue
+
+        key = f"{e.get('type')}/{e.get('id')}"
+        level = (levels or {}).get(key)
+        if level is None:
+            continue                      # 水位が決まらない面は置かない
+        out.append({
+            "name": t.get("name", ""), "k": kind, "y": round(float(level), 2),
+            "f": [round(v, 2) for p in pts for v in p],
+        })
+    return out
+
+
 # 史跡の種別。OSM の historic の値を日本語の見出しにする。
 # 沖縄は亀甲墓(tomb)と拝所(wayside_shrine)が街のなかに数多く残っていて、
 # これが土地の性格をよく表すので、墓と拝所も落とさずに拾う。
@@ -869,6 +935,9 @@ def main():
     ap.add_argument("--signals", default="", help="信号 (OSM Overpass JSON)")
     ap.add_argument("--footways", default="", help="歩道・横断歩道・階段 (OSM Overpass JSON)")
     ap.add_argument("--road-lines", default="", help="車道の中心線 (OSM Overpass JSON)")
+    ap.add_argument("--water", default="", help="水面 (OSM Overpass JSON)")
+    ap.add_argument("--rivers", default="", help="川のリボン (build_rivers.py の出力)")
+    ap.add_argument("--coast", default="", help="海岸線 (build_coast.py の出力)")
     ap.add_argument("--parks", default="", help="公園・広場・グラウンド (OSM Overpass JSON)")
     ap.add_argument("--walls", default="", help="首里城の石垣 (OSM Overpass JSON)")
     ap.add_argument("--historic", default="", help="史跡・碑・墓・拝所 (OSM Overpass JSON)")
@@ -1123,6 +1192,219 @@ def main():
         print(f"  {os.path.basename(path)}: 公園系 {len(parks)}面 {cnt} "
               f"(名前あり{nn}/無名{len(parks) - nn})", file=sys.stderr)
 
+    size_f = float(args.size)
+
+    # 水面。地形が出来たあとに置き、**水位より高い所を掘る**。
+    # DEM は水面で平らだが(龍潭は p10=92.00 / p50=92.01)、fill_missing の
+    # 平滑化が水面を岸へ引き上げるので、そのままだと水面が地形に埋まる
+    # (実測で池の中心の地形が 93.6m、水位が 92.0m)。
+    water = []
+    if args.water:
+        path = (args.water if os.path.isabs(args.water)
+                else os.path.join(NAHA, args.water))
+        lv_path = os.path.join(os.path.dirname(path), "naha_water_levels.json")
+        levels = {}
+        if os.path.exists(lv_path):
+            levels = json.load(open(lv_path, encoding="utf-8"))
+        else:
+            print("  naha_water_levels.json が無い → 水面を置かない"
+                  "(tools/build_water_levels.py を先に流す)", file=sys.stderr)
+        water = parse_water(path, lat_c, lon_c, m_lat, m_lon, half, args.size,
+                            levels=levels)
+        named = [w for w in water if w["name"]]
+        lv = [w["y"] for w in water if w["y"] is not None]
+        print(f"  {os.path.basename(path)}: 水面 {len(water)}面 "
+              f"(名前あり{len(named)}) 水位 "
+              f"{min(lv):.1f}〜{max(lv):.1f}m" if lv else
+              f"  {os.path.basename(path)}: 水面 {len(water)}面", file=sys.stderr)
+        for w in named:
+            print(f"    {w['name']} ({w['k']}) 水位 {w['y']}m", file=sys.stderr)
+
+        # 地形を掘る。既に水位より低い所(漫湖の干潟など)は触らない。
+        #
+        # **格子の向きに注意。** 描画側の groundAt は terrain[i * n + j] の
+        # i を x から、j を z から作る＝**行が x・列が z**。ここを z 行・x 列で
+        # 書くと、池の形を転置した所を掘ることになる(実際にそうなっていて、
+        # 池の中の最深部が水面の 0.04m 下にしかならなかった)。
+        n_t = terrain.shape[0]
+        cell = args.size / (n_t - 1)
+        carved = 0
+        for w in water:
+            ring = w["f"]
+            xs = ring[0::2]
+            zs = ring[1::2]
+            ix0 = max(0, int(min(xs) / cell) - 1)
+            ix1 = min(n_t - 1, int(max(xs) / cell) + 1)
+            iz0 = max(0, int(min(zs) / cell) - 1)
+            iz1 = min(n_t - 1, int(max(zs) / cell) + 1)
+            floor = w["y"] - WATER_DEPTH
+            for ix in range(ix0, ix1 + 1):
+                for iz in range(iz0, iz1 + 1):
+                    if terrain[ix][iz] <= floor:
+                        continue
+                    # **輪の内側だけを掘ると足りない。** 地形は 5m 格子を
+                    # 双一次補間して引くので、龍潭のように細い池は掘った格子と
+                    # 掘っていない格子の間で均されて、池の中でも水面すれすれに
+                    # なる。1格子ぶん外まで掘る
+                    px, pz = ix * cell, iz * cell
+                    if not (point_in_ring(px, pz, ring)
+                            or point_in_ring(px + cell, pz, ring)
+                            or point_in_ring(px - cell, pz, ring)
+                            or point_in_ring(px, pz + cell, ring)
+                            or point_in_ring(px, pz - cell, ring)):
+                        continue
+                    terrain[ix][iz] = floor
+                    carved += 1
+        if carved:
+            print(f"    地形を掘った格子 {carved}", file=sys.stderr)
+
+    # 海も掘る。DEM は水面を返すので、海の底が海面と同じ 0.0m になっていて
+    # 「海に入れるが泳げない」状態だった(実測で海側の地形が 0.0〜0.1m)。
+    # 池と同じ理由で、地形の側を下げる。
+    #
+    # 海か陸かは地形からは決められない(世界の外周は 80% が標高 0〜12m)。
+    # OSM の海岸線は「進行方向の左が陸」なので、その向きで決める。
+    # この世界は z が南向きで OSM と手系が逆なので、**右が陸・左が海**になる
+    # ＝外積が正なら海(描画側と同じ判定)。
+    if args.coast and os.path.exists(args.coast):
+        cst = json.load(open(args.coast, encoding="utf-8"))
+        off_x = (lon_c - args.origin[1]) * m_lon
+        off_z = -(lat_c - args.origin[0]) * m_lat
+        segs = []
+        for f in cst.get("lines", []):
+            for i in range(0, len(f) - 3, 2):
+                # 世界座標 → このタイルのローカル座標
+                segs.append((f[i] - off_x + half, f[i + 1] - off_z + half,
+                             f[i + 2] - off_x + half, f[i + 3] - off_z + half))
+        CB = 400.0
+        buck = {}
+        for sg in segs:
+            g0 = int(min(sg[0], sg[2]) // CB)
+            g1 = int(max(sg[0], sg[2]) // CB)
+            h0 = int(min(sg[1], sg[3]) // CB)
+            h1 = int(max(sg[1], sg[3]) // CB)
+            for gx in range(g0, g1 + 1):
+                for gz in range(h0, h1 + 1):
+                    buck.setdefault((gx, gz), []).append(sg)
+
+        def sea_side(px, pz):
+            bd, side = float("inf"), 0.0
+            cx, cz = int(px // CB), int(pz // CB)
+            for r in range(0, 9):
+                for gx in range(cx - r, cx + r + 1):
+                    for gz in range(cz - r, cz + r + 1):
+                        if r > 0 and abs(gx - cx) != r and abs(gz - cz) != r:
+                            continue
+                        for (ax, az, bx, bz) in buck.get((gx, gz), ()):
+                            dx, dz = bx - ax, bz - az
+                            L2 = dx * dx + dz * dz or 1.0
+                            t = max(0.0, min(1.0,
+                                             ((px - ax) * dx + (pz - az) * dz) / L2))
+                            qx, qz = ax + t * dx, az + t * dz
+                            d = (px - qx) ** 2 + (pz - qz) ** 2
+                            if d < bd:
+                                bd = d
+                                side = dx * (pz - az) - dz * (px - ax)
+                if bd < float("inf") and r > math.sqrt(bd) / CB + 1:
+                    break
+            return bd < float("inf") and side > 0
+
+        n_t = terrain.shape[0]
+        cell = args.size / (n_t - 1)
+        n_sea = 0
+        for ix in range(n_t):
+            for iz in range(n_t):
+                if terrain[ix][iz] > SEA_LEVEL + 0.4:
+                    continue
+                px, pz = ix * cell, iz * cell
+                if not sea_side(px, pz):
+                    continue
+                floor = SEA_LEVEL - SEA_DEPTH
+                if terrain[ix][iz] > floor:
+                    terrain[ix][iz] = floor
+                    n_sea += 1
+        if n_sea:
+            print(f"    海を掘った格子 {n_sea}", file=sys.stderr)
+
+    # 川も掘る。川は世界ぜんぶを1本の折れ線として持っている(タイルに分けると
+    # 川筋に沿って変わる水面の高さが継ぎ目で段差になる)ので、世界座標から
+    # このタイルのローカル座標へ直して当てる
+    if args.rivers and os.path.exists(args.rivers):
+        rv = json.load(open(args.rivers, encoding="utf-8"))
+        drop = rv.get("meta", {}).get("drop", 0.35)
+        # **道路面の下は掘らない。** 川を掘ると、川を跨ぐ道がそのまま
+        # 川底まで落ちる（実測で川に掛かる道の 204点すべてが水面より下に
+        # なり、最大 3.42m 沈んだ）。橋の上を車が水没して走ることになる。
+        # PLATEAU の tran は橋の路面も面として持っているので、これで守れる。
+        # 暗渠(ガーブ川など)も道の下なので掘られなくなるが、それは正しい
+        road_bb = []
+        for r0 in roads:
+            f0 = r0["f"]
+            xs0 = f0[0::2]
+            zs0 = f0[1::2]
+            road_bb.append((min(xs0), max(xs0), min(zs0), max(zs0), f0))
+
+        def on_road(px, pz, pad):
+            """道路面の上か。**掘る側と同じだけ広げて見る。**
+
+            掘り込みは輪の 1格子ぶん外まで及ぶのに、守る側が格子の中心しか
+            見ていないと、橋の縁が削られて道が水に浸かる
+            (実測で川に掛かる道 200点のうち 68点が最大 0.96m 沈んだ)。
+            """
+            for (a, b, c, d, f0) in road_bb:
+                if not (a - pad <= px <= b + pad and c - pad <= pz <= d + pad):
+                    continue
+                if (point_in_ring(px, pz, f0)
+                        or point_in_ring(px + pad, pz, f0)
+                        or point_in_ring(px - pad, pz, f0)
+                        or point_in_ring(px, pz + pad, f0)
+                        or point_in_ring(px, pz - pad, f0)):
+                    return True
+            return False
+        off_x = (lon_c - args.origin[1]) * m_lon
+        off_z = -(lat_c - args.origin[0]) * m_lat
+        n_t = terrain.shape[0]
+        cell = args.size / (n_t - 1)
+        carved = 0
+        skipped = 0
+        for r in rv.get("rivers", []):
+            f = r["f"]
+            hw = r["w"] / 2
+            for i in range(0, len(f) - 3, 3):
+                x0 = f[i] - off_x + half
+                z0 = f[i + 1] - off_z + half
+                x1 = f[i + 3] - off_x + half
+                z1 = f[i + 4] - off_z + half
+                y0, y1 = f[i + 2], f[i + 5]
+                lo_x, hi_x = min(x0, x1) - hw, max(x0, x1) + hw
+                lo_z, hi_z = min(z0, z1) - hw, max(z0, z1) + hw
+                if hi_x < 0 or lo_x > size_f or hi_z < 0 or lo_z > size_f:
+                    continue
+                dx, dz = x1 - x0, z1 - z0
+                L2 = dx * dx + dz * dz or 1.0
+                for ix in range(max(0, int(lo_x / cell) - 1),
+                                min(n_t - 1, int(hi_x / cell) + 1) + 1):
+                    for iz in range(max(0, int(lo_z / cell) - 1),
+                                    min(n_t - 1, int(hi_z / cell) + 1) + 1):
+                        px, pz = ix * cell, iz * cell
+                        t = max(0.0, min(1.0,
+                                         ((px - x0) * dx + (pz - z0) * dz) / L2))
+                        qx, qz = x0 + t * dx, z0 + t * dz
+                        # 1格子ぶん外まで掘る(池と同じ理由。細いと補間で均される)
+                        if math.hypot(px - qx, pz - qz) > hw + cell:
+                            continue
+                        floor = (y0 + (y1 - y0) * t) - drop
+                        if terrain[ix][iz] <= floor:
+                            continue
+                        if on_road(px, pz, cell):
+                            skipped += 1
+                            continue
+                        terrain[ix][iz] = floor
+                        carved += 1
+        if carved or skipped:
+            print(f"    川で掘った格子 {carved} / 道路面なので残した {skipped}",
+                  file=sys.stderr)
+
     historic = []
     if args.historic:
         path = (args.historic if os.path.isabs(args.historic)
@@ -1179,6 +1461,7 @@ def main():
         "footways": footways,
         "roadLines": road_lines,
         "parks": parks,
+        "water": water,
         "walls": walls,
         "castle": castle,
         "historic": historic,

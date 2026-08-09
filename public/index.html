@@ -190,6 +190,9 @@
   }
   /* 乗車中は移動スティックを出さない */
   body.riding #stick { display:none !important; }
+  /* 水中。画面のふちを水の色で締める(視界が狭まった感じを出す) */
+  body.under::after { content:""; position:fixed; inset:0; pointer-events:none;
+    z-index:5; box-shadow: inset 0 0 220px 60px rgba(10,50,60,.62); }
 
   /* ---- 市議会の言及パネル ---- */
   /* パネル自体はクリックを受け取らない。受け取るとパネルが画面を覆っている間
