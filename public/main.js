@@ -6235,8 +6235,11 @@ loadPurse();
 // (史跡289件のうち253件を説明なしで出したのと同じ線引き)。
 // だから水域の**種別**で表を分け、個々の池の名前では変えない。
 const CAST_R = 14;            // 竿を振って届く距離(m)
-const BITE_MS = [1800, 7000]; // 当たりが来るまで(ms)
-const HOOK_MS = 900;          // 当たってから合わせる猶予(ms)
+const BITE_MS = [1500, 5000]; // 当たりが来るまで(ms)
+// 合わせる猶予。**0.9秒では釣れない。** 「きた！」を読んでキーへ手を動かす
+// までにそれくらい掛かる。実際に遊んで一匹も上がらなかった
+const HOOK_MS = 1900;
+const REEL_R = 2.5;           // 投げた場所からこれだけ離れると糸を上げる(m)
 
 // 沖縄の水辺で釣れる魚。名前は現地の呼び方を添える。
 // k は waters の種別(water=池・貯水池 / wetland=干潟)、river=川、sea=海。
@@ -6375,6 +6378,8 @@ function fishAction() {
       phase: 'cast', t: 0, spot,
       biteAt: (BITE_MS[0] + Math.random() * (BITE_MS[1] - BITE_MS[0])) / 1000,
       kind: spot.kind, place: spot.place,
+      // 投げた立ち位置。ここから離れたら糸を上げる(やめる手段はこれ)
+      fromX: player.x, fromZ: player.z,
     };
     rodGroup.visible = true;
     floatMesh.visible = lineMesh.visible = true;
@@ -6383,7 +6388,10 @@ function fishAction() {
   } else if (fishing.phase === 'bite') {
     landFish();
   } else {
-    stopFishing('やめた');
+    // **待っているあいだの [F] で糸を上げない。** 同じキーが「合わせる」と
+    // 「やめる」を兼ねていたので、待ちきれずに押すと黙って終わっていた。
+    // これが「全然釣れない」の正体。やめたいときは水辺から離れる
+    say('まだ当たっていない');
   }
   updateFishUI();
 }
@@ -6419,6 +6427,11 @@ function stepFishing(dt) {
   if (!fishing) return;
   // 乗り物に乗る・店に入る・泳ぐと竿は仕舞う
   if (riding || transit || inShop || inWater) { stopFishing(null); return; }
+  // 水辺から離れたら糸を上げる。[F] は合わせる専用にしたので、やめる手段はこれ
+  if (Math.hypot(player.x - fishing.fromX, player.z - fishing.fromZ) > REEL_R) {
+    stopFishing('糸を上げた');
+    return;
+  }
   fishing.t += dt;
   const f = floatMesh, s = fishing.spot;
   if (fishing.phase === 'cast') {
@@ -6783,7 +6796,7 @@ function updateFishUI() {
   if (fishing?.phase === 'bite') {
     set('きた！', 'いま引く', '合わせる');
   } else if (fishing) {
-    set('糸をたらしている', '当たりを待つ', 'やめる');
+    set('糸をたらしている', '当たったら [F]・離れると上げる', '待つ');
   } else if (creaNear) {
     // いきものは逃げるので釣りより先。名前は近づけば見えているので出す
     set(creaNear.name, seenCrea.has(creaNear.name) ? '図鑑にある' : 'はじめて見る', '記録する');
