@@ -4177,7 +4177,9 @@ function applySpawn(name) {
   return true;
 }
 
-let spawned = false;
+// 最後に飛んだ先。選び直されたときだけ動かす（一時停止からの再開で
+// 毎回そこへ引き戻されては困る）。空文字＝城東小まわり＝初期位置
+let lastSpawn = '';
 
 /**
  * 移った先のタイルが本当に載ってから、地表に座り直す。
@@ -4198,16 +4200,35 @@ async function seatOnSpawn() {
   player.vy = 0; player.onGround = true;
 }
 
+/**
+ * 選ばれた場所へ移ってから歩きだす。
+ *
+ * **タイルが揃うまでカードを出したままにする。** 先に始めてしまうと、
+ * 建物の多い所（おもろまち周辺は6枚で12,014棟。城東小まわりの1.5倍）では
+ * 組み立てのあいだ操作を受け付けず、固まったように見える。
+ */
+async function goSpawn(name) {
+  const go = $('go');
+  const label = go.textContent;
+  go.disabled = true;
+  go.textContent = '読み込み中…';
+  $('meta').textContent = `${name}駅 のまわりを読み込んでいます`;
+  applySpawn(name);
+  await seatOnSpawn();
+  lastSpawn = name;
+  go.disabled = false;
+  go.textContent = label;
+  $('meta').textContent = `シーサー ${taken} / ${SEESAA_TOTAL} 体を保護ずみ`;
+  say(`${name}駅 から歩きだす`);
+}
+
 function start() {
-  // 最初に歩きだすときだけ、選ばれた場所へ移す。
-  // 一時停止からの再開で毎回飛ばされては困る
-  if (!spawned) {
-    spawned = true;
-    const name = $('spawn-sel')?.value ?? '';
-    if (applySpawn(name)) {
-      say(`${name}駅 から歩きだす`);
-      seatOnSpawn();
-    }
+  // 選び直されていたら、そこへ移ってから歩きだす。一時停止して駅を
+  // 選び直せば、何度でも移れる。選び直していなければその場で再開する
+  const name = $('spawn-sel')?.value ?? '';
+  if (name && name !== lastSpawn && spawnPoints().some((s) => s.name === name)) {
+    goSpawn(name).then(start);        // 読み終わってから改めて歩きだす
+    return;
   }
   started = true;
   overlay.classList.add('hide');
@@ -4658,6 +4679,20 @@ function rebuildDerived() {
   bakeMap();
 }
 
+/**
+ * 1フレーム譲る。
+ *
+ * requestAnimationFrame だけに頼ると、画面が隠れているあいだ rAF が
+ * 止まるので**永久に返ってこない**（読み込みがそこで固まる）。
+ * タイマーと競走させて、隠れていても必ず進むようにする。
+ */
+function nextFrame(ms = 60) {
+  return new Promise((r) => {
+    const id = setTimeout(r, ms);
+    requestAnimationFrame(() => { clearTimeout(id); r(); });
+  });
+}
+
 /** プレイヤーの位置に合わせてタイルを足し引きする。tick から間引いて呼ぶ。 */
 async function syncTiles() {
   if (TILE_FIXED || syncing) return;
@@ -4678,6 +4713,11 @@ async function syncTiles() {
       buildTileProps(t);
       addWalkLines(t);
       addCarLines(t);
+      // 1枚組み立てるあいだ主スレッドが止まる(建物の多いタイルで 220〜240ms)。
+      // そのまま次へ行くと、おもろまち周辺のように重いタイルが6枚続く所で
+      // 2秒ちかく画面が固まる。1枚ごとに1フレーム譲って描かせる。
+      // 合計の時間は変わらないが、止まって見えなくなる
+      await nextFrame();
     }
     for (const t of drop) dropTile(t);
     rebuildDerived();
@@ -5779,7 +5819,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   rebuildDerived, dropWalkLines, addWalkLines, carLines, cars, stepCars, addCarLines,
   board, alight, get riding() { return riding; }, get transit() { return transit; },
   get cabin() { return cabin; }, buildCabin, disposeCabin, stepRide,
-  spawnPoints, applySpawn, seatOnSpawn, bakeMap, buildApron, seesaaGroup,
+  spawnPoints, applySpawn, seatOnSpawn, goSpawn, get lastSpawn() { return lastSpawn; }, bakeMap, buildApron, seesaaGroup,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
