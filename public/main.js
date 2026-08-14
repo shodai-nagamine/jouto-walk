@@ -1042,6 +1042,228 @@ function digGround(x, z, r, depth, floor = -Infinity) {
 // タイルを足し引きすると縁が動くので、そのつど張り直す。
 let skirt = null;
 const SEA = 0.0;               // 海面の高さ(m)
+// ---------------------------------------------------------------- ハザード
+// 津波・高潮・洪水・土砂災害の想定区域。素材は PLATEAU の災害リスク CityGML
+// (建物・地形と同じ PDL1.0)。tools/build_hazard.py がタイルと同じ 5m 格子へ
+// 焼き落としたものを読む。素材は 495MB あるが、焼いた後は 4 種で 2.5MB。
+//
+// **これは避難の判断材料ではない。** 想定は前提の上に立っていて、時点も
+// 古いものがある(高潮は2007年)。画面には必ず出典と「実際の避難は那覇市の
+// 最新情報に従う」を添える。
+//
+// **浸水深はこちらで計算しない。** PLATEAU 自身が「地盤高は独自のものを
+// 使っているため見た目の浸水深と想定図が一致しない場合がある」と断っている。
+// 手元の DEM も別物なので、公式の**ランク**を正として出す。水位は描画用。
+const HAZARD_KINDS = ['tnm', 'htd', 'fld', 'lsld'];
+const hazard = new Map();          // 種別 -> {meta, n, tiles:Map(key -> {rank, level})}
+const B64 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_';
+const B64I = new Map([...B64].map((c, i) => [c, i]));
+const LVL_OFFSET = 100;
+
+/** `値+長さ+"."` の並びを Uint8Array へ戻す。 */
+function unrle(s, len) {
+  const out = new Uint8Array(len);
+  let k = 0, i = 0;
+  while (i < s.length && k < len) {
+    const v = s.charCodeAt(i++) - 48;
+    let n = 0;
+    while (i < s.length && s[i] !== '.') n = n * 10 + (s.charCodeAt(i++) - 48);
+    i++;                                   // '.' を飛ばす
+    for (let j = 0; j < n && k < len; j++) out[k++] = v;
+  }
+  return out;
+}
+
+/** 浸水した格子だけ並んだ 64進2文字を、格子全体の Float32Array へ戻す。 */
+function unpackLevels(s, rank, len) {
+  const out = new Float32Array(len).fill(NaN);
+  let p = 0;
+  for (let k = 0; k < len; k++) {
+    if (!rank[k]) continue;
+    const hi = B64I.get(s[p++]) ?? 0, lo = B64I.get(s[p++]) ?? 0;
+    out[k] = (((hi << 6) | lo) - LVL_OFFSET) / 10;
+  }
+  return out;
+}
+
+for (const kind of HAZARD_KINDS) {
+  const j = await fetch(`./data/hazard/${kind}.json`)
+    .then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  if (!j) continue;
+  const tmap = new Map();
+  for (const [key, t] of Object.entries(j.tiles)) {
+    const rank = unrle(t.rank, j.n * j.n);
+    tmap.set(key, {
+      rank,
+      level: t.level ? unpackLevels(t.level, rank, j.n * j.n) : null,
+    });
+  }
+  hazard.set(kind, { meta: j.meta, n: j.n, cell: j.cell, tiles: tmap });
+}
+console.log(`ハザード ${[...hazard.keys()].join('/')} / ` +
+  [...hazard.values()].map((h) => `${h.tiles.size}枚`).join(' '));
+
+/**
+ * (x,z) の想定ランク(0=区域外, 1〜)。
+ *
+ * 格子は地形と同じ **行が x・列が z**。ここを取り違えると、区域の形の
+ * 転置を読むことになる(水域を掘るときに踏んだ罠と同じ)。
+ * 補間はしない。ランクは階級なので、混ぜると存在しない階級になる。
+ */
+function hazardRankAt(kind, x, z) {
+  const h = hazard.get(kind);
+  if (!h) return 0;
+  const tx = Math.round(x / TILE), tz = Math.round(z / TILE);
+  const t = h.tiles.get(`${tx},${tz}`);
+  if (!t) return 0;
+  const ix = Math.round((x - (tx * TILE - HALF)) / h.cell);
+  const iz = Math.round((z - (tz * TILE - HALF)) / h.cell);
+  if (ix < 0 || ix >= h.n || iz < 0 || iz >= h.n) return 0;
+  return t.rank[ix * h.n + iz];
+}
+
+/** (x,z) の想定水位(m)。区域外や土砂災害は null。 */
+function hazardLevelAt(kind, x, z) {
+  const h = hazard.get(kind);
+  if (!h) return null;
+  const tx = Math.round(x / TILE), tz = Math.round(z / TILE);
+  const t = h.tiles.get(`${tx},${tz}`);
+  if (!t || !t.level) return null;
+  const ix = Math.round((x - (tx * TILE - HALF)) / h.cell);
+  const iz = Math.round((z - (tz * TILE - HALF)) / h.cell);
+  if (ix < 0 || ix >= h.n || iz < 0 || iz >= h.n) return null;
+  const v = t.level[ix * h.n + iz];
+  return Number.isNaN(v) ? null : v;
+}
+
+// 想定区域の色。**国土交通省の浸水想定区域図の配色に合わせる。**
+// 見慣れた色で出したほうが、実物のハザードマップと照らし合わせられる。
+const HAZ_COL = {
+  tnm: ['#f7f5a9', '#ffd8c0', '#ff9191', '#f285c9', '#dc7adc'],
+  htd: ['#f7f5a9', '#ffd8c0', '#ff9191', '#f285c9', '#dc7adc'],
+  fld: ['#f7f5a9', '#ffd8c0', '#ff9191', '#f285c9', '#dc7adc'],
+  lsld: ['#ffe08c', '#f5a3a3'],
+};
+
+let hazardLayer = null;            // いま出している種別(null=出さない)
+
+/**
+ * タイル1枚ぶんの想定区域を、地面のすぐ上に敷く板として作る。
+ *
+ * 地面テクスチャに焼き込まない。焼き込むと切り替えのたびに焼き直しになり、
+ * 建物の多いタイルで 1〜2 秒止まる。別の面にしておけば visible の
+ * 付け外しで済む。
+ *
+ * 高さは地形 + 0.06m。**想定水位そのものの高さには置かない。**
+ * PLATEAU の地盤高と手元の DEM は別物なので、水位で置くと地面に潜ったり
+ * 宙に浮いたりする。区域を「塗る」ものとして扱う。
+ */
+function buildHazardMesh(t, kind) {
+  const h = hazard.get(kind);
+  if (!h) return null;
+  const g = h.tiles.get(t.key);
+  if (!g) return null;
+  const cols = HAZ_COL[kind] ?? HAZ_COL.tnm;
+  const V = [], C = [];
+  const col = new THREE.Color();
+  const n = h.n, cell = h.cell;
+  for (let ix = 0; ix < n - 1; ix++) {
+    for (let iz = 0; iz < n - 1; iz++) {
+      const r = g.rank[ix * n + iz];
+      if (!r) continue;
+      const x0 = t.offX - HALF + ix * cell, z0 = t.offZ - HALF + iz * cell;
+      const x1 = x0 + cell, z1 = z0 + cell;
+      const y00 = groundAt(x0, z0) + 0.06, y10 = groundAt(x1, z0) + 0.06;
+      const y11 = groundAt(x1, z1) + 0.06, y01 = groundAt(x0, z1) + 0.06;
+      // **上から見る向きに巻く。** 素直に (x0,z0)→(x1,z0)→(x1,z1) と回すと
+      // 外積が -Y を向き、既定の FrontSide では真上から見ても消える
+      // (建物の屋根で踏んだのと同じ間違い)。実測で全画素中マゼンタ3画素だった
+      V.push(x0, y00, z0, x1, y11, z1, x1, y10, z0);
+      V.push(x0, y00, z0, x0, y01, z1, x1, y11, z1);
+      col.set(cols[Math.min(r, cols.length) - 1] ?? cols[0]);
+      for (let k = 0; k < 6; k++) C.push(col.r, col.g, col.b);
+    }
+  }
+  if (!V.length) return null;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+  // **polygonOffset を付ける。** 地面のすぐ上(0.06m)に敷くが、near 0.1 /
+  // far 2600 の透視投影では遠景の奥行きの分解能がその差を下回り、
+  // 地面と取り合って消える(実測で 300m 先の ndcZ が 0.9996 に張り付いた)。
+  // 高さを上げると近くで浮いて見えるので、奥行きの側をずらす
+  const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    vertexColors: true, depthWrite: false,
+    polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8,
+  }));
+  m.renderOrder = 2;               // 地面より後。水面(1)より上に出す
+  m.frustumCulled = true;
+  return m;
+}
+
+/** いま出している層に合わせて、読み込み済みタイルの板を作る/隠す。 */
+function syncHazardMeshes() {
+  for (const t of tiles.values()) {
+    t.hazMesh ??= new Map();
+    for (const kind of HAZARD_KINDS) {
+      let m = t.hazMesh.get(kind);
+      if (kind !== hazardLayer) { if (m) m.visible = false; continue; }
+      if (m === undefined) {
+        m = buildHazardMesh(t, kind);
+        t.hazMesh.set(kind, m);      // null も覚える(毎回作り直さない)
+        if (m) t.group.add(m);
+      }
+      if (m) m.visible = true;
+    }
+  }
+}
+
+function setHazardLayer(kind) {
+  hazardLayer = kind;
+  syncHazardMeshes();
+  updateHazardUI();
+  const h = kind && hazard.get(kind);
+  say(h ? `${h.meta.label}の想定区域を出した` : '想定区域を消した');
+}
+
+/** [H] とボタン。出さない → 津波 → 高潮 → 洪水 → 土砂 → 出さない、と回す。 */
+function cycleHazard() {
+  const order = [null, ...HAZARD_KINDS.filter((k) => hazard.has(k))];
+  const i = order.indexOf(hazardLayer);
+  setHazardLayer(order[(i + 1) % order.length]);
+}
+
+const hazEl = $('haz');
+
+/** 凡例と「いま立っている所の想定」。出典と但し書きは常に添える。 */
+function updateHazardUI() {
+  if (!hazEl) return;
+  if (!hazardLayer) { hazEl.classList.remove('on'); return; }
+  const h = hazard.get(hazardLayer);
+  const cols = HAZ_COL[hazardLayer] ?? HAZ_COL.tnm;
+  const here = hazardRankAt(hazardLayer, hereX(), hereZ());
+  $('hz-title').textContent = `${h.meta.label}の想定区域`;
+  $('hz-here').textContent = here
+    ? `いまいる所: ${h.meta.ranks[here - 1] ?? `ランク${here}`}`
+    : 'いまいる所: 区域外';
+  const lg = $('hz-legend');
+  lg.replaceChildren();
+  h.meta.ranks.forEach((label, i) => {
+    const row = document.createElement('div');
+    row.className = 'hz-row' + (here === i + 1 ? ' here' : '');
+    const sw = document.createElement('span');
+    sw.className = 'hz-sw';
+    sw.style.background = cols[i] ?? cols[0];
+    const tx = document.createElement('span');
+    tx.textContent = label;
+    row.append(sw, tx);
+    lg.appendChild(row);
+  });
+  const src = [h.meta.source, h.meta.law, h.meta.note].filter(Boolean).join(' ／ ');
+  $('hz-src').textContent = `出典: ${src}（PLATEAU）`;
+  hazEl.classList.add('on');
+}
+
 const SEA_COL = 0x27606e;
 
 // 海岸線。OSM の natural=coastline は「**進行方向の左が陸・右が海**」という
@@ -5777,6 +5999,8 @@ async function syncTiles() {
     }
     for (const t of drop) dropTile(t);
     rebuildDerived();
+    // 新しく来たタイルにも想定区域を敷く(出していないときは何も作らない)
+    if (hazardLayer) syncHazardMeshes();
   } catch (e) {
     console.error('タイルの読み込みに失敗:', e);
   } finally {
@@ -7276,6 +7500,7 @@ addEventListener('keydown', (e) => {
   if (!started) return;
   if (e.code === 'KeyE') rideAction();
   else if (e.code === 'KeyF') fishAction();
+  else if (e.code === 'KeyH') cycleHazard();
   // 運転中の Space は掘る。ジャンプ・飛行に取られないよう、ここで食い止める
   else if (e.code === 'Space' && operating) { e.preventDefault(); digAction(); }
 });
@@ -7519,6 +7744,8 @@ function tick() {
   stepFishing(dt);
   if (active && !inShop && !operating) stepCreatures(dt);
   if (fishing?.phase === 'bite' || (frame & 7) === 0) updateFishUI();
+  // 「いまいる所の想定」は歩くと変わる。出しているときだけ間引いて更新する
+  if (hazardLayer && (frame & 15) === 0) updateHazardUI();
 
   // 重機。乗り込める1台を探し、乗っているあいだは運転を進める
   if (active && !operating) {
@@ -8071,6 +8298,10 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   // 図鑑(検証用)
   renderZukan, openZukan, closeZukan, zukanOpen, zukanSeen,
   drawSpeciesFish, drawSpeciesLand, drawSpeciesPic,
+  // ハザード(検証用)。ランクと想定水位をその場で引ける
+  hazard, hazardRankAt, hazardLevelAt, HAZARD_KINDS,
+  setHazardLayer, cycleHazard, syncHazardMeshes, buildHazardMesh, updateHazardUI,
+  get hazardLayer() { return hazardLayer; },
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
