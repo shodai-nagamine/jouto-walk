@@ -7501,6 +7501,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyE') rideAction();
   else if (e.code === 'KeyF') fishAction();
   else if (e.code === 'KeyH') cycleHazard();
+  else if (e.code === 'KeyP') toggleAir();
   // 運転中の Space は掘る。ジャンプ・飛行に取られないよう、ここで食い止める
   else if (e.code === 'Space' && operating) { e.preventDefault(); digAction(); }
 });
@@ -7763,6 +7764,8 @@ function tick() {
     if (prev !== opBoard) updateRideUI();
   }
   if (operating) stepOperate(dt);
+  stepPlanes(dt);
+  if ((frame & 15) === 0) updateAirUI();
 
   if (active && !riding && !operating) {
     // 入力を「前後(fb)・左右(lr)」にまとめてから向きに乗せる
@@ -8061,6 +8064,186 @@ function tick() {
 }
 let elapsed = 0, frame = 0;
 
+// ---------------------------------------------------------------- 空を飛ぶ実機
+// いま那覇の空に本当に居る飛行機。ADS-B（機体が自分で出している位置の電波）を
+// 中継して受ける。**時刻表から「それらしく」飛ばしているのではない。**
+//
+// 中継が要る理由: この街は GitHub Pages の静的配信でサーバを持たないが、
+// ADS-B の提供元はどれも CORS ヘッダを返さない。実測で ADSB.lol / OpenSky /
+// adsb.fi / airplanes.live の4つともブラウザから `Failed to fetch` になった。
+// GitHub Actions で定期取得する案は、5分前の位置＝約75kmずれるので使えない
+// （巡航500kt）。よって中継を1枚置いてある（~/dev/tools/adsb-relay）。
+//
+// **中継が落ちても空が静かになるだけ**にしてある。街の他は動く。
+const AIR_URL = (new URLSearchParams(location.search).get('air')
+  ?? (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+      ? 'http://127.0.0.1:8790/naha'
+      : 'https://adsb-naha.shodai-nagamine.workers.dev/naha'));
+const AIR_POLL = 12000;        // 取りにいく間隔(ms)。中継側の保持と合わせる
+const PLANE_PROXY = 1800;      // これより遠い機体は、向きを保って手前へ畳む(m)
+// これより遠いと描かない。60km で 0.7px、120km で 0.4px。実際の空でも
+// そのくらいの距離の機影は「点」として見えるので、点のまま出しておく
+const PLANE_CULL = 120000;
+const FT = 0.3048;             // ft -> m
+const KT = 0.5144;             // kt -> m/s
+const planes = new Map();      // hex -> {g, lat, lon, alt, gs, track, vs, mil, ...}
+let airT = 1e9, airLast = 0, airErr = 0;   // 起動直後に1回取りにいく
+let airOn = true;              // [P] で消せる
+let airAsked = false;          // [P] を押されたか（中継の不調を出してよいか）
+
+// 緯度経度 -> この世界の座標。**z は南向き**（build_world.py と同じ規則）
+const AIR_OLAT = corridor?.meta?.originLat ?? 26.2233;
+const AIR_OLON = corridor?.meta?.originLon ?? 127.7322;
+const AIR_MLON = 111320 * Math.cos(AIR_OLAT * Math.PI / 180);
+const airWorld = (lat, lon) => ({
+  x: (lon - AIR_OLON) * AIR_MLON,
+  z: -(lat - AIR_OLAT) * 111320,
+});
+
+/**
+ * 機体の姿。**実寸で作る。** 生き物は小さすぎて見えないので2倍にしたが、
+ * 飛行機はもともと大きい（B788 は全長57m）。巡航高度なら点、着陸進入なら
+ * 形が見える——それが本当の空の見え方なので、いじらない。
+ */
+function makePlane(mil) {
+  const g = new THREE.Group();
+  // **霧をかけない。** 霧は far 1250m で、飛行機は数kmから数十km先にいる。
+  // かけると全部が霧の色に溶けて1機も見えない。実際の空でも遠くの機影は見える
+  const mat = new THREE.MeshLambertMaterial({ color: mil ? 0x6b7a63 : 0xe8e6df, fog: false });
+  const dark = new THREE.MeshLambertMaterial({ color: mil ? 0x3f4a3a : 0x8d98a2, fog: false });
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(2.6, 2.0, 50, 8), mat);
+  body.rotation.x = Math.PI / 2;              // 機首を -Z へ
+  const wing = new THREE.Mesh(new THREE.BoxGeometry(58, 1.2, 8), mat);
+  wing.position.z = 2;
+  const tailH = new THREE.Mesh(new THREE.BoxGeometry(20, 1.0, 5), mat);
+  tailH.position.z = 22;
+  const tailV = new THREE.Mesh(new THREE.BoxGeometry(1.0, 11, 8), dark);
+  tailV.position.set(0, 5, 22);
+  g.add(body, wing, tailH, tailV);
+  return g;
+}
+
+/** 中継から取り込む。落ちても黙って諦める（次の周期でまた試す）。 */
+async function fetchPlanes() {
+  try {
+    const r = await fetch(AIR_URL, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const j = await r.json();
+    const seen = new Set();
+    for (const a of j.ac ?? []) {
+      if (a.lat == null || a.lon == null) continue;
+      seen.add(a.hex);
+      let p = planes.get(a.hex);
+      if (!p) {
+        p = { g: makePlane(a.mil), mil: a.mil };
+        scene.add(p.g);
+        planes.set(a.hex, p);
+      }
+      Object.assign(p, {
+        lat: a.lat, lon: a.lon, alt: (a.alt ?? 0) * FT,
+        gs: (a.gs ?? 0) * KT, track: a.track ?? 0, vs: (a.vs ?? 0) * FT / 60,
+        flight: a.flight, type: a.type, reg: a.reg, ground: a.ground, t: 0,
+      });
+    }
+    // 消えた機体は捨てる（範囲外へ出た・電波が途切れた）
+    for (const [hex, p] of planes) {
+      if (seen.has(hex)) continue;
+      scene.remove(p.g); disposeTree(p.g); planes.delete(hex);
+    }
+    airLast = performance.now();
+    airErr = 0;
+  } catch {
+    airErr++;                  // 空が静かになるだけ。街は動く
+  }
+}
+
+/**
+ * 1フレーム進める。**取り込みの間は自分で進める。**
+ * 12秒ごとの位置をそのまま置くと、500kt の機体が 3.7km ずつ飛ぶ。
+ * 対地速度と進行方向で埋めて、次の取り込みで実測値へ寄せ直す。
+ */
+function stepPlanes(dt) {
+  if (!airOn) return;
+  airT += dt * 1000;
+  if (airT >= AIR_POLL) { airT = 0; fetchPlanes(); }
+  for (const p of planes.values()) {
+    if (p.lat == null) continue;
+    p.t += dt;
+    const w = airWorld(p.lat, p.lon);
+    // 進行方向は真北から時計回り。この世界は z が南向きなので、北へ進むと z が減る
+    const th = (p.track ?? 0) * Math.PI / 180;
+    const d = p.gs * p.t;
+    const x = w.x + Math.sin(th) * d;
+    const z = w.z - Math.cos(th) * d;
+    const y = p.ground ? groundAt(x, z) + 3 : p.alt + p.vs * p.t;
+
+    // **カメラの遠面(2600m)の内側へ畳む。**
+    // 飛行機は数km〜数十km先にいるので、そのまま置くと1機も描かれない。
+    // 見えている向きと見かけの大きさを保ったまま、手前へ引き寄せる
+    // （空を「投影」として扱う。空ドームと同じ考え方）。
+    // 距離そのものは名札のほうに本当の値を出す
+    const ex = x - camera.position.x, ey = y - camera.position.y, ez = z - camera.position.z;
+    const dist = Math.hypot(ex, ey, ez);
+    p.dist = dist;
+    if (dist > PLANE_CULL) { p.g.visible = false; continue; }
+    p.g.visible = airOn;
+    const k = dist > PLANE_PROXY ? PLANE_PROXY / dist : 1;
+    p.g.position.set(camera.position.x + ex * k,
+                     camera.position.y + ey * k,
+                     camera.position.z + ez * k);
+    p.g.scale.setScalar(k);                  // 見かけの大きさは変わらない
+    p.g.rotation.set(0, -th + Math.PI, 0);   // 機首(-Z)を進行方向へ
+  }
+}
+
+/** いちばん近い機体。名札に使う。 */
+function planeNear() {
+  let best = null, bd = PLANE_CULL;
+  for (const p of planes.values()) {
+    // **畳んだ後の位置ではなく、本当の距離(p.dist)で選ぶ。**
+    // 畳んだ位置で測ると、遠い機体が全部 1800m に並んで見分けがつかない
+    if (p.lat == null || p.dist == null) continue;
+    if (p.dist < bd) { bd = p.dist; best = p; }
+  }
+  return best ? { p: best, d: bd } : null;
+}
+
+const airEl = $('air');
+
+/** 空の様子。**中継が落ちているときは黙らずにそう出す。** */
+function updateAirUI() {
+  if (!airEl) return;
+  if (!airOn) { airEl.classList.remove('on'); return; }
+  const n = planes.size;
+  // **中継が無いことを黙って我慢する。** まだ中継を立てていない/落ちている
+  // ときに「つながらない」を全員に出しても仕方がない。[P] を押した人にだけ返す
+  if (!n && (airErr === 0 || !airAsked)) { airEl.classList.remove('on'); return; }
+  const near = planeNear();
+  $('air-count').textContent = airErr ? '中継につながらない' : `${n} 機`;
+  if (near && !airErr) {
+    const p = near.p;
+    const name = p.flight || p.reg || p.type || '不明';
+    const alt = p.ground ? '地上' : `${Math.round(p.alt / FT).toLocaleString()} ft`;
+    // **本当の距離を出す。** 描くときは遠面の内側へ畳んでいるが、
+    // 数字まで畳むと嘘になる
+    $('air-near').textContent =
+      `${name}${p.type ? `（${p.type}）` : ''}　${alt}　${(near.d / 1000).toFixed(1)} km`
+      + (p.mil ? '　軍用' : '');
+  } else {
+    $('air-near').textContent = airErr ? '空は静かなまま' : '';
+  }
+  airEl.classList.add('on');
+}
+
+/** [P] で空の実機を出し入れする。 */
+function toggleAir() {
+  airAsked = true;
+  airOn = !airOn;
+  for (const p of planes.values()) p.g.visible = airOn;
+  updateAirUI();
+  say(airOn ? '空の実機を出した' : '空の実機を消した');
+}
+
 // ---------------------------------------------------------------- 図鑑
 // 釣った魚と見つけたいきものを見返す画面。造形は Antigravity(agy)に契約を
 // 渡して書かせたものを検分して取り込んだ(シーサー・正殿・車内・重機と同じ)。
@@ -8299,6 +8482,9 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   renderZukan, openZukan, closeZukan, zukanOpen, zukanSeen,
   drawSpeciesFish, drawSpeciesLand, drawSpeciesPic,
   // ハザード(検証用)。ランクと想定水位をその場で引ける
+  // 空の実機(検証用)。取り込みを待たずに引ける
+  planes, fetchPlanes, stepPlanes, planeNear, toggleAir, updateAirUI,
+  makePlane, airWorld, AIR_URL, get airErr() { return airErr; },
   hazard, hazardRankAt, hazardLevelAt, HAZARD_KINDS,
   setHazardLayer, cycleHazard, syncHazardMeshes, buildHazardMesh, updateHazardUI,
   get hazardLayer() { return hazardLayer; },
