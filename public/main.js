@@ -7849,38 +7849,58 @@ let elapsed = 0, frame = 0;
 //      **捕捉フェーズで止める**
 //   3. 開いても歩きっぱなしになり、視点も掴まれたままでタブを押せなかった。
 //      開くときに押しているキーを捨て、ポインタの固定を解く
-const ZUKAN_FISH_CATS = {
-  water: '池・貯水池', wetland: '干潟', river: '川', sea: '海',
-};
-const ZUKAN_CREA_CATS = {
-  tree: '公園の木', grass: '公園の草地', wall: '民家の壁ぎわ',
-  bank: '淡水の岸', tide: '干潟・海辺',
+// なかまの色。札の印に使う
+const ZUKAN_GROUP_COL = {
+  '魚': '#4f9ec4', 'エビ・カニ': '#c08060', '虫': '#7fae5f',
+  'トカゲ': '#9ec46f', 'カエル': '#5fae95',
 };
 
 const zukanEl = $('zukan');
-const zukanPaneFish = $('zukan-pane-fish');
-const zukanPaneCrea = $('zukan-pane-crea');
+const zukanPaneWater = $('zukan-pane-water');
+const zukanPaneLand = $('zukan-pane-land');
 
-/** 表に出てくる名前の実数。延べ件数ではない(同じ魚が2つの水域に出る)。 */
-const zukanTotal = (table) => {
-  const s = new Set();
-  for (const list of Object.values(table)) for (const it of list) s.add(it[0]);
-  return s.size;
-};
+/** 見つけた名前ぜんぶ。釣ったものと見つけたものは同じ図鑑に載る。 */
+const zukanSeen = () => new Set([...seenFish, ...seenCrea]);
 
-/** 1枠ぶんの DOM。名前と説明は textContent で入れる(innerHTML に混ぜない)。 */
-function zukanCard(name, desc, seen, count) {
+/**
+ * 1枠ぶんの DOM。名前と説明は textContent で入れる(innerHTML に混ぜない)。
+ *
+ * 未発見でも**なかまの印だけは出す**。何のなかまがまだ残っているかが見えると、
+ * 次にどこへ歩けばいいかの手がかりになる(住みかは見出しで分かる)。
+ */
+function zukanCard(e, seen, count) {
   const card = document.createElement('div');
   card.className = 'zukan-card' + (seen ? '' : ' unknown');
   const nameEl = document.createElement('div');
   nameEl.className = 'zukan-card-name';
-  nameEl.textContent = seen ? name : '？？？';
+  nameEl.textContent = seen ? e.name : '？？？';
   card.appendChild(nameEl);
+
+  const tags = document.createElement('div');
+  tags.className = 'zukan-tags';
+  const tag = (text, col) => {
+    const s = document.createElement('span');
+    s.className = 'zukan-tag';
+    s.textContent = text;
+    s.style.color = col;
+    tags.appendChild(s);
+  };
+  tag(e.group, ZUKAN_GROUP_COL[e.group] ?? 'rgba(246,243,234,.6)');
+  if (seen) tag(e.how === '釣' ? '釣る' : '見つける',
+                e.how === '釣' ? '#e8642f' : 'rgba(246,243,234,.5)');
+  card.appendChild(tags);
+
   if (seen) {
     const descEl = document.createElement('div');
     descEl.className = 'zukan-card-desc';
-    descEl.textContent = desc;
+    descEl.textContent = e.note;
     card.appendChild(descEl);
+    if (e.cm) {
+      const sz = document.createElement('div');
+      sz.className = 'zukan-size';
+      sz.textContent = `${e.cm[0]}〜${e.cm[1]} cm`;
+      card.appendChild(sz);
+    }
     if (count > 0) {
       const c = document.createElement('div');
       c.className = 'zukan-card-count';
@@ -7891,41 +7911,50 @@ function zukanCard(name, desc, seen, count) {
   return card;
 }
 
-/** 表を1つぶん、見出しと枠の並びにして pane へ足す。 */
-function zukanSection(pane, title, items, seenSet, counts) {
-  const sec = document.createElement('div');
+/** 住みかを1つぶん、見出しと枠の並びにして pane へ足す。 */
+function zukanSection(pane, sec, seen) {
+  const box = document.createElement('div');
+  const got = sec.list.filter((e) => seen.has(e.name)).length;
   const h = document.createElement('h3');
   h.className = 'zukan-category-title';
-  h.textContent = title;
-  sec.appendChild(h);
+  h.textContent = `${sec.place}　${got} / ${sec.list.length}`;
+  box.appendChild(h);
   const grid = document.createElement('div');
   grid.className = 'zukan-grid';
-  for (const [name, desc] of items) {
-    grid.appendChild(zukanCard(name, desc, seenSet.has(name),
-                               counts ? (counts.get(name) ?? 0) : 0));
+  for (const e of sec.list) {
+    grid.appendChild(zukanCard(e, seen.has(e.name), bag.get(e.name) ?? 0));
   }
-  sec.appendChild(grid);
-  pane.appendChild(sec);
+  box.appendChild(grid);
+  pane.appendChild(box);
 }
 
-/** 開くたびに作り直す。記録は遊んでいるあいだに増えるので。 */
+/**
+ * 開くたびに作り直す。記録は遊んでいるあいだに増えるので。
+ *
+ * 並びは LIVING の順(住みか順)そのまま。水辺と陸で札を振り分ける。
+ * 総数は**表から数える**。べた書きすると表を足したときに黙ってずれる。
+ */
 function renderZukan() {
-  const fishTotal = zukanTotal(FISH), creaTotal = zukanTotal(CREATURES);
-  const setBar = (id, label, got, total) => {
-    $(`zukan-prog-${id}-text`).textContent = `${label} ${got} / ${total} 種`;
-    $(`zukan-prog-${id}-fill`).style.width = `${total ? (got / total) * 100 : 0}%`;
-  };
-  setBar('fish', 'さかな', Math.min(seenFish.size, fishTotal), fishTotal);
-  setBar('crea', 'いきもの', Math.min(seenCrea.size, creaTotal), creaTotal);
+  const seen = zukanSeen();
+  const got = [...LIVING_BY_NAME.keys()].filter((n) => seen.has(n)).length;
+  $('zukan-prog-all-text').textContent = `ぜんぶ ${got} / ${LIVING_TOTAL} 種`;
+  $('zukan-prog-all-fill').style.width =
+    `${LIVING_TOTAL ? (got / LIVING_TOTAL) * 100 : 0}%`;
 
-  zukanPaneFish.replaceChildren();
-  for (const [k, items] of Object.entries(FISH)) {
-    zukanSection(zukanPaneFish, ZUKAN_FISH_CATS[k] ?? k, items, seenFish, bag);
+  zukanPaneWater.replaceChildren();
+  zukanPaneLand.replaceChildren();
+  const counts = { 水辺: [0, 0], 陸: [0, 0] };
+  for (const sec of LIVING) {
+    const pane = sec.side === '陸' ? zukanPaneLand : zukanPaneWater;
+    zukanSection(pane, sec, seen);
+    const c = counts[sec.side];
+    c[0] += sec.list.filter((e) => seen.has(e.name)).length;
+    c[1] += sec.list.length;
   }
-  zukanPaneCrea.replaceChildren();
-  for (const [k, items] of Object.entries(CREATURES)) {
-    zukanSection(zukanPaneCrea, ZUKAN_CREA_CATS[k] ?? k, items, seenCrea, null);
-  }
+  // タブにもその側の数を出す。延べ件数なので、同じ名前が2つの住みかに出ると
+  // 両方で数える(見出しの数と足し合わせたときに合うほうを採る)
+  $('zukan-tab-water').textContent = `水辺 ${counts.水辺[0]} / ${counts.水辺[1]}`;
+  $('zukan-tab-land').textContent = `陸 ${counts.陸[0]} / ${counts.陸[1]}`;
 }
 
 function openZukan() {
@@ -7943,7 +7972,7 @@ $('btn-zukan').addEventListener('click', openZukan);
 zukanEl.querySelector('.zukan-close').addEventListener('click', closeZukan);
 zukanEl.querySelector('.zukan-backdrop').addEventListener('click', closeZukan);
 {
-  const tabs = [['zukan-tab-fish', 'zukan-pane-fish'], ['zukan-tab-crea', 'zukan-pane-crea']];
+  const tabs = [['zukan-tab-water', 'zukan-pane-water'], ['zukan-tab-land', 'zukan-pane-land']];
   for (const [tid] of tabs) {
     $(tid).addEventListener('click', () => {
       for (const [t, p] of tabs) {
@@ -8000,7 +8029,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   get operating() { return operating; }, get opBoard() { return opBoard; },
   get opLoad() { return opLoad; },
   // 図鑑(検証用)
-  renderZukan, openZukan, closeZukan, zukanOpen, zukanTotal,
+  renderZukan, openZukan, closeZukan, zukanOpen, zukanSeen,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
