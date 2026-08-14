@@ -6291,14 +6291,16 @@ function updatePurseUI() {
   if (row) row.style.display = coins > 0 ? '' : 'none';
   const c = $('purse');
   if (c) c.textContent = `${coins.toLocaleString()} 円`;
+  // 図鑑はひとつ。釣った種も見つけた種も同じ分母(LIVING_TOTAL)で数える
+  const cr = $('creacount');
+  // 足し算にしない。同じ名前が両方に入っても二重に数えないため
+  if (cr) cr.textContent = `${new Set([...seenFish, ...seenCrea]).size} / ${LIVING_TOTAL} 種`;
   const f = $('fishcount');
   if (f) {
     let n = 0;
     for (const [k, v] of bag) if (FISH_NAMES.has(k)) n += v;
-    f.textContent = `${n} 匹 / ${seenFish.size} 種`;
+    f.textContent = `${n} 匹`;
   }
-  const cr = $('creacount');
-  if (cr) cr.textContent = `${seenCrea.size} 種`;
 }
 
 loadPurse();
@@ -6323,34 +6325,127 @@ const REEL_R = 2.5;           // 投げた場所からこれだけ離れると�
 
 // 沖縄の水辺で釣れる魚。名前は現地の呼び方を添える。
 // k は waters の種別(water=池・貯水池 / wetland=干潟)、river=川、sea=海。
-const FISH = {
-  water: [
-    ['ティラピア', 'ちかごろの池でいちばん釣れる。もとは食用に持ちこまれた魚', 18, 34],
-    ['コイ', '公園の池でよく見る。人に慣れていて岸まで寄ってくる', 30, 62],
-    ['オオウナギ', '夜に出てくる大きなウナギ。石垣の隙間にひそむ', 60, 110],
-    ['テナガエビ', '腕の長いエビ。魚ではないが、よく釣れる', 6, 13],
-  ],
-  wetland: [
-    ['ミナミトビハゼ', 'トントンミー。干潟をはねて歩く、水から出られる魚', 5, 10],
-    ['ミナミクロダイ', 'チンシラー。汽水の濁りを好む', 22, 45],
-    ['シオマネキ', '片方のはさみだけ大きいカニ。潮を招くように振る', 3, 5],
-  ],
-  river: [
-    ['ボウズハゼ', '腹の吸盤で滝をのぼる。川の上流にいる', 8, 15],
-    ['ヨシノボリ', '石の間を跳ねるように動く小さなハゼ', 5, 11],
-    ['オオウナギ', '川の淵の岩陰にひそむ。夜に動く', 60, 110],
-    ['テナガエビ', '腕の長いエビ。石を起こすと逃げていく', 6, 13],
-  ],
-  sea: [
-    ['グルクン', 'タカサゴ。沖縄県の魚。から揚げでよく食べる', 20, 30],
-    ['イラブチャー', 'ブダイ。青い体。サンゴをかじって砂にする', 30, 60],
-    ['ミーバイ', 'ハタ。岩の穴で待ちぶせる。刺身にも汁にも', 25, 55],
-    ['ガーラ', 'ロウニンアジ。港の中まで入ってくる大物', 40, 90],
-    ['チヌマン', 'アイゴ。ひれのとげに毒があるので触らない', 18, 30],
-  ],
-};
+// ---------------------------------------------------------------- いきもの図鑑
+// **図鑑はひとつ。並びは住みか順。** 前は「さかな」と「いきもの」に分けていたが、
+// 魚もいきものなので分け方として成り立っていなかった。実際そのせいで、
+// **シオマネキ(釣りの表)とミナミコメツキガニ(いきものの表)という同じ干潟の
+// 同じカニの仲間が、別々の図鑑に入っていた**。テナガエビの説明が
+// 「魚ではないが、よく釣れる」と自分に言い訳していたのも同じ理由。
+//
+// 本当に分かれているのは生き物の種類ではなく**出会い方**(竿で釣る／歩いて
+// 見つける)だけなので、それは札の印にとどめ、骨組みは住みかにする。
+// この街が場所でできているのと同じ並びになる。
+//
+// how: '釣'=竿で釣る(持ち帰れる) / '見'=見つけて記録する(持ち帰らない)
+// group: なかま。魚 / エビ・カニ / 虫 / トカゲ / カエル
+// cm: 釣れる大きさの幅。see: 見た目と動き
+const LIVING = [
+  { key: 'sea', place: '海', side: '水辺', list: [
+    { name: 'グルクン', group: '魚', how: '釣', cm: [20, 30],
+      note: 'タカサゴ。沖縄県の魚。から揚げでよく食べる' },
+    { name: 'イラブチャー', group: '魚', how: '釣', cm: [30, 60],
+      note: 'ブダイ。青い体。サンゴをかじって砂にする' },
+    { name: 'ミーバイ', group: '魚', how: '釣', cm: [25, 55],
+      note: 'ハタ。岩の穴で待ちぶせる。刺身にも汁にも' },
+    { name: 'ガーラ', group: '魚', how: '釣', cm: [40, 90],
+      note: 'ロウニンアジ。港の中まで入ってくる大物' },
+    { name: 'チヌマン', group: '魚', how: '釣', cm: [18, 30],
+      note: 'アイゴ。ひれのとげに毒があるので触らない' },
+  ] },
+  { key: 'wetland', place: '干潟の水', side: '水辺', list: [
+    { name: 'ミナミトビハゼ', group: '魚', how: '釣', cm: [5, 10],
+      note: 'トントンミー。干潟をはねて歩く、水から出られる魚' },
+    { name: 'ミナミクロダイ', group: '魚', how: '釣', cm: [22, 45],
+      note: 'チンシラー。汽水の濁りを好む' },
+    { name: 'シオマネキ', group: 'エビ・カニ', how: '釣', cm: [3, 5],
+      note: '片方のはさみだけ大きいカニ。潮を招くように振る' },
+  ] },
+  { key: 'river', place: '川', side: '水辺', list: [
+    { name: 'ボウズハゼ', group: '魚', how: '釣', cm: [8, 15],
+      note: '腹の吸盤で滝をのぼる。川の上流にいる' },
+    { name: 'ヨシノボリ', group: '魚', how: '釣', cm: [5, 11],
+      note: '石の間を跳ねるように動く小さなハゼ' },
+    { name: 'オオウナギ', group: '魚', how: '釣', cm: [60, 110],
+      note: '川の淵の岩陰にひそむ。夜に動く' },
+    { name: 'テナガエビ', group: 'エビ・カニ', how: '釣', cm: [6, 13],
+      note: '腕の長いエビ。石を起こすと逃げていく' },
+  ] },
+  { key: 'water', place: '池・貯水池', side: '水辺', list: [
+    { name: 'ティラピア', group: '魚', how: '釣', cm: [18, 34],
+      note: 'ちかごろの池でいちばん釣れる。もとは食用に持ちこまれた魚' },
+    { name: 'コイ', group: '魚', how: '釣', cm: [30, 62],
+      note: '公園の池でよく見る。人に慣れていて岸まで寄ってくる' },
+    { name: 'オオウナギ', group: '魚', how: '釣', cm: [60, 110],
+      note: '夜に出てくる大きなウナギ。石垣の隙間にひそむ' },
+    { name: 'テナガエビ', group: 'エビ・カニ', how: '釣', cm: [6, 13],
+      note: '腕の長いエビ。石を起こすと逃げていく' },
+  ] },
+  { key: 'bank', place: '池・川の岸', side: '水辺', list: [
+    { name: 'オオシオカラトンボ', group: '虫', how: '見', see: ['dragonfly', 'fly'],
+      note: '水色の太いトンボ。水辺を行ったり来たりする' },
+    { name: 'ショウジョウトンボ', group: '虫', how: '見', see: ['dragonfly', 'fly'],
+      note: '真っ赤なトンボ。赤とんぼの仲間ではない' },
+    { name: 'ヒメアマガエル', group: 'カエル', how: '見', see: ['frog', 'sit'],
+      note: '小さくて丸いカエル。雨のあとによく鳴く' },
+  ] },
+  { key: 'tide', place: '干潟・海辺', side: '水辺', list: [
+    { name: 'オカヤドカリ', group: 'エビ・カニ', how: '見', see: ['crab', 'sit'],
+      note: '国の天然記念物。貝がらを借りて歩く。持ち帰れない' },
+    { name: 'ミナミコメツキガニ', group: 'エビ・カニ', how: '見', see: ['crab', 'sit'],
+      note: '干潟を群れになって歩く青いカニ。まっすぐ前に歩く' },
+  ] },
+  { key: 'tree', place: '公園の木', side: '陸', list: [
+    { name: 'クロイワツクツク', group: '虫', how: '見', see: ['cicada', 'sit'],
+      note: '沖縄のツクツクボウシ。夏の終わりに鳴きだす' },
+    { name: 'リュウキュウアブラゼミ', group: '虫', how: '見', see: ['cicada', 'sit'],
+      note: '羽の茶色いセミ。街なかの木でも鳴く' },
+    { name: 'オキナワキノボリトカゲ', group: 'トカゲ', how: '見', see: ['lizard', 'sit'],
+      note: '幹でじっとしている緑のトカゲ。体の色を変える' },
+    { name: 'ナナフシ', group: '虫', how: '見', see: ['stick', 'sit'],
+      note: '枝にそっくりな虫。動かないと見つけられない' },
+  ] },
+  { key: 'grass', place: '公園の草地', side: '陸', list: [
+    { name: 'オオゴマダラ', group: '虫', how: '見', see: ['butterfly', 'fly'],
+      note: '沖縄県の蝶。日本でいちばん大きい蝶のひとつで、さなぎが金色になる' },
+    { name: 'リュウキュウアサギマダラ', group: '虫', how: '見', see: ['butterfly', 'fly'],
+      note: '浅葱色の蝶。冬になると谷あいに群れて集まる' },
+    { name: 'アオカナヘビ', group: 'トカゲ', how: '見', see: ['lizard', 'sit'],
+      note: '草の上を走る細いトカゲ。しっぽが体より長い' },
+  ] },
+  // 民家の壁ぎわ。**この街でいちばん多い住みか**。公園だけを住みかにすると、
+  // 城東小のまわりのような住宅地では一匹も出ない(出発地点から最寄りの公園は
+  // 230m、最寄りの木は 240m だった)
+  { key: 'wall', place: '民家の壁ぎわ', side: '陸', list: [
+    { name: 'ホオグロヤモリ', group: 'トカゲ', how: '見', see: ['lizard', 'sit'],
+      note: '「ケケケ」と鳴くヤモリ。夜、灯りのそばの壁で虫を待つ' },
+    { name: 'シロオビアゲハ', group: '虫', how: '見', see: ['butterfly', 'fly'],
+      note: '黒地に白い帯の蝶。庭のミカンの木で育つ' },
+    { name: 'アオドウガネ', group: '虫', how: '見', see: ['cicada', 'sit'],
+      note: '緑色のコガネムシ。夜、灯りに集まってくる' },
+  ] },
+];
+
+// 実行時の索引は LIVING から作る。**表はひとつだけ持つ。**
+// 釣りと湧かしの側は今までどおりの形で引けるので、動きは変わらない。
+const FISH = {};              // 水域の種別 -> [名前, 説明, 下限cm, 上限cm]
+const CREATURES = {};         // 住みか -> [名前, 説明, 見た目, 動き]
 const FISH_NAMES = new Set();
-for (const list of Object.values(FISH)) for (const f of list) FISH_NAMES.add(f[0]);
+const LIVING_BY_NAME = new Map();
+for (const sec of LIVING) {
+  for (const e of sec.list) {
+    if (e.how === '釣') {
+      (FISH[sec.key] ??= []).push([e.name, e.note, e.cm[0], e.cm[1]]);
+      FISH_NAMES.add(e.name);
+    } else {
+      (CREATURES[sec.key] ??= []).push([e.name, e.note, e.see[0], e.see[1]]);
+    }
+    // 同じ生き物が複数の住みかに出る(オオウナギ・テナガエビ)。名前で1つに数える
+    if (!LIVING_BY_NAME.has(e.name)) LIVING_BY_NAME.set(e.name, { ...e, places: [] });
+    LIVING_BY_NAME.get(e.name).places.push(sec.place);
+  }
+}
+const LIVING_TOTAL = LIVING_BY_NAME.size;
+
 updatePurseUI();          // 前の節の loadPurse() の結果をここで初めて出せる
 
 // 状態は1つだけ。null=釣っていない / 'cast'=待っている / 'bite'=当たり /
@@ -6546,47 +6641,15 @@ function stepFishing(dt) {
 //
 // 魚と同じで、**どこに何が居るとは言わない**。OSM にも PLATEAU にも生き物は
 // 入っていないので、言えるのは「沖縄のこういう場所で見かける生き物」まで。
-// だから居場所の**種類**(木・草地・淡水の岸・潮の岸)で表を分ける。
 //
 // **ヤンバルクイナは入れていない。** あれはやんばる(北部)の鳥で、那覇には居ない。
 // 沖縄でいちばん名の知れた生き物だが、出したら嘘になる。
+//
+// 表そのものは上の LIVING(いきもの図鑑)にまとめてある。ここで引く CREATURES は
+// そこから作った索引で、**魚と同じ1つの表**から来ている。
 const CREA_N = 14;             // 同時に居る数(距離バジェット。歩行者36人・車44台と同じ考え)
 const CREA_NEAR = [7, 70];     // この距離の帯に湧かし直す(m)
 const CATCH_R = 3.4;           // 図鑑に載せられる距離(m)
-
-// [名前, 説明, 見た目, 動き]。動きは 'fly'=舞う / 'sit'=とまっている
-const CREATURES = {
-  tree: [
-    ['クロイワツクツク', '沖縄のツクツクボウシ。夏の終わりに鳴きだす', 'cicada', 'sit'],
-    ['リュウキュウアブラゼミ', '羽の茶色いセミ。街なかの木でも鳴く', 'cicada', 'sit'],
-    ['オキナワキノボリトカゲ', '幹でじっとしている緑のトカゲ。体の色を変える', 'lizard', 'sit'],
-    ['ナナフシ', '枝にそっくりな虫。動かないと見つけられない', 'stick', 'sit'],
-  ],
-  grass: [
-    ['オオゴマダラ', '沖縄県の蝶。日本でいちばん大きい蝶のひとつで、さなぎが金色になる', 'butterfly', 'fly'],
-    ['リュウキュウアサギマダラ', '浅葱色の蝶。冬になると谷あいに群れて集まる', 'butterfly', 'fly'],
-    ['アオカナヘビ', '草の上を走る細いトカゲ。しっぽが体より長い', 'lizard', 'sit'],
-  ],
-  // 民家の壁ぎわ。**この街でいちばん多い住みか**。公園だけを住みかにすると、
-  // 城東小のまわりのような住宅地では一匹も出ない(出発地点から最寄りの公園は
-  // 230m、最寄りの木は 240m だった)
-  wall: [
-    ['ホオグロヤモリ', '「ケケケ」と鳴くヤモリ。夜、灯りのそばの壁で虫を待つ', 'lizard', 'sit'],
-    ['シロオビアゲハ', '黒地に白い帯の蝶。庭のミカンの木で育つ', 'butterfly', 'fly'],
-    ['アオドウガネ', '緑色のコガネムシ。夜、灯りに集まってくる', 'cicada', 'sit'],
-  ],
-  // 淡水(池・川)の岸
-  bank: [
-    ['オオシオカラトンボ', '水色の太いトンボ。水辺を行ったり来たりする', 'dragonfly', 'fly'],
-    ['ショウジョウトンボ', '真っ赤なトンボ。赤とんぼの仲間ではない', 'dragonfly', 'fly'],
-    ['ヒメアマガエル', '小さくて丸いカエル。雨のあとによく鳴く', 'frog', 'sit'],
-  ],
-  // 潮の満ち引きのある岸(干潟・海岸)
-  tide: [
-    ['オカヤドカリ', '国の天然記念物。貝がらを借りて歩く。持ち帰れない', 'crab', 'sit'],
-    ['ミナミコメツキガニ', '干潟を群れになって歩く青いカニ。まっすぐ前に歩く', 'crab', 'sit'],
-  ],
-};
 
 const creatures = [];          // {g, name, note, look, mode, home, phase, alive}
 let creaNear = null;           // いま記録できる1匹
@@ -7928,6 +7991,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   resetPurse: () => { bag.clear(); seenFish.clear(); seenCrea.clear(); coins = 0;
     savePurse(); updatePurseUI(); },
   // いきもの(検証用)。湧かし直しと記録を tick を待たずに回せる
+  LIVING, LIVING_BY_NAME, LIVING_TOTAL,
   creatures, seenCrea, CREATURES, stepCreatures, spawnCreature, pickHome,
   recordCreature, makeCreature, get creaNear() { return creaNear; },
   // 重機の運転(検証用)。乗って掘ってダンプへ積むまで tick を待たずに回せる
