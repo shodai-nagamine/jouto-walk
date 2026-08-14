@@ -7863,6 +7863,41 @@ const zukanPaneLand = $('zukan-pane-land');
 const zukanSeen = () => new Set([...seenFish, ...seenCrea]);
 
 /**
+ * 札の絵を描く。描けたら true。
+ *
+ * **未発見のときは同じ絵を影にして出す。** 描いたあと
+ * `globalCompositeOperation='source-atop'` で全面を薄い色で塗ると、
+ * 絵のある所（アルファのある画素）だけが塗られてシルエットになる。
+ * 描く側の関数に「影の描き方」を足さなくて済む。
+ *
+ * 絵は 240x120 の座標系で描かせ、canvas の実画素だけ devicePixelRatio 倍する。
+ */
+function drawSpeciesPic(cv, e, seen) {
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  const W = 240, H = 120;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const ctx = cv.getContext('2d');
+  if (!ctx) return false;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  let ok = false;
+  try {
+    ok = (typeof drawSpeciesFish === 'function' && drawSpeciesFish(ctx, e.name, W, H))
+      || (typeof drawSpeciesLand === 'function' && drawSpeciesLand(ctx, e.name, W, H));
+  } catch { ok = false; }      // 1種の絵が落ちても図鑑ごと閉じないように
+  if (!ok) return false;
+  if (!seen) {
+    // **不透明で塗る。** 半透明だと元の色が透けて、影ではなく
+    // 「色あせた絵」になる(16%で試して色が残った)。札の側の opacity で薄まる
+    ctx.globalCompositeOperation = 'source-atop';
+    ctx.fillStyle = '#93a0a4';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  return true;
+}
+
+/**
  * 1枠ぶんの DOM。名前と説明は textContent で入れる(innerHTML に混ぜない)。
  *
  * 未発見でも**なかまの印だけは出す**。何のなかまがまだ残っているかが見えると、
@@ -7871,6 +7906,11 @@ const zukanSeen = () => new Set([...seenFish, ...seenCrea]);
 function zukanCard(e, seen, count) {
   const card = document.createElement('div');
   card.className = 'zukan-card' + (seen ? '' : ' unknown');
+
+  const pic = document.createElement('canvas');
+  pic.className = 'zukan-pic';
+  if (drawSpeciesPic(pic, e, seen)) card.appendChild(pic);
+
   const nameEl = document.createElement('div');
   nameEl.className = 'zukan-card-name';
   nameEl.textContent = seen ? e.name : '？？？';
@@ -8030,6 +8070,7 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
   get opLoad() { return opLoad; },
   // 図鑑(検証用)
   renderZukan, openZukan, closeZukan, zukanOpen, zukanSeen,
+  drawSpeciesFish, drawSpeciesLand, drawSpeciesPic,
   bakes, stepBakes, bakeTileMap, drawMap, MAP_SPAN, settleCouncil, historicPosts,
   meshCells, meshAt, siteNotes: () => siteNotes,
   heritageByOsm, heritageSolo, heritageFor, addSoloHeritage,
@@ -8085,6 +8126,763 @@ window.dbg = { player, seesaa, groundAt, supportY, blocked, onRoad, rstore, scen
     return true;
   },
   flyState: () => ({ flying, jumpHeld, holdUsed, held: performance.now() - jumpSince }) };
+
+// ---------------------------------------------------------------- 図鑑の絵
+// 札に載せる 29 種の絵。写真は貼らない。この街は紅型の千鳥も「三角と丸」で
+// 描いているので、絵も手続きで描く(権利・外部ファイル・容量がすべてゼロになる)。
+// 造形は Antigravity(agy)に契約を渡して書かせたものを検分して取り込んだ。
+//
+// 契約: canvas 2D の基本操作だけ / 外部ファイル・drawImage・fillText 禁止 /
+//       Math.random 禁止 / 背景を塗らない(透明のまま) / w,h から座標を計算する /
+//       入口で save・出口で restore / 知らない名前は false を返す。
+//
+// **種ごとの見分けどころを契約に書いた。** そうしないと「ただの魚の絵」が
+// 12枚できる。イラブチャーは青いブダイでくちばし状の口、チヌマンは背びれの
+// とげ、オオウナギは雲状の斑、というふうに1種ずつ指定してある。
+// 指定された沖縄の魚12種を描画する関数です。
+// 描画に成功した場合は true、知らない名前の場合は false を返します。
+function drawSpeciesFish(ctx, name, w, h) {
+    ctx.save();
+    var marginX = w * 0.08;
+    var marginY = h * 0.08;
+    var drawW = w - marginX * 2;
+    var drawH = h - marginY * 2;
+    var cx = w / 2;
+    var cy = h / 2;
+    var scale = Math.min(drawW / 120, drawH / 80);
+    
+    ctx.translate(cx, cy);
+    ctx.scale(scale, scale);
+    
+    function dsf_eye(x, y, r) {
+        ctx.fillStyle = "#000";
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#FFF";
+        ctx.beginPath();
+        ctx.arc(x - r * 0.3, y - r * 0.3, r * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    var known = true;
+    
+    switch (name) {
+        case "グルクン":
+            ctx.fillStyle = "#20B2AA";
+            ctx.beginPath();
+            ctx.moveTo(35, 0);
+            ctx.lineTo(55, -15);
+            ctx.lineTo(45, 0);
+            ctx.lineTo(55, 15);
+            ctx.fill();
+            
+            var grd = ctx.createLinearGradient(0, -15, 0, 15);
+            grd.addColorStop(0, "#008B8B");
+            grd.addColorStop(1, "#E0FFFF");
+            ctx.fillStyle = grd;
+            ctx.beginPath();
+            ctx.moveTo(-45, 0);
+            ctx.quadraticCurveTo(-20, -18, 10, -12);
+            ctx.quadraticCurveTo(30, -5, 45, 0);
+            ctx.quadraticCurveTo(30, 5, 10, 12);
+            ctx.quadraticCurveTo(-20, 18, -45, 0);
+            ctx.fill();
+            
+            ctx.strokeStyle = "#FFD700";
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(-35, -2);
+            ctx.quadraticCurveTo(0, -2, 40, 0);
+            ctx.stroke();
+            
+            dsf_eye(-35, -4, 2);
+            break;
+            
+        case "イラブチャー":
+            ctx.fillStyle = "#1E90FF";
+            ctx.beginPath();
+            ctx.moveTo(35, 0);
+            ctx.lineTo(50, -15);
+            ctx.quadraticCurveTo(55, 0, 50, 15);
+            ctx.fill();
+            
+            ctx.fillStyle = "#0000CD";
+            ctx.beginPath(); ctx.moveTo(-10, -20); ctx.lineTo(30, -20); ctx.lineTo(35, -8); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(10, 20); ctx.lineTo(35, 20); ctx.lineTo(35, 8); ctx.fill();
+            
+            ctx.fillStyle = "#00BFFF";
+            ctx.beginPath();
+            ctx.moveTo(-45, 2);
+            ctx.lineTo(-50, 0);
+            ctx.lineTo(-45, -2);
+            ctx.quadraticCurveTo(-45, -20, -25, -25);
+            ctx.quadraticCurveTo(10, -25, 40, -5);
+            ctx.lineTo(40, 5);
+            ctx.quadraticCurveTo(10, 25, -25, 20);
+            ctx.fill();
+            
+            ctx.strokeStyle = "#20B2AA";
+            ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.arc(-5, 0, 5, -Math.PI/2, Math.PI/2); ctx.stroke();
+            ctx.beginPath(); ctx.arc(10, -5, 5, -Math.PI/2, Math.PI/2); ctx.stroke();
+            ctx.beginPath(); ctx.arc(15, 8, 5, -Math.PI/2, Math.PI/2); ctx.stroke();
+            
+            dsf_eye(-35, -8, 2.5);
+            break;
+            
+        case "ミーバイ":
+            ctx.fillStyle = "#8B4513";
+            ctx.beginPath();
+            ctx.moveTo(35, -10);
+            ctx.quadraticCurveTo(55, 0, 35, 10);
+            ctx.fill();
+            
+            ctx.fillStyle = "#A0522D";
+            ctx.beginPath();
+            ctx.moveTo(-40, -5);
+            ctx.quadraticCurveTo(-20, -25, 10, -20);
+            ctx.quadraticCurveTo(30, -15, 40, -5);
+            ctx.lineTo(40, 5);
+            ctx.quadraticCurveTo(30, 20, 0, 22);
+            ctx.quadraticCurveTo(-30, 20, -45, 10);
+            ctx.lineTo(-30, 2);
+            ctx.fill();
+            
+            ctx.fillStyle = "#3E1F00";
+            var mSpots = [[-20, -10], [-10, 5], [5, -12], [10, 10], [25, 0], [20, -8], [0, 15], [-5, -2]];
+            for (var i = 0; i < mSpots.length; i++) {
+                ctx.beginPath(); ctx.arc(mSpots[i][0], mSpots[i][1], 2, 0, Math.PI*2); ctx.fill();
+            }
+            dsf_eye(-30, -10, 2.5);
+            break;
+            
+        case "ガーラ":
+            ctx.fillStyle = "#808080";
+            ctx.beginPath();
+            ctx.moveTo(35, 0);
+            ctx.lineTo(55, -20);
+            ctx.lineTo(45, 0);
+            ctx.lineTo(55, 20);
+            ctx.fill();
+            
+            ctx.fillStyle = "#A9A9A9";
+            ctx.beginPath(); ctx.moveTo(0, -25); ctx.lineTo(20, -35); ctx.lineTo(15, -20); ctx.fill();
+            
+            var grd2 = ctx.createLinearGradient(0, -25, 0, 25);
+            grd2.addColorStop(0, "#C0C0C0");
+            grd2.addColorStop(1, "#FFFFFF");
+            ctx.fillStyle = grd2;
+            ctx.beginPath();
+            ctx.moveTo(-45, 0);
+            ctx.lineTo(-38, -20);
+            ctx.quadraticCurveTo(-20, -35, 5, -25);
+            ctx.quadraticCurveTo(25, -15, 40, -5);
+            ctx.lineTo(40, 5);
+            ctx.quadraticCurveTo(20, 25, -15, 20);
+            ctx.fill();
+            
+            ctx.strokeStyle = "#808080";
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(-25, 0);
+            ctx.quadraticCurveTo(0, -10, 15, 0);
+            ctx.lineTo(40, 0);
+            ctx.stroke();
+            
+            dsf_eye(-35, -5, 2.5);
+            break;
+
+        case "チヌマン":
+            ctx.fillStyle = "#696969";
+            ctx.beginPath();
+            ctx.moveTo(40, 0); ctx.lineTo(55, -12); ctx.lineTo(50, 0); ctx.lineTo(55, 12);
+            ctx.fill();
+            
+            ctx.strokeStyle = "#2F4F4F";
+            ctx.lineWidth = 1.5;
+            for (var j = -10; j <= 20; j += 5) {
+                ctx.beginPath(); ctx.moveTo(j, -20); ctx.lineTo(j - 3, -32); ctx.stroke();
+            }
+            ctx.fillStyle = "rgba(105, 105, 105, 0.7)";
+            ctx.beginPath();
+            ctx.moveTo(-10, -20); ctx.lineTo(-13, -32); ctx.lineTo(17, -32); ctx.lineTo(20, -20);
+            ctx.fill();
+            
+            ctx.fillStyle = "#8B8878";
+            ctx.beginPath();
+            ctx.moveTo(-45, 5);
+            ctx.quadraticCurveTo(-30, -30, 0, -28);
+            ctx.quadraticCurveTo(30, -25, 43, -5);
+            ctx.lineTo(43, 5);
+            ctx.quadraticCurveTo(30, 25, 0, 25);
+            ctx.quadraticCurveTo(-30, 25, -45, 5);
+            ctx.fill();
+            
+            ctx.fillStyle = "#444";
+            for (var cx2 = -20; cx2 < 30; cx2 += 8) {
+                for (var cy2 = -15; cy2 < 15; cy2 += 8) {
+                    if (cx2*cx2 + cy2*cy2 < 400) {
+                        ctx.beginPath(); ctx.arc(cx2, cy2, 1, 0, Math.PI*2); ctx.fill();
+                    }
+                }
+            }
+            dsf_eye(-35, 0, 2);
+            break;
+
+        case "ミナミトビハゼ":
+            ctx.fillStyle = "#6B8E23";
+            ctx.beginPath();
+            ctx.moveTo(35, 15); ctx.lineTo(50, 5); ctx.lineTo(50, 25); ctx.fill();
+            
+            ctx.fillStyle = "#8FBC8F";
+            ctx.beginPath();
+            ctx.moveTo(-35, 15);
+            ctx.quadraticCurveTo(-25, -5, -5, 0);
+            ctx.quadraticCurveTo(20, 5, 40, 15);
+            ctx.lineTo(40, 20);
+            ctx.quadraticCurveTo(15, 25, -15, 20);
+            ctx.fill();
+            
+            ctx.fillStyle = "#556B2F";
+            ctx.beginPath(); ctx.ellipse(-20, 2, 4, 6, Math.PI/6, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(-28, -1, 4, 6, -Math.PI/6, 0, Math.PI*2); ctx.fill();
+            dsf_eye(-20, 1, 1.5);
+            dsf_eye(-28, -2, 1.5);
+            
+            ctx.fillStyle = "#6B8E23";
+            ctx.beginPath();
+            ctx.moveTo(-15, 15); ctx.lineTo(-10, 25); ctx.lineTo(0, 25); ctx.lineTo(-5, 15); ctx.fill();
+            ctx.strokeStyle = "#556B2F";
+            ctx.beginPath(); ctx.moveTo(-10, 25); ctx.lineTo(-7, 28); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(-5, 25); ctx.lineTo(-2, 28); ctx.stroke();
+            break;
+
+        case "ミナミクロダイ":
+            ctx.fillStyle = "#708090";
+            ctx.beginPath();
+            ctx.moveTo(40, 0); ctx.lineTo(55, -15); ctx.lineTo(45, 0); ctx.lineTo(55, 15); ctx.fill();
+            
+            ctx.beginPath();
+            ctx.moveTo(-10, -20);
+            for(var k=-10; k<25; k+=5) {
+                ctx.lineTo(k, -30 + (k>5?5:0));
+                ctx.lineTo(k+2, -20 + (k>5?2:0));
+            }
+            ctx.fill();
+            
+            ctx.fillStyle = "#B0C4DE";
+            ctx.beginPath();
+            ctx.moveTo(-45, 5);
+            ctx.lineTo(-40, -5);
+            ctx.quadraticCurveTo(-20, -25, 0, -20);
+            ctx.quadraticCurveTo(25, -15, 42, -5);
+            ctx.lineTo(42, 5);
+            ctx.quadraticCurveTo(20, 25, -10, 22);
+            ctx.fill();
+            
+            ctx.strokeStyle = "#778899";
+            ctx.beginPath(); ctx.moveTo(-30, -5); ctx.quadraticCurveTo(0, -15, 40, -2); ctx.stroke();
+            
+            dsf_eye(-35, -2, 2);
+            break;
+
+        case "ボウズハゼ":
+            ctx.fillStyle = "#556B2F";
+            ctx.beginPath();
+            ctx.moveTo(35, 0); ctx.lineTo(50, -10); ctx.quadraticCurveTo(55, 0, 50, 10); ctx.fill();
+            
+            ctx.beginPath(); ctx.moveTo(-10, -8); ctx.quadraticCurveTo(0, -18, 5, -8); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(10, -7); ctx.quadraticCurveTo(20, -15, 25, -5); ctx.fill();
+            
+            ctx.fillStyle = "#6B8E23";
+            ctx.beginPath();
+            ctx.moveTo(-40, 8);
+            ctx.quadraticCurveTo(-45, -5, -35, -10);
+            ctx.quadraticCurveTo(0, -10, 38, -3);
+            ctx.lineTo(38, 3);
+            ctx.quadraticCurveTo(0, 10, -30, 8);
+            ctx.fill();
+            
+            ctx.strokeStyle = "#000";
+            ctx.lineWidth = 1.5;
+            ctx.beginPath(); ctx.ellipse(-20, 9, 6, 2, 0, 0, Math.PI*2); ctx.stroke();
+            
+            dsf_eye(-35, -2, 1.5);
+            break;
+
+        case "ヨシノボリ":
+            ctx.fillStyle = "#8B4513";
+            ctx.beginPath();
+            ctx.moveTo(30, 10); ctx.lineTo(45, 0); ctx.quadraticCurveTo(50, 10, 45, 20); ctx.fill();
+            
+            ctx.fillStyle = "#D2B48C";
+            ctx.beginPath();
+            ctx.moveTo(-35, 18);
+            ctx.quadraticCurveTo(-20, 0, 0, 5);
+            ctx.quadraticCurveTo(20, 10, 35, 12);
+            ctx.lineTo(35, 18);
+            ctx.lineTo(-35, 18);
+            ctx.fill();
+            
+            ctx.fillStyle = "rgba(139, 69, 19, 0.7)";
+            ctx.beginPath(); ctx.moveTo(-15, 15); ctx.quadraticCurveTo(0, 0, 5, 18); ctx.fill();
+            
+            ctx.strokeStyle = "#5C4033";
+            ctx.lineWidth = 0.5;
+            for(var l=1; l<=4; l++){
+                ctx.beginPath(); ctx.moveTo(-15, 15); ctx.lineTo(-15 + l*4, 5 + l*2); ctx.stroke();
+            }
+            
+            ctx.fillStyle = "#DC143C";
+            ctx.beginPath(); ctx.arc(-22, 12, 1.5, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(-18, 14, 1.5, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(-20, 16, 1.5, 0, Math.PI*2); ctx.fill();
+            
+            dsf_eye(-28, 10, 1.5);
+            break;
+
+        case "オオウナギ":
+            ctx.fillStyle = "#5C4033";
+            ctx.beginPath();
+            ctx.moveTo(0, -6);
+            ctx.quadraticCurveTo(30, -10, 50, 0);
+            ctx.quadraticCurveTo(30, 10, 10, 6);
+            ctx.fill();
+            
+            ctx.fillStyle = "#8B5A2B";
+            ctx.beginPath();
+            ctx.moveTo(-45, 0);
+            ctx.quadraticCurveTo(-30, -15, -10, -5);
+            ctx.quadraticCurveTo(10, 5, 30, -5);
+            ctx.quadraticCurveTo(45, -10, 50, 0);
+            ctx.quadraticCurveTo(45, -2, 30, 3);
+            ctx.quadraticCurveTo(10, 13, -10, 3);
+            ctx.quadraticCurveTo(-30, -7, -45, 5);
+            ctx.fill();
+            
+            ctx.fillStyle = "#3E2723";
+            var madas = [[-35, 0, 3], [-20, -5, 4], [0, 2, 5], [20, -2, 4], [35, -2, 3], [-15, 0, 3], [10, -1, 4]];
+            for(var m=0; m<madas.length; m++){
+                ctx.beginPath();
+                var px = madas[m][0], py = madas[m][1], pr = madas[m][2];
+                ctx.moveTo(px+pr, py);
+                ctx.quadraticCurveTo(px+pr, py-pr, px, py-pr);
+                ctx.quadraticCurveTo(px-pr, py-pr, px-pr, py);
+                ctx.quadraticCurveTo(px-pr, py+pr, px, py+pr);
+                ctx.fill();
+            }
+            
+            dsf_eye(-40, -1, 1.2);
+            break;
+
+        case "ティラピア":
+            ctx.fillStyle = "#2F4F4F";
+            ctx.beginPath();
+            ctx.moveTo(35, 0); ctx.lineTo(50, -12); ctx.lineTo(50, 12); ctx.fill();
+            
+            ctx.beginPath();
+            ctx.moveTo(-15, -15); ctx.lineTo(25, -20); ctx.lineTo(35, -5); ctx.fill();
+            ctx.strokeStyle = "#000";
+            for(var n=-10; n<25; n+=4){
+                ctx.beginPath(); ctx.moveTo(n, -15 + (n>10?(n-10)*0.5:0)); ctx.lineTo(n+2, -19); ctx.stroke();
+            }
+            
+            ctx.fillStyle = "#5F9EA0";
+            ctx.beginPath();
+            ctx.moveTo(-40, 5);
+            ctx.lineTo(-35, -5);
+            ctx.quadraticCurveTo(-10, -25, 10, -20);
+            ctx.quadraticCurveTo(25, -15, 38, -5);
+            ctx.lineTo(38, 5);
+            ctx.quadraticCurveTo(15, 25, -15, 20);
+            ctx.fill();
+            
+            dsf_eye(-30, -3, 2);
+            break;
+
+        case "コイ":
+            ctx.fillStyle = "#B8860B";
+            ctx.beginPath();
+            ctx.moveTo(40, 0); ctx.lineTo(55, -12); ctx.quadraticCurveTo(48, 0, 55, 12); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(0, -15); ctx.lineTo(20, -18); ctx.lineTo(25, -10); ctx.fill();
+            
+            ctx.fillStyle = "#DAA520";
+            ctx.beginPath();
+            ctx.moveTo(-45, 5);
+            ctx.quadraticCurveTo(-25, -20, 5, -15);
+            ctx.quadraticCurveTo(30, -10, 42, -4);
+            ctx.lineTo(42, 4);
+            ctx.quadraticCurveTo(30, 15, 5, 18);
+            ctx.quadraticCurveTo(-20, 15, -45, 5);
+            ctx.fill();
+            
+            ctx.strokeStyle = "#8B6508";
+            ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(-43, 5); ctx.quadraticCurveTo(-46, 8, -45, 10); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(-41, 6); ctx.quadraticCurveTo(-44, 9, -43, 11); ctx.stroke();
+            
+            ctx.strokeStyle = "#B8860B";
+            var scales = [[-10, 0], [-2, 2], [6, 0], [-6, -6], [2, -5]];
+            for(var s=0; s<scales.length; s++){
+                ctx.beginPath(); ctx.arc(scales[s][0], scales[s][1], 4, -Math.PI/2, Math.PI/2); ctx.stroke();
+            }
+            
+            dsf_eye(-35, 0, 2);
+            break;
+
+        default:
+            known = false;
+            break;
+    }
+    
+    ctx.restore();
+    return known;
+}
+
+// 沖縄の陸生生物（虫・トカゲ・カエル・エビカニ）17種を描画する関数です。
+// 一致する名前があれば描画し true を、なければ false を返します。
+function drawSpeciesLand(ctx, name, w, h) {
+    ctx.save();
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const s = Math.min(w, h) * 0.42;
+    ctx.translate(cx, cy);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    function drawEllipse(x, y, rx, ry, rot, fillCol, strokeCol) {
+        ctx.beginPath();
+        ctx.ellipse(x * s, y * s, rx * s, ry * s, rot, 0, Math.PI * 2);
+        if (fillCol) { ctx.fillStyle = fillCol; ctx.fill(); }
+        if (strokeCol) { ctx.strokeStyle = strokeCol; ctx.stroke(); }
+    }
+
+    function drawPoly(pts, fillCol, strokeCol) {
+        ctx.beginPath();
+        for (let i = 0; i < pts.length; i += 2) {
+            if (i === 0) ctx.moveTo(pts[i] * s, pts[i + 1] * s);
+            else ctx.lineTo(pts[i] * s, pts[i + 1] * s);
+        }
+        ctx.closePath();
+        if (fillCol) { ctx.fillStyle = fillCol; ctx.fill(); }
+        if (strokeCol) { ctx.strokeStyle = strokeCol; ctx.stroke(); }
+    }
+
+    function drawLines(pts, width, strokeCol) {
+        ctx.beginPath();
+        ctx.lineWidth = width * s;
+        for (let i = 0; i < pts.length; i += 2) {
+            if (i === 0) ctx.moveTo(pts[i] * s, pts[i + 1] * s);
+            else ctx.lineTo(pts[i] * s, pts[i + 1] * s);
+        }
+        ctx.strokeStyle = strokeCol;
+        ctx.stroke();
+    }
+
+    function drawArc(x, y, r, a1, a2, width, col) {
+        ctx.beginPath();
+        ctx.arc(x * s, y * s, r * s, a1, a2);
+        ctx.lineWidth = width * s;
+        ctx.strokeStyle = col;
+        ctx.stroke();
+    }
+
+    let found = true;
+
+    switch (name) {
+        case "クロイワツクツク":
+            [[-0.1, 0], [0.1, 0], [0.3, 0]].forEach(p => {
+                drawLines([p[0], 0, p[0] - 0.2, 0.2, p[0] - 0.2, 0.4], 0.02, "#111");
+                drawLines([p[0], 0, p[0] - 0.1, 0.3, p[0] - 0.1, 0.5], 0.04, "#333");
+            });
+            drawEllipse(-0.4, 0, 0.12, 0.25, 0, "#574", null);
+            drawEllipse(-0.5, -0.15, 0.05, 0.05, 0, "#000", null);
+            drawEllipse(0.1, 0, 0.4, 0.2, 0, "#574", null);
+            ctx.globalAlpha = 0.5;
+            drawEllipse(0.2, 0.1, 0.6, 0.25, 0.1, "#eef", "#333");
+            break;
+
+        // 描き直した。重ねた楕円が溶けて「茶色い塊」になっていた。
+        // 不透明の茶色い翅を屋根形に2枚、その上に胴と幅広の頭を置く
+        // (翅が不透明なのがクロイワツクツクとの決定的な違い)
+        case "リュウキュウアブラゼミ": {
+            drawEllipse(-0.30, 0.34, 0.17, 0.48, 0.30, "#7d5c39", "#553c24");
+            drawEllipse(0.30, 0.34, 0.17, 0.48, -0.30, "#7d5c39", "#553c24");
+            drawEllipse(0, 0.06, 0.17, 0.36, 0, "#4a3a2a", null);
+            drawEllipse(0, -0.30, 0.21, 0.13, 0, "#3b2e22", null);
+            drawEllipse(-0.16, -0.33, 0.05, 0.05, 0, "#141414", null);
+            drawEllipse(0.16, -0.33, 0.05, 0.05, 0, "#141414", null);
+            for (const g of [-1, 1]) {
+                drawLines([g * 0.14, -0.14, g * 0.34, -0.02], 0.032, "#2e241a");
+                drawLines([g * 0.14, 0.02, g * 0.36, 0.16], 0.032, "#2e241a");
+            }
+            break;
+        }
+
+        case "ナナフシ":
+            drawLines([-1, 0, -0.8, 0, -0.7, -0.2, -0.5, 0.2, 0, 0.1, 0.8, 0.2], 0.06, "#7b5");
+            drawLines([-1, 0, -1.2, -0.1], 0.02, "#7b5");
+            drawLines([-1, 0, -1.2, 0.1], 0.02, "#7b5");
+            drawEllipse(-0.95, -0.05, 0.02, 0.02, 0, "#000", null);
+            [[-0.7, -0.8, -0.6], [-0.4, -0.1, 0.8], [0.1, 0.5, -0.6]].forEach(p => {
+                drawLines([p[0], 0, p[0] - 0.1, p[1], p[0] - 0.2, p[2]], 0.02, "#472");
+            });
+            [[-0.7, -0.6, -0.8], [-0.4, 0.5, 0.8], [0.1, -0.4, -0.6]].forEach(p => {
+                drawLines([p[0], 0, p[0] + 0.1, p[1], p[0] + 0.2, p[2]], 0.03, "#7b5");
+            });
+            break;
+
+        case "アオドウガネ":
+            [[-0.2, 0], [0, 0], [0.2, 0]].forEach(p => {
+                drawLines([p[0], 0.1, p[0] - 0.1, 0.3, p[0] - 0.2, 0.5], 0.02, "#000");
+                drawLines([p[0], 0.1, p[0], 0.4, p[0], 0.6], 0.04, "#111");
+            });
+            drawEllipse(-0.5, 0, 0.15, 0.15, 0, "#262", null);
+            drawEllipse(-0.6, -0.1, 0.04, 0.04, 0, "#000", null);
+            drawEllipse(0.1, 0, 0.5, 0.35, 0, "#393", "#141");
+            drawEllipse(-0.1, -0.15, 0.2, 0.08, 0, "#8f8", null);
+            break;
+
+        // 描き直した。白い翅に細い輪郭だけで、契約に書いた
+        // 「黒い翅脈」と「縁に並ぶ黒い斑(碁石模様)」がほとんど出ていなかった
+        case "オオゴマダラ": {
+            ctx.scale(1.18, 1.18);
+            const wh = "#f4f2ea", bk = "#2b2b2b";
+            drawEllipse(-0.44, -0.18, 0.44, 0.30, 0.44, wh, bk);
+            drawEllipse(0.44, -0.18, 0.44, 0.30, -0.44, wh, bk);
+            drawEllipse(-0.34, 0.32, 0.34, 0.30, -0.2, wh, bk);
+            drawEllipse(0.34, 0.32, 0.34, 0.30, 0.2, wh, bk);
+            for (const g of [-1, 1]) {
+                [[0.78, -0.40], [0.86, -0.18], [0.80, 0.02]].forEach(([vx, vy]) =>
+                    drawLines([g * 0.05, -0.10, g * vx, vy], 0.02, bk));
+                [[0.60, 0.54], [0.36, 0.62], [0.14, 0.60]].forEach(([vx, vy]) =>
+                    drawLines([g * 0.05, 0.14, g * vx, vy], 0.02, bk));
+                [[0.72, -0.46], [0.86, -0.28], [0.88, -0.06],
+                 [0.58, 0.58], [0.36, 0.66], [0.14, 0.64]].forEach(([px, py]) =>
+                    drawEllipse(g * px, py, 0.05, 0.05, 0, bk, null));
+            }
+            drawEllipse(0, 0.02, 0.085, 0.34, 0, "#2b2b2b", null);
+            drawEllipse(0, -0.30, 0.055, 0.055, 0, "#1a1a1a", null);
+            drawLines([0, -0.33, -0.17, -0.52], 0.022, "#1a1a1a");
+            drawLines([0, -0.33, 0.17, -0.52], 0.022, "#1a1a1a");
+            break;
+        }
+
+        // 描き直した。翅が #222 で札の地に沈み、浅葱の点だけが浮いて
+        // 「点が散っているだけの絵」になっていた。翅を少し明るくして形を出し、
+        // 浅葱の斑を大きく並べる
+        case "リュウキュウアサギマダラ": {
+            const wing = "#31363b", pale = "#8fd8cc";
+            drawEllipse(-0.42, -0.18, 0.42, 0.28, 0.42, wing, null);
+            drawEllipse(0.42, -0.18, 0.42, 0.28, -0.42, wing, null);
+            drawEllipse(-0.32, 0.30, 0.30, 0.28, -0.2, wing, null);
+            drawEllipse(0.32, 0.30, 0.30, 0.28, 0.2, wing, null);
+            [[0.30, -0.30], [0.50, -0.20], [0.68, -0.08], [0.38, -0.06],
+             [0.56, 0.04], [0.24, 0.24], [0.40, 0.36], [0.20, 0.46]]
+              .forEach(([px, py]) => {
+                drawEllipse(-px, py, 0.085, 0.07, 0, pale, null);
+                drawEllipse(px, py, 0.085, 0.07, 0, pale, null);
+              });
+            drawEllipse(0, 0.02, 0.075, 0.30, 0, "#22252a", null);
+            drawEllipse(0, -0.26, 0.05, 0.05, 0, "#15181c", null);
+            drawLines([0, -0.29, -0.16, -0.48], 0.022, "#15181c");
+            drawLines([0, -0.29, 0.16, -0.48], 0.022, "#15181c");
+            break;
+        }
+
+        case "シロオビアゲハ":
+            for (let i = 0; i < 6; i++) {
+                drawLines([0, 0, i < 3 ? -0.1 : 0.1, -0.1 + (i % 3) * 0.1], 0.02, "#111");
+            }
+            drawEllipse(0, 0, 0.08, 0.3, 0, "#222", null);
+            drawEllipse(0, -0.25, 0.04, 0.04, 0, "#000", null);
+            drawEllipse(-0.35, -0.2, 0.35, 0.25, 0.5, "#111", null);
+            drawEllipse(0.35, -0.2, 0.35, 0.25, -0.5, "#111", null);
+            drawEllipse(-0.25, 0.3, 0.25, 0.3, -0.2, "#111", null);
+            drawEllipse(0.25, 0.3, 0.25, 0.3, 0.2, "#111", null);
+            drawLines([-0.35, 0.5, -0.4, 0.7], 0.04, "#111");
+            drawLines([0.35, 0.5, 0.4, 0.7], 0.04, "#111");
+            drawLines([-0.4, 0.2, -0.1, 0.3], 0.1, "#fff");
+            drawLines([0.4, 0.2, 0.1, 0.3], 0.1, "#fff");
+            break;
+
+        case "オオシオカラトンボ":
+            for (let i = 0; i < 6; i++) {
+                drawLines([0, -0.2, i < 3 ? -0.1 : 0.1, -0.3 + (i % 3) * 0.1], 0.02, "#111");
+            }
+            drawEllipse(0, -0.4, 0.08, 0.08, 0, "#48f", null);
+            drawEllipse(0, -0.3, 0.1, 0.12, 0, "#333", null);
+            drawEllipse(0, 0.2, 0.06, 0.5, 0, "#aef", "#579");
+            ctx.globalAlpha = 0.6;
+            drawEllipse(-0.4, -0.25, 0.4, 0.1, 0.1, "#eee", "#333");
+            drawEllipse(0.4, -0.25, 0.4, 0.1, -0.1, "#eee", "#333");
+            drawEllipse(-0.4, -0.05, 0.4, 0.12, -0.1, "#eee", "#333");
+            drawEllipse(0.4, -0.05, 0.4, 0.12, 0.1, "#eee", "#333");
+            ctx.globalAlpha = 1.0;
+            drawEllipse(-0.15, -0.05, 0.08, 0.08, 0, "#111", null);
+            drawEllipse(0.15, -0.05, 0.08, 0.08, 0, "#111", null);
+            break;
+
+        case "ショウジョウトンボ":
+            for (let i = 0; i < 6; i++) {
+                drawLines([0, -0.2, i < 3 ? -0.1 : 0.1, -0.3 + (i % 3) * 0.1], 0.02, "#300");
+            }
+            drawEllipse(0, -0.4, 0.07, 0.07, 0, "#f22", null);
+            drawEllipse(0, -0.3, 0.08, 0.12, 0, "#d11", null);
+            drawEllipse(0, 0.2, 0.04, 0.5, 0, "#f33", "#a11");
+            ctx.globalAlpha = 0.5;
+            drawEllipse(-0.4, -0.25, 0.4, 0.1, 0.1, "#fee", "#d55");
+            drawEllipse(0.4, -0.25, 0.4, 0.1, -0.1, "#fee", "#d55");
+            drawEllipse(-0.4, -0.05, 0.4, 0.12, -0.1, "#fee", "#d55");
+            drawEllipse(0.4, -0.05, 0.4, 0.12, 0.1, "#fee", "#d55");
+            ctx.globalAlpha = 1.0;
+            drawEllipse(-0.15, -0.25, 0.1, 0.06, 0.1, "#f83", null);
+            drawEllipse(0.15, -0.25, 0.1, 0.06, -0.1, "#f83", null);
+            drawEllipse(-0.15, -0.05, 0.1, 0.08, -0.1, "#f83", null);
+            drawEllipse(0.15, -0.05, 0.1, 0.08, 0.1, "#f83", null);
+            break;
+
+        case "オキナワキノボリトカゲ":
+            drawLines([0, 0.1, 0.1, 0.2, 0.2, 0.4], 0.03, "#151");
+            drawLines([-0.3, 0, -0.2, 0.1, -0.1, 0.3], 0.03, "#151");
+            drawLines([0.1, 0.1, 0.3, 0.3, 0.4, 0.5], 0.05, "#272");
+            drawLines([-0.4, 0, -0.3, 0.2, -0.2, 0.4], 0.04, "#272");
+            drawLines([0.2, 0, 0.8, 0.5], 0.05, "#383");
+            drawEllipse(-0.1, 0, 0.4, 0.15, 0.2, "#383", null);
+            drawEllipse(-0.55, -0.2, 0.15, 0.1, 0.3, "#383", null);
+            drawEllipse(-0.6, -0.25, 0.03, 0.03, 0, "#000", null);
+            for (let i = -0.4; i < 0.2; i += 0.1) {
+                drawPoly([i, i * 0.4 - 0.15, i + 0.05, i * 0.4 - 0.25, i + 0.1, i * 0.4 - 0.1], "#272", null);
+            }
+            break;
+
+        // 描き直した。線が細く散らばって「緑の落書き」に見えていた。
+        // 胴を先に太く置き、尾は体より長く、脚は4本を胴の下から出す
+        case "アオカナヘビ": {
+            const gr = "#6fae4a", dk = "#4d8433";
+            drawLines([0.16, 0.02, 0.62, -0.04, 1.02, 0.16], 0.05, gr);
+            [[-0.30, 0.10, -0.44, 0.34], [-0.30, 0.10, -0.14, 0.36],
+             [0.06, 0.10, -0.08, 0.36], [0.06, 0.10, 0.22, 0.34]]
+              .forEach((l) => drawLines(l, 0.038, dk));
+            drawEllipse(-0.12, 0.02, 0.34, 0.115, 0, gr, null);
+            drawEllipse(-0.52, -0.02, 0.15, 0.085, -0.12, gr, null);
+            drawLines([-0.40, -0.05, 0.14, -0.02], 0.028, "#b6dd97");
+            drawEllipse(-0.60, -0.05, 0.028, 0.028, 0, "#111", null);
+            break;
+        }
+
+        case "ホオグロヤモリ":
+            drawLines([0.1, 0, 0.2, 0.1, 0.3, 0.1], 0.04, "#655");
+            drawLines([-0.2, 0, -0.3, 0.2, -0.1, 0.3], 0.04, "#655");
+            drawLines([0, 0, 0.2, 0.2, 0.4, 0.1], 0.06, "#877");
+            drawLines([-0.3, 0, -0.4, 0.3, -0.2, 0.4], 0.06, "#877");
+            [[0.3, 0.1], [-0.1, 0.3], [0.4, 0.1], [-0.2, 0.4]].forEach(pt => {
+                drawEllipse(pt[0] - 0.03, pt[1], 0.03, 0.03, 0, "#877", null);
+                drawEllipse(pt[0], pt[1] - 0.03, 0.03, 0.03, 0, "#877", null);
+                drawEllipse(pt[0] + 0.03, pt[1], 0.03, 0.03, 0, "#877", null);
+            });
+            drawEllipse(0.1, 0, 0.4, 0.05, 0.1, "#766", null);
+            for (let i = 0.2; i < 0.5; i += 0.1) {
+                drawEllipse(i, i * 0.1 - 0.05, 0.02, 0.04, 0, "#544", null);
+            }
+            drawEllipse(-0.1, 0, 0.25, 0.12, 0, "#877", null);
+            drawEllipse(-0.4, 0, 0.15, 0.1, 0, "#877", null);
+            drawEllipse(-0.45, -0.05, 0.04, 0.04, 0, "#000", null);
+            break;
+
+        case "ヒメアマガエル":
+            ctx.scale(0.7, 0.7);
+            drawLines([0.3, 0.1, 0.4, 0.3], 0.03, "#875");
+            drawLines([-0.05, 0.1, -0.05, 0.3], 0.02, "#875");
+            drawEllipse(0.15, 0.15, 0.15, 0.08, -0.2, "#a86", null);
+            drawLines([0.2, 0.15, 0.3, 0.35], 0.04, "#a86");
+            drawLines([-0.1, 0.1, -0.1, 0.35], 0.03, "#a86");
+            drawEllipse(0, 0, 0.3, 0.25, 0, "#b97", null);
+            drawPoly([-0.2, -0.1, -0.5, 0.1, -0.2, 0.2], "#b97", null);
+            drawEllipse(-0.35, -0.02, 0.04, 0.04, 0, "#000", null);
+            drawPoly([0, -0.1, 0.1, -0.2, 0.2, 0, 0.1, 0.1], "#643", null);
+            break;
+
+        case "テナガエビ":
+            drawLines([-0.2, -0.1, -0.8, -0.3], 0.02, "#f87");
+            drawLines([-0.2, -0.1, -1.0, -0.1], 0.02, "#f87");
+            for (let i = 0; i < 4; i++) {
+                let dx = 0.0 + i * 0.1;
+                drawLines([dx, 0.1, dx + 0.05, 0.3, dx + 0.1, 0.5], 0.015, "#dca");
+                drawLines([dx + 0.05, 0.1, dx + 0.1, 0.4, dx + 0.2, 0.6], 0.02, "#eca");
+            }
+            drawLines([-0.1, 0.1, -0.4, 0.3, -0.8, 0.2], 0.03, "#ca9");
+            drawEllipse(-0.8, 0.2, 0.08, 0.03, -0.2, "#d98", null);
+            drawLines([-0.1, 0.1, -0.5, 0.4, -0.9, 0.3], 0.05, "#eba");
+            drawEllipse(-0.9, 0.3, 0.08, 0.03, -0.2, "#e87", null);
+            ctx.globalAlpha = 0.8;
+            drawEllipse(0.2, 0, 0.4, 0.15, 0, "#ffe", "#fca");
+            drawEllipse(-0.1, -0.05, 0.2, 0.15, -0.2, "#fdf", "#fca");
+            ctx.globalAlpha = 1.0;
+            drawEllipse(-0.25, -0.15, 0.03, 0.03, 0, "#000", null);
+            break;
+
+        case "シオマネキ":
+            for (let i = 0; i < 8; i++) {
+                let dir = i < 4 ? -1 : 1;
+                let j = i % 4;
+                drawLines([0, 0.1, dir * (0.2 + j * 0.1), 0.4, dir * (0.3 + j * 0.15), 0.7], 0.03, i < 4 ? "#843" : "#a54");
+            }
+            drawPoly([-0.25, -0.2, 0.25, -0.2, 0.2, 0.2, -0.2, 0.2], "#c65", null);
+            drawLines([-0.1, -0.2, -0.2, -0.5], 0.02, "#da8");
+            drawEllipse(-0.2, -0.5, 0.04, 0.04, 0, "#000", null);
+            drawLines([0.1, -0.2, 0.2, -0.5], 0.02, "#da8");
+            drawEllipse(0.2, -0.5, 0.04, 0.04, 0, "#000", null);
+            drawLines([0.1, 0.1, 0.3, 0.2], 0.04, "#d76");
+            drawEllipse(0.3, 0.2, 0.05, 0.03, 0, "#d76", null);
+            drawLines([-0.1, 0.1, -0.4, 0.2, -0.6, 0.0], 0.08, "#f65");
+            drawEllipse(-0.6, 0, 0.25, 0.15, 0.2, "#f65", "#c32");
+            break;
+
+        case "オカヤドカリ":
+            drawEllipse(0.2, -0.1, 0.4, 0.4, 0.2, "#dca", "#865");
+            drawArc(0.2, -0.1, 0.3, 0, Math.PI * 1.5, 0.02, "#a86");
+            drawArc(0.2, -0.1, 0.15, 0, Math.PI, 0.02, "#a86");
+            for (let i = 0; i < 4; i++) {
+                drawLines([-0.1, 0.1, -0.1 - i * 0.05, 0.3, -0.1 - i * 0.1, 0.5], 0.03, "#424");
+                drawLines([-0.1, 0.1, -0.2 - i * 0.1, 0.4, -0.3 - i * 0.1, 0.7], 0.05, "#646");
+            }
+            drawLines([-0.3, 0, -0.5, 0.1, -0.6, 0.0], 0.06, "#525");
+            drawEllipse(-0.6, 0, 0.1, 0.06, 0.2, "#525", "#313");
+            drawLines([-0.3, 0, -0.6, 0.2, -0.7, 0.0], 0.08, "#747");
+            drawEllipse(-0.7, 0, 0.12, 0.08, 0.2, "#747", "#424");
+            drawEllipse(-0.3, -0.1, 0.1, 0.1, 0, "#535", null);
+            drawLines([-0.3, -0.1, -0.5, -0.3], 0.02, "#868");
+            drawEllipse(-0.5, -0.3, 0.04, 0.04, 0, "#000", null);
+            break;
+
+        case "ミナミコメツキガニ":
+            ctx.scale(0.8, 0.8);
+            for (let i = 0; i < 8; i++) {
+                let dir = i < 4 ? -1 : 1;
+                let j = i % 4;
+                drawLines([0, 0.1, dir * (0.2 + j * 0.1), 0.3, dir * (0.3 + j * 0.15), 0.8], 0.02, i < 4 ? "#567" : "#789");
+            }
+            drawEllipse(0, 0, 0.25, 0.25, 0, "#89a", null);
+            drawLines([-0.1, -0.2, -0.15, -0.35], 0.02, "#9ab");
+            drawEllipse(-0.15, -0.35, 0.03, 0.03, 0, "#000", null);
+            drawLines([0.1, -0.2, 0.15, -0.35], 0.02, "#9ab");
+            drawEllipse(0.15, -0.35, 0.03, 0.03, 0, "#000", null);
+            drawLines([-0.1, 0.1, -0.3, 0.1], 0.04, "#789");
+            drawEllipse(-0.3, 0.1, 0.06, 0.04, 0, "#89a", null);
+            drawLines([0.1, 0.1, 0.3, 0.1], 0.04, "#789");
+            drawEllipse(0.3, 0.1, 0.06, 0.04, 0, "#89a", null);
+            break;
+
+        default:
+            found = false;
+            break;
+    }
+
+    ctx.restore();
+    return found;
+}
 
 // ---------------------------------------------------------------- 紅型と おもろ
 // 読み込み画面の地。紅型(びんがた)は琉球の型染めで、

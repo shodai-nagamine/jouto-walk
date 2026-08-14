@@ -224,6 +224,10 @@
     background:rgba(0,0,0,.2); min-width:0; }
   /* まだ見つけていない枠は薄く点線に。あと何種いるかが見えるのが図鑑の要 */
   #zukan .zukan-card.unknown { opacity:.4; border-style:dashed; }
+  /* 絵。札の上半分。未発見の枠では中身を描かず、影だけを出す */
+  #zukan .zukan-pic { width:100%; aspect-ratio:2/1; display:block;
+    background:rgba(246,243,234,.05); border-radius:4px; }
+  #zukan .zukan-card.unknown .zukan-pic { background:rgba(246,243,234,.03); }
   #zukan .zukan-card-name { font-weight:700; font-size:12.5px; }
   #zukan .zukan-card-desc { font-size:11px; opacity:.8; line-height:1.55; }
   /* なかま(魚・虫…)と出会い方(釣・見)の印。未発見の枠でも なかま だけは出す */
