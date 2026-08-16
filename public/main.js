@@ -8100,6 +8100,8 @@ const PLANE_PROXY = 1800;      // これより遠い機体は、向きを保っ�
 // 人の目は約1分角を見分けるのに、この画面は 1px が約4.4分角しかないため。
 // **現実には見えている機影が画面では見えない**ので、そのぶんを補う
 const PLANE_MIN_PX = 5;
+// これより大きく写るなら実寸の形で、小さいなら点で出す
+const PLANE_SHAPE_PX = 26;
 // これより遠いと描かない。60km で 0.7px、120km で 0.4px。実際の空でも
 // そのくらいの距離の機影は「点」として見えるので、点のまま出しておく
 const PLANE_CULL = 120000;
@@ -8141,6 +8143,17 @@ function makePlane(mil) {
   const tailV = new THREE.Mesh(new THREE.BoxGeometry(1.0, 11, 8), dark);
   tailV.position.set(0, 5, 22);
   g.add(body, wing, tailH, tailV);
+
+  // **遠くでは形ではなく点で出す。**
+  // 長さが5pxになるよう膨らませても、胴も翼も細いので**厚みが0.5px未満**になり、
+  // ほとんど塗られない(実測: 48.6km の機体が画面上わずか1画素だった)。
+  // 遠景は常にカメラを向く板1枚に差し替える。実際の空でも遠くの機影は点に見える
+  const dot = new THREE.Sprite(new THREE.SpriteMaterial({
+    color: mil ? 0x9ab08e : 0xf2f0e8, fog: false, depthWrite: false,
+  }));
+  g.add(dot);
+  g.userData.dot = dot;
+  g.userData.body = [body, wing, tailH, tailV];
   return g;
 }
 
@@ -8216,12 +8229,30 @@ function stepPlanes(dt) {
     p.g.position.set(camera.position.x + ex * k,
                      camera.position.y + ey * k,
                      camera.position.z + ez * k);
-    // 実寸のままの見かけの大きさ(px)。足りなければその分だけ膨らませる
-    const pxPerRad = innerHeight / (2 * Math.tan(camera.fov * Math.PI / 360));
+    // 実寸のままの見かけの大きさ(px)。
+    // **高さは innerHeight から取らない。** 埋め込みの枠では 0 になることがあり、
+    // そうなると倍率が全部 0 になって何も見えなくなる。描画キャンバスから取る
+    const vh = renderer.domElement.clientHeight || innerHeight || 800;
+    const pxPerRad = vh / (2 * Math.tan(camera.fov * Math.PI / 360));
     const truePx = 57 / dist * pxPerRad;
-    const boost = truePx < PLANE_MIN_PX ? PLANE_MIN_PX / truePx : 1;
-    p.g.scale.setScalar(k * boost);
-    p.boost = boost;                         // 名札に出す(膨らませたことを隠さない)
+    p.truePx = truePx;
+    const dot = p.g.userData.dot, bodyParts = p.g.userData.body ?? [];
+    if (truePx < PLANE_SHAPE_PX) {
+      // 遠い。形をやめて点にする。**点の大きさは画面上で一定**
+      p.g.scale.setScalar(k);
+      for (const m of bodyParts) m.visible = false;
+      if (dot) {
+        dot.visible = true;
+        // 点は g の中にあるので、描かれる大きさは w*k、距離は dist*k。
+        // 見かけ = w*k/(dist*k) = w/dist なので、w = dist * (欲しいpx / pxPerRad)
+        dot.scale.setScalar(dist * PLANE_MIN_PX / pxPerRad);
+      }
+    } else {
+      // 近い。実寸の形で出す
+      p.g.scale.setScalar(k);
+      for (const m of bodyParts) m.visible = true;
+      if (dot) dot.visible = false;
+    }
     p.g.rotation.set(0, -th + Math.PI, 0);   // 機首(-Z)を進行方向へ
   }
 }
