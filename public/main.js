@@ -8089,7 +8089,7 @@ let elapsed = 0, frame = 0;
 const AIR_URL = (new URLSearchParams(location.search).get('air')
   ?? (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
       ? 'http://127.0.0.1:8790/naha'
-      : 'https://adsb-naha.shodai-nagamine.workers.dev/naha'));
+      : 'https://adsb-naha.adsb-relay.workers.dev/naha'));
 const AIR_POLL = 12000;        // 取りにいく間隔(ms)。中継側の保持と合わせる
 const PLANE_PROXY = 1800;      // これより遠い機体は、向きを保って手前へ畳む(m)
 // これより遠いと描かない。60km で 0.7px、120km で 0.4px。実際の空でも
@@ -8101,6 +8101,7 @@ const planes = new Map();      // hex -> {g, lat, lon, alt, gs, track, vs, mil, 
 let airT = 1e9, airLast = 0, airErr = 0;   // 起動直後に1回取りにいく
 let airOn = true;              // [P] で消せる
 let airAsked = false;          // [P] を押されたか（中継の不調を出してよいか）
+let airStale = false, airAge = 0;   // 中継が古い位置を返しているか
 $('btn-air')?.classList.toggle('on', airOn);   // 画面のボタンの初期の点灯
 
 // 緯度経度 -> この世界の座標。**z は南向き**（build_world.py と同じ規則）
@@ -8164,6 +8165,10 @@ async function fetchPlanes() {
     }
     airLast = performance.now();
     airErr = 0;
+    // 中継が上流に弾かれたとき、直前の良い位置を返してくる。**そう出す。**
+    // 上流(ADSB.lol)は Cloudflare の共有IPを断続的に 429 で弾く
+    airStale = !!j.stale;
+    airAge = j.age ?? 0;
   } catch {
     airErr++;                  // 空が静かになるだけ。街は動く
   }
@@ -8231,7 +8236,8 @@ function updateAirUI() {
   // ときに「つながらない」を全員に出しても仕方がない。[P] を押した人にだけ返す
   if (!n && (airErr === 0 || !airAsked)) { airEl.classList.remove('on'); return; }
   const near = planeNear();
-  $('air-count').textContent = airErr ? '中継につながらない' : `${n} 機`;
+  $('air-count').textContent = airErr ? '中継につながらない'
+    : (airStale ? `${n} 機（${airAge}秒前）` : `${n} 機`);
   if (near && !airErr) {
     const p = near.p;
     const name = p.flight || p.reg || p.type || '不明';
