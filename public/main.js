@@ -8086,12 +8086,20 @@ let elapsed = 0, frame = 0;
 // （巡航500kt）。よって中継を1枚置いてある（~/dev/tools/adsb-relay）。
 //
 // **中継が落ちても空が静かになるだけ**にしてある。街の他は動く。
+// **手元で開いたときも、既定は公開中の中継を見る。**
+// 以前は localhost だと開発用の中継(127.0.0.1:8790)を見にいっていたが、
+// それは普段動いていないので、手元で開くと必ず空になっていた。
+// 開発用を使いたいときは ?air=http://127.0.0.1:8790/naha と明示する
 const AIR_URL = (new URLSearchParams(location.search).get('air')
-  ?? (location.hostname === 'localhost' || location.hostname === '127.0.0.1'
-      ? 'http://127.0.0.1:8790/naha'
-      : 'https://adsb-naha.adsb-relay.workers.dev/naha'));
+  ?? 'https://adsb-naha.adsb-relay.workers.dev/naha');
 const AIR_POLL = 12000;        // 取りにいく間隔(ms)。中継側の保持と合わせる
 const PLANE_PROXY = 1800;      // これより遠い機体は、向きを保って手前へ畳む(m)
+// **画面に出す最小の大きさ(px)。**
+// 実寸のままだと 20km 先の旅客機が 1.9px、67km 先が 0.57px にしかならず、
+// 画面上は消える(実測)。これは「実寸が正しい」ゆえの取りこぼしで、
+// 人の目は約1分角を見分けるのに、この画面は 1px が約4.4分角しかないため。
+// **現実には見えている機影が画面では見えない**ので、そのぶんを補う
+const PLANE_MIN_PX = 5;
 // これより遠いと描かない。60km で 0.7px、120km で 0.4px。実際の空でも
 // そのくらいの距離の機影は「点」として見えるので、点のまま出しておく
 const PLANE_CULL = 120000;
@@ -8208,7 +8216,12 @@ function stepPlanes(dt) {
     p.g.position.set(camera.position.x + ex * k,
                      camera.position.y + ey * k,
                      camera.position.z + ez * k);
-    p.g.scale.setScalar(k);                  // 見かけの大きさは変わらない
+    // 実寸のままの見かけの大きさ(px)。足りなければその分だけ膨らませる
+    const pxPerRad = innerHeight / (2 * Math.tan(camera.fov * Math.PI / 360));
+    const truePx = 57 / dist * pxPerRad;
+    const boost = truePx < PLANE_MIN_PX ? PLANE_MIN_PX / truePx : 1;
+    p.g.scale.setScalar(k * boost);
+    p.boost = boost;                         // 名札に出す(膨らませたことを隠さない)
     p.g.rotation.set(0, -th + Math.PI, 0);   // 機首(-Z)を進行方向へ
   }
 }
@@ -8244,8 +8257,15 @@ function updateAirUI() {
     const alt = p.ground ? '地上' : `${Math.round(p.alt / FT).toLocaleString()} ft`;
     // **本当の距離を出す。** 描くときは遠面の内側へ畳んでいるが、
     // 数字まで畳むと嘘になる
+    // どっちを見ればいいか。真北から時計回りの方角を八方位で出す
+    const bx = p.lon != null ? airWorld(p.lat, p.lon) : null;
+    let dir = '';
+    if (bx) {
+      const a = (Math.atan2(bx.x - player.x, -(bx.z - player.z)) * 180 / Math.PI + 360) % 360;
+      dir = ['北','北東','東','南東','南','南西','西','北西'][Math.round(a / 45) % 8];
+    }
     $('air-near').textContent =
-      `${name}${p.type ? `（${p.type}）` : ''}　${alt}　${(near.d / 1000).toFixed(1)} km`
+      `${name}${p.type ? `（${p.type}）` : ''}　${alt}　${dir}${(near.d / 1000).toFixed(1)} km`
       + (p.mil ? '　軍用' : '');
   } else {
     $('air-near').textContent = airErr ? '空は静かなまま' : '';
