@@ -1222,6 +1222,7 @@ function setHazardLayer(kind) {
   hazardLayer = kind;
   syncHazardMeshes();
   updateHazardUI();
+  $('btn-haz')?.classList.toggle('on', !!kind);
   const h = kind && hazard.get(kind);
   say(h ? `${h.meta.label}の想定区域を出した` : '想定区域を消した');
 }
@@ -7507,6 +7508,16 @@ addEventListener('keydown', (e) => {
 });
 
 $('fs-btn').addEventListener('click', fishAction);
+// 画面のボタン。**キーだけの機能を作らない。** スマホには H も P も無い
+for (const [id, fn] of [['btn-haz', () => cycleHazard()], ['btn-air', () => toggleAir()]]) {
+  const b = $(id);
+  if (!b) continue;
+  b.addEventListener('click', fn);
+  b.addEventListener('touchstart', (e) => { e.preventDefault(); fn(); }, { passive: false });
+}
+// **ここで airOn を読んではいけない。** 宣言は下の「空を飛ぶ実機」の節にあり、
+// この行はそれより先に走るので TDZ になる。初期の点灯は宣言のところで行う
+
 $('fs-btn').addEventListener('touchstart', (e) => {
   e.preventDefault();
   fishAction();
@@ -8090,6 +8101,7 @@ const planes = new Map();      // hex -> {g, lat, lon, alt, gs, track, vs, mil, 
 let airT = 1e9, airLast = 0, airErr = 0;   // 起動直後に1回取りにいく
 let airOn = true;              // [P] で消せる
 let airAsked = false;          // [P] を押されたか（中継の不調を出してよいか）
+$('btn-air')?.classList.toggle('on', airOn);   // 画面のボタンの初期の点灯
 
 // 緯度経度 -> この世界の座標。**z は南向き**（build_world.py と同じ規則）
 const AIR_OLAT = corridor?.meta?.originLat ?? 26.2233;
@@ -8239,6 +8251,7 @@ function updateAirUI() {
 function toggleAir() {
   airAsked = true;
   airOn = !airOn;
+  $('btn-air')?.classList.toggle('on', airOn);
   for (const p of planes.values()) p.g.visible = airOn;
   updateAirUI();
   say(airOn ? '空の実機を出した' : '空の実機を消した');
