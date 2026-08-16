@@ -8099,7 +8099,9 @@ const PLANE_PROXY = 1800;      // これより遠い機体は、向きを保っ�
 // 画面上は消える(実測)。これは「実寸が正しい」ゆえの取りこぼしで、
 // 人の目は約1分角を見分けるのに、この画面は 1px が約4.4分角しかないため。
 // **現実には見えている機影が画面では見えない**ので、そのぶんを補う
-const PLANE_MIN_PX = 5;
+// 5px にしたら、画面中央の照準(#reticle)と見分けがつかず「見えない」と言われた。
+// 実測で 15km 先の機体が 5x5 画素。**空の広さに対して小さすぎる**ので 10px にする
+const PLANE_MIN_PX = 10;
 // これより大きく写るなら実寸の形で、小さいなら点で出す
 const PLANE_SHAPE_PX = 26;
 // これより遠いと描かない。60km で 0.7px、120km で 0.4px。実際の空でも
@@ -8295,8 +8297,17 @@ function updateAirUI() {
       const a = (Math.atan2(bx.x - player.x, -(bx.z - player.z)) * 180 / Math.PI + 360) % 360;
       dir = ['北','北東','東','南東','南','南西','西','北西'][Math.round(a / 45) % 8];
     }
+    // **どれだけ見上げるかを出す。** 35,000ft の機体が 16km 先にいると
+    // 仰角 34度。水平線を見ていても永久に見つからない
+    let up = '';
+    if (!p.ground) {
+      const horiz = Math.max(1, Math.sqrt(Math.max(0, near.d * near.d
+        - Math.pow(p.alt - (player.y - EYE), 2))));
+      const deg = Math.round(Math.atan2(p.alt - (player.y - EYE), horiz) * 180 / Math.PI);
+      if (deg > 2) up = `　見上げ ${deg}°`;
+    }
     $('air-near').textContent =
-      `${name}${p.type ? `（${p.type}）` : ''}　${alt}　${dir}${(near.d / 1000).toFixed(1)} km`
+      `${name}${p.type ? `（${p.type}）` : ''}　${alt}　${dir}${(near.d / 1000).toFixed(1)} km${up}`
       + (p.mil ? '　軍用' : '');
   } else {
     $('air-near').textContent = airErr ? '空は静かなまま' : '';
