@@ -8103,7 +8103,7 @@ const PLANE_PROXY = 1800;      // これより遠い機体は、向きを保っ�
 // 実測で 15km 先の機体が 5x5 画素。**空の広さに対して小さすぎる**ので 10px にする
 const PLANE_MIN_PX = 10;
 // これより大きく写るなら実寸の形で、小さいなら点で出す
-const PLANE_SHAPE_PX = 26;
+const PLANE_SHAPE_PX = 20;
 // これより遠いと描かない。60km で 0.7px、120km で 0.4px。実際の空でも
 // そのくらいの距離の機影は「点」として見えるので、点のまま出しておく
 const PLANE_CULL = 120000;
@@ -8125,37 +8125,449 @@ const airWorld = (lat, lon) => ({
   z: -(lat - AIR_OLAT) * 111320,
 });
 
+// ────────────────────────────────────────────────────────────
+// 機体の姿
+//
+// **実寸で作る。** 生き物は小さすぎて見えないので2倍にしたが、飛行機は
+// もともと大きい。巡航高度なら点、着陸進入なら形が見える——それが本当の
+// 空の見え方なので、そこはいじらない。
+//
+// **大きさと形は型式ごとに変える。** 以前は全機を「全長57m・全幅58mの
+// 筒に板を3枚」で描いていた。実際には那覇の空を通るものだけでも
+// DH8D(全幅28m)から B77W(全幅65m)まで2倍以上の開きがあり、発動機の数も
+// 2発と4発があり、プロペラ機もヘリもオスプレイも飛んでいる。
+// ADS-B は型式コードを送ってくるので、それを使う。
+// ────────────────────────────────────────────────────────────
+
+/** [全長m, 全幅m, 発動機の数, 形]。実機の諸元から。 */
+const PLANE_SPEC = {
+  // ── 那覇に多い小型機 ──
+  A319: [33.8, 35.8, 2, 'jet'], A320: [37.6, 35.8, 2, 'jet'], A321: [44.5, 35.8, 2, 'jet'],
+  A20N: [37.6, 35.8, 2, 'jet'], A21N: [44.5, 35.8, 2, 'jet'], A19N: [33.8, 35.8, 2, 'jet'],
+  B737: [33.6, 28.9, 2, 'jet'], B738: [39.5, 35.8, 2, 'jet'], B739: [42.1, 35.8, 2, 'jet'],
+  B37M: [35.6, 35.9, 2, 'jet'], B38M: [39.5, 35.9, 2, 'jet'], B39M: [42.2, 35.9, 2, 'jet'],
+  B752: [47.3, 38.0, 2, 'jet'],
+  // ── 中〜大型 ──
+  B762: [48.5, 47.6, 2, 'jet'], B763: [54.9, 47.6, 2, 'jet'],
+  B772: [63.7, 60.9, 2, 'jet'], B77L: [63.7, 64.8, 2, 'jet'], B77W: [73.9, 64.8, 2, 'jet'],
+  B788: [56.7, 60.1, 2, 'jet'], B789: [62.8, 60.1, 2, 'jet'], B78X: [68.3, 60.1, 2, 'jet'],
+  B744: [70.7, 64.4, 4, 'jet'], B748: [76.3, 68.4, 4, 'jet'],
+  A332: [58.8, 60.3, 2, 'jet'], A333: [63.7, 60.3, 2, 'jet'], A339: [63.7, 64.0, 2, 'jet'],
+  A359: [66.8, 64.8, 2, 'jet'], A35K: [73.8, 64.8, 2, 'jet'],
+  A343: [63.7, 60.3, 4, 'jet'], A346: [75.4, 63.5, 4, 'jet'], A388: [72.7, 79.8, 4, 'jet'],
+  // ── 地域路線・プロペラ ──
+  DH8D: [32.8, 28.4, 2, 'prop'], AT45: [22.7, 24.6, 2, 'prop'], AT76: [27.2, 27.1, 2, 'prop'],
+  E170: [29.9, 26.0, 2, 'jet'], E190: [36.2, 28.7, 2, 'jet'],
+  CRJ2: [26.8, 21.2, 2, 'jet'], CRJ7: [32.3, 23.2, 2, 'jet'],
+  // ── 軍用。嘉手納・普天間・那覇。**自衛隊機はADS-Bを出さないので、
+  //    ここに立つのはほぼ在日米軍機**(実測: 全世界の軍用機202機のうち
+  //    沖縄周辺は1機だけだった) ──
+  K35R: [41.5, 39.9, 4, 'jet'], KC135: [41.5, 39.9, 4, 'jet'],
+  C17: [53.0, 51.8, 4, 'jet'], C5M: [75.5, 67.9, 4, 'jet'],
+  C130: [29.8, 40.4, 4, 'prop'], C30J: [29.8, 40.4, 4, 'prop'], LMT: [29.8, 40.4, 4, 'prop'],
+  P8: [39.5, 37.6, 2, 'jet'], E3TF: [46.6, 44.4, 4, 'jet'], RC35: [46.6, 44.4, 4, 'jet'],
+  C40: [33.6, 34.3, 2, 'jet'], UC35: [14.9, 15.9, 2, 'jet'], GLF5: [29.4, 28.5, 2, 'jet'],
+  C12: [13.3, 16.6, 2, 'prop'],
+  F15: [19.4, 13.0, 2, 'fighter'], F16: [15.0, 9.8, 1, 'fighter'],
+  F18: [17.1, 12.3, 2, 'fighter'], F22A: [18.9, 13.6, 2, 'fighter'],
+  F35: [15.7, 10.7, 1, 'fighter'],
+  V22: [17.5, 25.8, 2, 'tilt'],                       // オスプレイ。普天間
+  H60: [19.8, 16.4, 2, 'heli'], CH53: [30.2, 24.1, 2, 'heli'], H1: [17.8, 14.6, 2, 'heli'],
+};
+const PLANE_ANY = [40, 36, 2, 'jet'];
+
+/** 知らない型式は頭の文字で当たりを付ける。外しても大きさが少し違うだけ。 */
+function planeSpec(type) {
+  if (!type) return PLANE_ANY;
+  const t = String(type).toUpperCase();
+  if (PLANE_SPEC[t]) return PLANE_SPEC[t];
+  if (/^H\d|^EC\d|^S7[06]|^A139|^R44|^B06|^AS\d/.test(t)) return [16, 14, 1, 'heli'];
+  if (/^F[-\d]/.test(t)) return [18, 13, 2, 'fighter'];
+  if (/^A3[3-8]/.test(t)) return [64, 62, 2, 'jet'];
+  if (/^A[123]/.test(t)) return [38, 36, 2, 'jet'];
+  if (/^B7[45]/.test(t)) return [72, 65, 4, 'jet'];
+  if (/^B7[78]/.test(t)) return [64, 61, 2, 'jet'];
+  if (/^B7/.test(t)) return [45, 40, 2, 'jet'];
+  if (/^E1|^E7|^CRJ|^RJ|^GLF|^CL\d|^C25|^E55|^LJ\d/.test(t)) return [32, 26, 2, 'jet'];
+  if (/^AT|^DH|^SF3|^BE|^PC1|^C20|^D22|^SW4/.test(t)) return [26, 26, 2, 'prop'];
+  if (/^C\d/.test(t)) return [30, 40, 4, 'prop'];
+  return PLANE_ANY;
+}
+
+// 尾翼の色。**便名の頭3文字は航空会社のコード**なので、そのまま使える。
+// 遠くては見えないが、進入してくる機体は尾翼だけで見分けが付く
+const PLANE_TAIL = {
+  JAL: 0xc8102e, JTA: 0xc8102e, RAC: 0xc8102e,   // 日本航空・日本トランスオーシャン・琉球エアー
+  ANA: 0x1b3f8b, AKX: 0x1b3f8b, ANK: 0x1b3f8b,   // 全日空
+  APJ: 0x8e2b8b,                                  // ピーチ
+  SKY: 0x1c2b4a,                                  // スカイマーク
+  SNJ: 0x0f9d58,                                  // ソラシド
+  JJP: 0xe05a00, TZP: 0xe05a00,                   // ジェットスター
+  CAL: 0x0d4c8c, CPA: 0x0f5132, EVA: 0x0b6b3a,    // チャイナ・キャセイ・エバー
+  CES: 0xc8102e, CSN: 0x1560bd, CCA: 0xc8102e,    // 中国東方・南方・国際
+  HVN: 0x1a5fa8, KAL: 0x1d4f91, AAR: 0xb01e2e,    // ベトナム・大韓・アシアナ
+  TWB: 0xd23c2a, JNA: 0x1560bd, ESR: 0xe0a400,    // ティーウェイ・ジンエアー・イースター
+  UAL: 0x1560bd, DAL: 0xc8102e, HAL: 0x5b2d8e,    // ユナイテッド・デルタ・ハワイアン
+};
+
+// 使い回しの入れ物。**機体は最大120機出るので、型式ごとに1つ作って複製する。**
+// clone() は形と材質を共有するので、120機出しても中身は数個ぶんしか増えない
+const planeProto = new Map();
+const planeMats = new Map();
+let planeDotTex = null, planeTrailTex = null;
+
+function planeMat(color, opts) {
+  const key = color + '|' + (opts ?? '');
+  let m = planeMats.get(key);
+  if (!m) {
+    // **霧をかけない。** 霧は far 1250m で、飛行機は数km〜数十km先にいる。
+    // かけると全部が霧の色に溶けて1機も見えない
+    m = new THREE.MeshLambertMaterial({ color, fog: false });
+    // **自分で光る成分を持たせる。** 太陽は上にあり、飛行機は必ず頭上にいるので、
+    // 素の Lambert だと**こちらを向いている面（腹側）が真っ黒**になる。
+    // 実際の空の機体は、空からの散乱光と地面の照り返しで下からも明るい
+    m.emissive = new THREE.Color(color).multiplyScalar(0.62);
+    if (opts === 'thin') m.side = THREE.DoubleSide;   // 翼は薄いので裏も塗る
+    if (opts === 'disc') {
+      m.transparent = true; m.opacity = 0.30; m.depthWrite = false;
+      m.side = THREE.DoubleSide;
+    }
+    planeMats.set(key, m);
+  }
+  return m;
+}
+
 /**
- * 機体の姿。**実寸で作る。** 生き物は小さすぎて見えないので2倍にしたが、
- * 飛行機はもともと大きい（B788 は全長57m）。巡航高度なら点、着陸進入なら
- * 形が見える——それが本当の空の見え方なので、いじらない。
+ * 平面形から翼を1枚作る。**左右を1つの多角形にまとめる**ので、
+ * 翼は1メッシュで済む（左右別々に置くと鏡像になって裏返る）。
+ * 出来上がりは 幅=X・翼弦=Z（機首が -Z）・厚み=Y。
  */
-function makePlane(mil) {
+function wingGeo(halfSpan, rootChord, tipChord, sweep, thick, half) {
+  const le = -rootChord * 0.5, lt = le + sweep;
+  const s = new THREE.Shape();
+  if (half) {
+    // 片翼だけ。上反角を付けるときは左右を別の板にする必要がある
+    s.moveTo(0, le);
+    s.lineTo(halfSpan, lt);
+    s.lineTo(halfSpan, lt + tipChord);
+    s.lineTo(0, le + rootChord);
+  } else {
+    s.moveTo(-halfSpan, lt);
+    s.lineTo(0, le);
+    s.lineTo(halfSpan, lt);
+    s.lineTo(halfSpan, lt + tipChord);
+    s.lineTo(0, le + rootChord);
+    s.lineTo(-halfSpan, lt + tipChord);
+  }
+  s.closePath();
+  const g = new THREE.ExtrudeGeometry(s, { depth: thick, bevelEnabled: false, curveSegments: 1 });
+  g.translate(0, 0, -thick * 0.5);
+  g.rotateX(Math.PI / 2);        // 翼弦を +Z へ（前縁が -Z ＝ 機首の側）
+  return g;
+}
+
+/** 垂直尾翼。出来上がりは 高さ=Y・翼弦=Z・厚み=X。 */
+function finGeo(rootChord, tipChord, height, sweep, thick) {
+  const s = new THREE.Shape();
+  s.moveTo(0, 0);
+  s.lineTo(rootChord, 0);
+  s.lineTo(sweep + tipChord, height);
+  s.lineTo(sweep, height);
+  s.closePath();
+  const g = new THREE.ExtrudeGeometry(s, { depth: thick, bevelEnabled: false, curveSegments: 1 });
+  g.translate(0, 0, -thick * 0.5);
+  g.rotateY(-Math.PI / 2);
+  return g;
+}
+
+/** 発動機。筒＋前の口。 */
+function addNacelle(g, x, y, z, len, r, skin, dark) {
+  const pod = new THREE.Mesh(new THREE.CylinderGeometry(r, r * 0.86, len, 10), skin);
+  pod.rotation.x = Math.PI / 2;
+  pod.position.set(x, y, z);
+  const lip = new THREE.Mesh(new THREE.CylinderGeometry(r * 1.04, r * 1.04, len * 0.10, 10), dark);
+  lip.rotation.x = Math.PI / 2;
+  lip.position.set(x, y, z - len * 0.48);
+  g.add(pod, lip);
+}
+
+/** 回っている円盤（プロペラ・ローター）。半透明の板1枚で表す。 */
+function addDisc(g, x, y, z, r, axis) {
+  const d = new THREE.Mesh(new THREE.CircleGeometry(r, 20), planeMat(0xb8bcc2, 'disc'));
+  if (axis === 'up') d.rotation.x = -Math.PI / 2;   // 面を上に向ける（ヘリ）
+  d.position.set(x, y, z);
+  g.add(d);
+}
+
+/** 機体の骨組みを1つ作る。**型式ごとに1回だけ呼ぶ**（あとは clone）。 */
+function buildAirframe(spec, mil) {
+  const [L, W, eng, kind] = spec;
   const g = new THREE.Group();
-  // **霧をかけない。** 霧は far 1250m で、飛行機は数kmから数十km先にいる。
-  // かけると全部が霧の色に溶けて1機も見えない。実際の空でも遠くの機影は見える
-  const mat = new THREE.MeshLambertMaterial({ color: mil ? 0x6b7a63 : 0xe8e6df, fog: false });
-  const dark = new THREE.MeshLambertMaterial({ color: mil ? 0x3f4a3a : 0x8d98a2, fog: false });
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(2.6, 2.0, 50, 8), mat);
-  body.rotation.x = Math.PI / 2;              // 機首を -Z へ
-  const wing = new THREE.Mesh(new THREE.BoxGeometry(58, 1.2, 8), mat);
-  wing.position.z = 2;
-  const tailH = new THREE.Mesh(new THREE.BoxGeometry(20, 1.0, 5), mat);
-  tailH.position.z = 22;
-  const tailV = new THREE.Mesh(new THREE.BoxGeometry(1.0, 11, 8), dark);
-  tailV.position.set(0, 5, 22);
-  g.add(body, wing, tailH, tailV);
+  const skin = planeMat(mil ? 0x717f68 : 0xe9e7e0);
+  const thinS = planeMat(mil ? 0x717f68 : 0xe9e7e0, 'thin');
+  const dark = planeMat(mil ? 0x424d3d : 0x7f8a95);
+  const belly = planeMat(mil ? 0x6d7a66 : 0xd2d6db);
+
+  if (kind === 'heli') {
+    // 胴は丸っこく、後ろへ細い尾。上に主ローター、尾に尾ローター
+    const cab = new THREE.Mesh(new THREE.SphereGeometry(L * 0.16, 12, 8), skin);
+    cab.scale.set(0.85, 0.9, 1.7);
+    cab.position.z = -L * 0.16;
+    const boom = new THREE.Mesh(new THREE.CylinderGeometry(L * 0.035, L * 0.02, L * 0.55, 8), skin);
+    boom.rotation.x = Math.PI / 2;
+    boom.position.z = L * 0.24;
+    const fin = new THREE.Mesh(finGeo(L * 0.13, L * 0.07, L * 0.14, L * 0.05, L * 0.012), dark);
+    fin.position.set(0, L * 0.02, L * 0.42);
+    g.add(cab, boom, fin);
+    addDisc(g, 0, L * 0.20, -L * 0.10, W * 0.5, 'up');
+    addDisc(g, L * 0.03, L * 0.10, L * 0.50, L * 0.10);
+    return g;
+  }
+
+  if (kind === 'tilt') {
+    // オスプレイ。太い胴・肩の翼・翼端の回る発動機
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(L * 0.14, L * 0.52, 6, 10), skin);
+    body.rotation.x = Math.PI / 2;
+    const wing = new THREE.Mesh(wingGeo(W * 0.36, L * 0.26, L * 0.24, L * 0.02, L * 0.02), thinS);
+    wing.position.set(0, L * 0.14, -L * 0.02);
+    const fin1 = new THREE.Mesh(finGeo(L * 0.20, L * 0.12, L * 0.20, L * 0.06, L * 0.012), dark);
+    const fin2 = fin1.clone();
+    fin1.position.set(-W * 0.14, L * 0.06, L * 0.28);
+    fin2.position.set(W * 0.14, L * 0.06, L * 0.28);
+    const htail = new THREE.Mesh(wingGeo(W * 0.15, L * 0.18, L * 0.12, L * 0.03, L * 0.014), thinS);
+    htail.position.set(0, L * 0.06, L * 0.30);
+    g.add(body, wing, fin1, fin2, htail);
+    for (const s of [-1, 1]) {
+      addNacelle(g, s * W * 0.36, L * 0.16, -L * 0.06, L * 0.30, L * 0.075, skin, dark);
+      addDisc(g, s * W * 0.36, L * 0.16, -L * 0.24, W * 0.22);
+    }
+    return g;
+  }
+
+  // ── ここから固定翼 ──
+  const fighter = kind === 'fighter';
+  const r = Math.max(0.6, L * (fighter ? 0.038 : 0.052));   // 胴の半径
+  const noseL = L * (fighter ? 0.26 : 0.14);
+  const tailL = L * (fighter ? 0.16 : 0.26);
+  const barL = L - noseL - tailL;
+
+  // **機首は円錐にしない。** 錐にすると槍のように尖って、旅客機に見えない。
+  // 実機の機首は丸い。半径を √ 気味に増やす曲線を回して作る
+  let noseGeo;
+  if (fighter) {
+    noseGeo = new THREE.ConeGeometry(r, noseL, 12);     // 戦闘機はほんとうに尖っている
+  } else {
+    const prof = [];
+    for (let i = 0; i <= 8; i++) {
+      const t = i / 8;
+      prof.push(new THREE.Vector2(r * Math.pow(Math.sin(t * Math.PI / 2), 0.62), t * noseL));
+    }
+    noseGeo = new THREE.LatheGeometry(prof, 12);
+    noseGeo.translate(0, -noseL * 0.5, 0);              // ConeGeometry と原点を揃える
+  }
+  const nose = new THREE.Mesh(noseGeo, skin);
+  nose.rotation.x = -Math.PI / 2;                 // 先端を -Z（機首）へ
+  nose.position.z = -L * 0.5 + noseL * 0.5;
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(r, r, barL, 12), skin);
+  barrel.rotation.x = Math.PI / 2;
+  barrel.position.z = -L * 0.5 + noseL + barL * 0.5;
+  // 尾部は細って少し上がる（実機がそうなっている。着陸時に尻を擦らないため）
+  // 尾も完全には尖らせない（実機の尾端は細い筒で終わっている）
+  const cone = new THREE.Mesh(
+    new THREE.CylinderGeometry(r * (fighter ? 0.55 : 0.13), r, tailL, 12), skin);
+  cone.rotation.x = Math.PI / 2;
+  cone.position.set(0, r * 0.42, L * 0.5 - tailL * 0.5);
+  g.add(nose, barrel, cone);
+
+  // 主翼。**左右を別々の板にして上反角を付ける。**
+  // 1枚の平らな板だと、真後ろ・真正面から見たとき「棒」にしか見えない。
+  // 実機の翼は先へ行くほど上がっていて（旅客機で5度前後）、
+  // その V 字が地上から見上げたときの機影を機影らしくしている
+  const dih = fighter ? 0.02 : 0.09;                      // 上反角(rad)
+  const wingZ = fighter ? L * 0.10 : -L * 0.02;
+  const wingY = fighter ? 0 : -r * 0.52;
+  const halfW = fighter
+    ? wingGeo(W * 0.5, L * 0.42, L * 0.08, L * 0.30, L * 0.012, true)
+    : wingGeo(W * 0.5, L * 0.30, L * 0.085, W * 0.20, L * 0.011, true);
+  for (const side of [1, -1]) {
+    const w = new THREE.Mesh(halfW, thinS);
+    w.position.set(0, wingY, wingZ);
+    // 鏡にすると裏返るので、材質は両面にしてある
+    w.scale.x = side;
+    w.rotation.z = side * dih;
+    g.add(w);
+  }
+
+  // 水平尾翼
+  const ht = new THREE.Mesh(
+    wingGeo(W * (fighter ? 0.30 : 0.19), L * 0.13, L * 0.055, L * 0.07, L * 0.010), thinS);
+  // **もっと後ろへ。** 主翼のすぐ後ろに置いていたので胴が詰まって見えた。
+  // 実機の水平尾翼は全長の 8 割あたりから始まる
+  ht.position.set(0, r * 0.24, L * 0.5 - tailL * (fighter ? 0.35 : 0.45));
+  g.add(ht);
+
+  // 垂直尾翼。**ここだけ航空会社の色に塗り替えられるよう名前を付ける**
+  const finH = L * (fighter ? 0.14 : 0.19);
+  if (fighter) {
+    for (const s of [-1, 1]) {
+      const f = new THREE.Mesh(finGeo(L * 0.16, L * 0.07, finH, L * 0.10, L * 0.010), dark);
+      f.position.set(s * W * 0.13, r * 0.6, L * 0.5 - tailL * 1.5);
+      f.rotation.z = -s * 0.22;
+      g.add(f);
+    }
+  } else {
+    const fin = new THREE.Mesh(finGeo(L * 0.20, L * 0.085, finH, L * 0.13, L * 0.011), dark);
+    fin.name = 'fin';
+    fin.position.set(0, r * 0.55, L * 0.5 - tailL * 0.80);
+    g.add(fin);
+    // 翼端の小翼。いまの旅客機はだいたい付いている
+    for (const s of [-1, 1]) {
+      const wl = new THREE.Mesh(finGeo(L * 0.075, L * 0.035, L * 0.055, L * 0.03, L * 0.009), skin);
+      // 翼端の前縁に合わせる（翼の付け根の前縁 -rootChord/2 に後退量を足した所）。
+      // 高さは上反角で翼端が持ち上がったぶん
+      wl.position.set(s * W * 0.5, wingY + W * 0.5 * dih, wingZ - L * 0.15 + W * 0.20);
+      g.add(wl);
+    }
+  }
+
+  // 発動機
+  if (!fighter) {
+    const xs = eng >= 4 ? [-0.34, -0.20, 0.20, 0.34] : [-0.30, 0.30];
+    for (const f of xs) {
+      const ex = f * W;
+      if (kind === 'prop') {
+        // プロペラ機は翼の前に発動機が乗る
+        addNacelle(g, ex, wingY + Math.abs(ex) * dih + r * 0.35,
+                   wingZ - L * 0.13, L * 0.22, r * 0.42, skin, dark);
+        addDisc(g, ex, wingY + Math.abs(ex) * dih + r * 0.35, wingZ - L * 0.25, L * 0.13);
+      } else {
+        // 翼が上反角で上がっているぶん、吊り下げる高さも上げる
+        addNacelle(g, ex, wingY - r * 0.63 + Math.abs(ex) * dih,
+                   wingZ - L * 0.09, L * 0.14, r * 0.60, skin, dark);
+      }
+    }
+  }
+
+  // 脚。**低い所を飛んでいるときだけ出す**（stepPlanes が出し入れする）。
+  // 那覇に降りる機体はこの街の上空 300〜900m を通るので、そこでは脚が出ている
+  if (!fighter && kind !== 'heli' && kind !== 'tilt') {
+    const gear = new THREE.Group();
+    gear.name = 'gear';
+    const leg = (x, z, len, rad) => {
+      const st = new THREE.Mesh(new THREE.CylinderGeometry(rad * 0.22, rad * 0.22, len, 6), dark);
+      st.position.set(x, wingY - len * 0.5 - r * 0.2, z);
+      const wh = new THREE.Mesh(new THREE.CylinderGeometry(rad, rad, rad * 1.1, 8), dark);
+      wh.rotation.z = Math.PI / 2;
+      wh.position.set(x, wingY - len - r * 0.2, z);
+      gear.add(st, wh);
+    };
+    leg(0, -L * 0.34, r * 0.80, r * 0.16);                     // 前脚
+    leg(-W * 0.075, wingZ + L * 0.06, r * 0.95, r * 0.21);     // 主脚
+    leg(W * 0.075, wingZ + L * 0.06, r * 0.95, r * 0.21);
+    gear.visible = false;
+    g.add(gear);
+  }
+
+  // 胴体の下側を少し濃く（実機の腹は灰色で、これがあると筒に見えなくなる）
+  // **角度の起点に注意。** 筒を寝かせたあと、角度0の面が下(-Y)に来る。
+  // 0.72π から取ると背中側に帯が付く（実際そうなっていた）
+  const under = new THREE.Mesh(new THREE.CylinderGeometry(r * 1.005, r * 1.005, barL, 12,
+    1, true, -Math.PI * 0.28, Math.PI * 0.56), belly);
+  under.rotation.x = Math.PI / 2;
+  under.position.z = barrel.position.z;
+  g.add(under);
+  return g;
+}
+
+/** 遠景の点。**四角い板だと機影に見えない**ので、丸くして縁をぼかす。 */
+function planeDot() {
+  if (!planeDotTex) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const x = c.getContext('2d');
+    const gr = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(255,255,255,1)');
+    gr.addColorStop(0.34, 'rgba(255,255,255,0.95)');
+    gr.addColorStop(0.62, 'rgba(240,242,246,0.35)');
+    gr.addColorStop(1, 'rgba(240,242,246,0)');
+    x.fillStyle = gr; x.fillRect(0, 0, 64, 64);
+    planeDotTex = new THREE.CanvasTexture(c);
+  }
+  return planeDotTex;
+}
+
+/**
+ * 飛行機雲の帯。**巡航高度でしか出さない。**
+ * 実際に雲ができるのは対流圏の上の冷たい所（おおむね 8km 以上）で、
+ * 着陸進入中の機体に尾を引かせると嘘になる。
+ * 形は「機体のすぐ後ろが細く濃い→後ろへ行くほど広がって消える」台形。
+ */
+function planeTrail() {
+  if (!planeTrailTex) {
+    const c = document.createElement('canvas');
+    c.width = 4; c.height = 128;
+    const x = c.getContext('2d');
+    const gr = x.createLinearGradient(0, 0, 0, 128);
+    // 機体の真後ろは何も無い（雲ができるのは発動機の少し後ろから）
+    gr.addColorStop(0, 'rgba(255,255,255,0)');
+    gr.addColorStop(0.05, 'rgba(255,255,255,0.46)');
+    gr.addColorStop(0.35, 'rgba(255,255,255,0.24)');
+    gr.addColorStop(1, 'rgba(255,255,255,0)');       // 後ろへ行くほど消える
+    x.fillStyle = gr; x.fillRect(0, 0, 4, 128);
+    planeTrailTex = new THREE.CanvasTexture(c);
+  }
+  // 長さ1・幅は前 0.006 → 後ろ 0.05 の台形。使う側で伸ばす。
+  // **細くしないと雲でなく楔に見える**（最初 0.02→0.13 で作ったらそうなった）
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+    -0.006, 0, 0, 0.006, 0, 0, 0.05, 0, 1, -0.05, 0, 1,
+  ]), 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array([
+    0, 0, 1, 0, 1, 1, 0, 1,
+  ]), 2));
+  geo.setIndex([0, 1, 2, 0, 2, 3]);
+  geo.computeVertexNormals();
+  return new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    map: planeTrailTex, transparent: true, depthWrite: false,
+    side: THREE.DoubleSide, fog: false,
+  }));
+}
+
+/**
+ * 1機ぶんの見た目。骨組みは型式ごとに1つ作って複製する。
+ * **複製は形と材質を共有する**ので、機体を消すときに dispose してはいけない
+ * （同じ型式の他の機体まで壊れる）。scene から外すだけでよい
+ */
+function makePlane(mil, type, flight) {
+  const g = new THREE.Group();
+  const spec = planeSpec(type);
+  const key = `${type ?? '-'}|${mil ? 1 : 0}`;
+  let proto = planeProto.get(key);
+  if (!proto) { proto = buildAirframe(spec, mil); planeProto.set(key, proto); }
+  const body = proto.clone();
+  // 尾翼だけ航空会社の色に塗り替える（材質の差し替えだけなので形は共有のまま）
+  const tail = PLANE_TAIL[String(flight ?? '').slice(0, 3).toUpperCase()];
+  if (tail && !mil) {
+    const fin = body.getObjectByName('fin');
+    if (fin) fin.material = planeMat(tail);
+  }
+  g.add(body);
 
   // **遠くでは形ではなく点で出す。**
-  // 長さが5pxになるよう膨らませても、胴も翼も細いので**厚みが0.5px未満**になり、
-  // ほとんど塗られない(実測: 48.6km の機体が画面上わずか1画素だった)。
-  // 遠景は常にカメラを向く板1枚に差し替える。実際の空でも遠くの機影は点に見える
+  // 長さが数pxになるよう膨らませても、胴も翼も細いので**厚みが0.5px未満**に
+  // なりほとんど塗られない(実測: 48.6km の機体が画面上わずか1画素だった)。
+  // 遠景は常にカメラを向く板1枚に差し替える
   const dot = new THREE.Sprite(new THREE.SpriteMaterial({
-    color: mil ? 0x9ab08e : 0xf2f0e8, fog: false, depthWrite: false,
+    map: planeDot(), color: mil ? 0xc2cfb6 : 0xffffff,
+    fog: false, depthWrite: false, transparent: true,
   }));
   g.add(dot);
-  g.userData.dot = dot;
-  g.userData.body = [body, wing, tailH, tailV];
+
+  const trail = planeTrail();
+  trail.visible = false;
+  g.add(trail);
+
+  g.userData = { dot, body, trail, spec, gear: body.getObjectByName('gear') ?? null };
   return g;
 }
 
@@ -8171,10 +8583,19 @@ async function fetchPlanes() {
       seen.add(a.hex);
       let p = planes.get(a.hex);
       if (!p) {
-        p = { g: makePlane(a.mil), mil: a.mil };
+        p = { g: makePlane(a.mil, a.type, a.flight), mil: a.mil };
         scene.add(p.g);
         planes.set(a.hex, p);
       }
+      // **旋回の速さはここで測る。** track は12秒に1回しか変わらないので、
+      // 1フレームぶんの差で割ると 0 が続いたあと1回だけ跳ねる。取り込みの
+      // 間隔で割って「毎秒何度ずつ向きが変わっているか」を出す
+      if (p.track != null && a.track != null) {
+        const dtr = ((a.track - p.track + 540) % 360) - 180;
+        const el = Math.max(1, (performance.now() - (p.trackAt ?? 0)) / 1000);
+        p.turn = dtr * Math.PI / 180 / Math.min(el, 30);
+      }
+      p.trackAt = performance.now();
       Object.assign(p, {
         lat: a.lat, lon: a.lon, alt: (a.alt ?? 0) * FT,
         gs: (a.gs ?? 0) * KT, track: a.track ?? 0, vs: (a.vs ?? 0) * FT / 60,
@@ -8184,7 +8605,9 @@ async function fetchPlanes() {
     // 消えた機体は捨てる（範囲外へ出た・電波が途切れた）
     for (const [hex, p] of planes) {
       if (seen.has(hex)) continue;
-      scene.remove(p.g); disposeTree(p.g); planes.delete(hex);
+      // **dispose しない。** 骨組みは型式ごとに1つ作って複製しており、
+      // 形も材質も他の機体と共有している。捨てると同じ型式の機が壊れる
+      scene.remove(p.g); planes.delete(hex);
     }
     airLast = performance.now();
     airErr = 0;
@@ -8236,26 +8659,67 @@ function stepPlanes(dt) {
     // そうなると倍率が全部 0 になって何も見えなくなる。描画キャンバスから取る
     const vh = renderer.domElement.clientHeight || innerHeight || 800;
     const pxPerRad = vh / (2 * Math.tan(camera.fov * Math.PI / 360));
-    const truePx = 57 / dist * pxPerRad;
+    // **57m 固定をやめた。** 型式ごとの実寸のうち大きいほう（たいてい全幅）で
+    // 測る。DH8D(28m)と B77W(65m)を同じ大きさで出していたのは嘘だった
+    const sp = p.g.userData.spec ?? [40, 36];
+    const truePx = Math.max(sp[0], sp[1]) / dist * pxPerRad;
     p.truePx = truePx;
-    const dot = p.g.userData.dot, bodyParts = p.g.userData.body ?? [];
-    if (truePx < PLANE_SHAPE_PX) {
-      // 遠い。形をやめて点にする。**点の大きさは画面上で一定**
-      p.g.scale.setScalar(k);
-      for (const m of bodyParts) m.visible = false;
-      if (dot) {
-        dot.visible = true;
-        // 点は g の中にあるので、描かれる大きさは w*k、距離は dist*k。
-        // 見かけ = w*k/(dist*k) = w/dist なので、w = dist * (欲しいpx / pxPerRad)
-        dot.scale.setScalar(dist * PLANE_MIN_PX / pxPerRad);
-      }
-    } else {
-      // 近い。実寸の形で出す
-      p.g.scale.setScalar(k);
-      for (const m of bodyParts) m.visible = true;
-      if (dot) dot.visible = false;
+    // 骨組みはひとつの入れ物にまとめてあるので、**入れ物ごと**出し入れする
+    // （枝が丸ごと消えると three は中を辿らない）
+    const dot = p.g.userData.dot, shape = p.g.userData.body;
+    const far = truePx < PLANE_SHAPE_PX;
+    p.g.scale.setScalar(k);
+    if (shape) shape.visible = !far;
+    if (dot) {
+      dot.visible = far;
+      // 点は g の中にあるので、描かれる大きさは w*k、距離は dist*k。
+      // 見かけ = w*k/(dist*k) = w/dist なので、w = dist * (欲しいpx / pxPerRad)
+      if (far) dot.scale.setScalar(dist * PLANE_MIN_PX / pxPerRad);
     }
-    p.g.rotation.set(0, -th + Math.PI, 0);   // 機首(-Z)を進行方向へ
+    // **姿勢を付ける。** 水平のまま平行移動していると模型に見える。
+    // 釣り合い旋回では tan(バンク) = V*ω/g。ω は fetchPlanes で測った旋回の速さ
+    const want = THREE.MathUtils.clamp(
+      Math.atan2(p.gs * (p.turn ?? 0), 9.8), -0.52, 0.52);            // ±30度まで
+    p.bank = (p.bank ?? 0) + (want - (p.bank ?? 0)) * Math.min(1, dt * 1.2);
+    // 機首上げ下げ。上昇率と対地速度の比。実機は巡航でも2〜3度上を向いている
+    const pitch = p.ground ? 0
+      : THREE.MathUtils.clamp(Math.atan2(p.vs, Math.max(p.gs, 40)), -0.26, 0.35) + 0.035;
+    // YXZ は「方位 → 機首上げ → 傾き」の順。飛行機の姿勢の書き方そのもの
+    p.g.rotation.set(pitch, -th + Math.PI, -(p.bank ?? 0), 'YXZ');
+
+    // 脚。**降りてくる機体だけ出す。** 那覇に降りる機体はこの街の上空を
+    // 300〜900m で通る。巡航中に脚が出ていたら嘘になる
+    const gear = p.g.userData.gear;
+    if (gear) gear.visible = !far && (!!p.ground || p.alt - groundAt(x, z) < 900);
+
+    // 飛行機雲。**高い所でしか出さない。**
+    // 実際に雲ができるのは 8km より上の冷たい空気の中で、
+    // 着陸進入中の機体に尾を引かせると嘘になる
+    const trail = p.g.userData.trail;
+    if (trail) {
+      // ヘリとオスプレイは飛行機雲を引かない（そもそもその高さまで上がれない）。
+      // ADS-B の高度がおかしいときに、ヘリが尾を引いてしまうのを止める
+      const kind = sp[3];
+      const on = !p.ground && p.alt > 7800 && dist < 90000
+        && kind !== 'heli' && kind !== 'tilt';
+      trail.visible = on;
+      if (on) {
+        // 長さは「本当の距離」で決める。g には縮尺 k が掛かっているので、
+        // 局所の長さ len は見かけ上 len/dist の角度になる＝畳む前と同じ
+        const len = Math.min(9000, dist * 0.75);
+        // 幅は長さと同じ縮尺で掛ける（形のほうを細く作ってある）。
+        // 9km の雲で 前 54m・後ろ 450m。実際の飛行機雲もこのくらいで広がる
+        trail.scale.set(len, 1, len);
+        trail.position.set(0, 0, sp[0] * 0.5 + len * 0.02);
+        // **帯を1枚の板で描いているので、見る向きに合わせて軸のまわりに回す。**
+        // 回さないと真横から見たとき線が消える
+        p.g.updateMatrixWorld();
+        const c = camera.position.clone().applyMatrix4(
+          new THREE.Matrix4().copy(p.g.matrixWorld).invert());
+        trail.rotation.set(0, 0, Math.atan2(-(c.x - trail.position.x),
+                                            c.y - trail.position.y));
+      }
+    }
   }
 }
 
